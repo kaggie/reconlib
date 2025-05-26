@@ -255,3 +255,232 @@ class L2Regularizer(Regularizer):
         if denominator == 0: # Avoid division by zero; unlikely for positive lambda, step_size
             return torch.zeros_like(x_tensor)
         return x_tensor / denominator
+
+class TVRegularizer(Regularizer):
+    """
+    Anisotropic Total Variation (TV) Regularizer.
+    Uses Chambolle's projection algorithm to solve the proximal problem.
+    """
+    def __init__(self, lambda_param, max_chambolle_iter=25, tol_chambolle=1e-5, verbose_chambolle=False):
+        self.lambda_param = lambda_param
+        self.max_chambolle_iter = max_chambolle_iter
+        self.tol_chambolle = tol_chambolle
+        self.verbose_chambolle = verbose_chambolle
+
+    def _gradient(self, u_tensor):
+        """Computes the discrete gradient using forward differences.
+           Boundary: grad_dim[..., N-1] = 0 - u_tensor[..., N-1] for each dim.
+        """
+        N_dim = u_tensor.ndim
+        grads = []
+        
+        if N_dim == 2: # (H, W)
+            zeros_y_boundary = torch.zeros_like(u_tensor[-1:, :], dtype=u_tensor.dtype, device=u_tensor.device)
+            grads.append(torch.diff(u_tensor, dim=0, append=zeros_y_boundary))
+            zeros_x_boundary = torch.zeros_like(u_tensor[:, -1:], dtype=u_tensor.dtype, device=u_tensor.device)
+            grads.append(torch.diff(u_tensor, dim=1, append=zeros_x_boundary))
+        elif N_dim == 3: # (D, H, W)
+            zeros_z_boundary = torch.zeros_like(u_tensor[-1:, :, :], dtype=u_tensor.dtype, device=u_tensor.device)
+            grads.append(torch.diff(u_tensor, dim=0, append=zeros_z_boundary))
+            zeros_y_boundary = torch.zeros_like(u_tensor[:, -1:, :], dtype=u_tensor.dtype, device=u_tensor.device)
+            grads.append(torch.diff(u_tensor, dim=1, append=zeros_y_boundary))
+            zeros_x_boundary = torch.zeros_like(u_tensor[:, :, -1:], dtype=u_tensor.dtype, device=u_tensor.device)
+            grads.append(torch.diff(u_tensor, dim=2, append=zeros_x_boundary))
+        else: # General N-dim case
+            for d in range(N_dim):
+                boundary_shape_list = list(u_tensor.shape)
+                boundary_shape_list[d] = 1 
+                zeros_at_boundary = torch.zeros(boundary_shape_list, dtype=u_tensor.dtype, device=u_tensor.device)
+                grads.append(torch.diff(u_tensor, dim=d, append=zeros_at_boundary))
+                
+        return tuple(grads)
+
+    def _divergence(self, grad_tensor_tuple):
+        """Computes the discrete divergence (adjoint of the forward difference gradient used in _gradient).
+           div_d = p_d[i] - p_d[i-1], with p_d[-1]=0.
+        """
+        N_dim = len(grad_tensor_tuple)
+        div_sum = torch.zeros_like(grad_tensor_tuple[0], device=grad_tensor_tuple[0].device, dtype=grad_tensor_tuple[0].dtype)
+
+        for d in range(N_dim):
+            p_d = grad_tensor_tuple[d] 
+            
+            rolled_pd = torch.roll(p_d, shifts=1, dims=d)
+            
+            idx_first_slice = [slice(None)] * p_d.ndim
+            idx_first_slice[d] = 0
+            rolled_pd[tuple(idx_first_slice)] = 0.0 
+            
+            div_d_comp = p_d - rolled_pd 
+            div_sum = div_sum + div_d_comp
+        return div_sum
+
+    def prox(self, x_tensor, step_size):
+        if not isinstance(x_tensor, torch.Tensor):
+            target_device = x_tensor.device if hasattr(x_tensor, 'device') else 'cpu'
+            x_tensor = torch.tensor(x_tensor, device=target_device, dtype=torch.float32) 
+        
+        device = x_tensor.device
+        original_dtype = x_tensor.dtype
+
+        if not x_tensor.is_floating_point() and not x_tensor.is_complex():
+            x_tensor_proc = x_tensor.to(torch.float32)
+        else:
+            x_tensor_proc = x_tensor
+
+        effective_lambda = self.lambda_param * step_size
+        if effective_lambda <= 1e-9: 
+            return x_tensor.to(original_dtype)
+
+        f_param_chambolle = x_tensor_proc / effective_lambda
+        N_dim = x_tensor_proc.ndim
+        
+        p_old_list = []
+        for _ in range(N_dim):
+            p_old_list.append(torch.zeros_like(x_tensor_proc, dtype=x_tensor_proc.dtype, device=device)) 
+        p_old = tuple(p_old_list)
+
+        sigma_dual = 1.0 / (2.0 * N_dim) 
+
+        for iter_num in range(self.max_chambolle_iter):
+            term_in_grad = self._divergence(p_old) - f_param_chambolle
+            grad_of_term = self._gradient(term_in_grad)
+
+            p_temp_list = []
+            for i in range(N_dim):
+                p_temp_list.append(p_old[i] + sigma_dual * grad_of_term[i])
+            
+            p_new_list = []
+            real_dtype_for_one = x_tensor_proc.real.dtype if x_tensor_proc.is_complex() else x_tensor_proc.dtype
+            one_tensor = torch.tensor(1.0, device=device, dtype=real_dtype_for_one)
+            
+            for p_comp_temp in p_temp_list:
+                magnitude = torch.abs(p_comp_temp)
+                p_new_list.append(p_comp_temp / torch.maximum(one_tensor, magnitude))
+            
+            p_new = tuple(p_new_list)
+
+            norm_p_old_sum = sum(torch.linalg.norm(p_old[i].flatten()) for i in range(N_dim)) + 1e-9 
+            norm_diff_sum = sum(torch.linalg.norm(p_new[i].flatten() - p_old[i].flatten()) for i in range(N_dim))
+            diff_criterion = norm_diff_sum / norm_p_old_sum
+            
+            p_old = p_new 
+
+            if self.verbose_chambolle and (iter_num % 10 == 0 or iter_num == self.max_chambolle_iter -1) :
+                print(f"  TVRegularizer Chambolle Iter {iter_num+1}/{self.max_chambolle_iter}, RelChange_p: {diff_criterion:.2e}")
+
+            if diff_criterion < self.tol_chambolle:
+                if self.verbose_chambolle:
+                    print(f"  TVRegularizer Chambolle converged at iter {iter_num+1}, RelChange_p: {diff_criterion:.2e}")
+                break
+        
+        reconstructed_image = x_tensor_proc - effective_lambda * self._divergence(p_new)
+        return reconstructed_image.to(original_dtype)
+
+class GradientMatchingRegularizer(Regularizer):
+    """
+    Regularizer for penalizing the L2 norm of the difference between the gradient
+    of the image and the gradient of a constraint (reference) image.
+    Term: 0.5 * lambda_gm * || grad(x) - grad(x_ref) ||_2^2
+    This is a quadratic term. It's designed to be incorporated into optimizers 
+    that can handle such terms in the x-update step directly (e.g., a modified ADMM),
+    rather than via a simple proximal operator for FISTA-like methods.
+    """
+    def __init__(self, constraint_image_tensor, lambda_gm, device='cpu'):
+        self.lambda_gm = lambda_gm
+        self.device = torch.device(device)
+        
+        # Constraint image is typically real-valued for gradient matching.
+        # Convert to float32 for consistent gradient computation.
+        self.constraint_image_tensor = torch.as_tensor(
+            constraint_image_tensor, 
+            device=self.device, 
+            dtype=torch.float32 
+        )
+        
+        # Precompute gradient of the constraint image
+        self.grad_constraint_image_tensor_tuple = self._gradient(self.constraint_image_tensor)
+
+    def _gradient(self, u_tensor):
+        """Computes the discrete gradient using forward differences.
+           (Adapted from TVRegularizer for self-containment)
+        """
+        N_dim = u_tensor.ndim
+        grads = []
+        
+        # Ensure u_tensor is on the correct device and float for gradient computation
+        u_tensor_proc = torch.as_tensor(u_tensor, device=self.device)
+        if not u_tensor_proc.is_floating_point():
+            u_tensor_proc = u_tensor_proc.to(torch.float32)
+
+        if N_dim == 2: # (H, W)
+            zeros_y_boundary = torch.zeros_like(u_tensor_proc[-1:, :], dtype=u_tensor_proc.dtype, device=self.device)
+            grads.append(torch.diff(u_tensor_proc, dim=0, append=zeros_y_boundary))
+            zeros_x_boundary = torch.zeros_like(u_tensor_proc[:, -1:], dtype=u_tensor_proc.dtype, device=self.device)
+            grads.append(torch.diff(u_tensor_proc, dim=1, append=zeros_x_boundary))
+        elif N_dim == 3: # (D, H, W)
+            zeros_z_boundary = torch.zeros_like(u_tensor_proc[-1:, :, :], dtype=u_tensor_proc.dtype, device=self.device)
+            grads.append(torch.diff(u_tensor_proc, dim=0, append=zeros_z_boundary))
+            zeros_y_boundary = torch.zeros_like(u_tensor_proc[:, -1:, :], dtype=u_tensor_proc.dtype, device=self.device)
+            grads.append(torch.diff(u_tensor_proc, dim=1, append=zeros_y_boundary))
+            zeros_x_boundary = torch.zeros_like(u_tensor_proc[:, :, -1:], dtype=u_tensor_proc.dtype, device=self.device)
+            grads.append(torch.diff(u_tensor_proc, dim=2, append=zeros_x_boundary))
+        else: 
+            for d in range(N_dim):
+                boundary_shape_list = list(u_tensor_proc.shape)
+                boundary_shape_list[d] = 1 
+                zeros_at_boundary = torch.zeros(boundary_shape_list, dtype=u_tensor_proc.dtype, device=self.device)
+                grads.append(torch.diff(u_tensor_proc, dim=d, append=zeros_at_boundary))
+        return tuple(grads)
+
+    def _divergence(self, grad_tensor_tuple):
+        """Computes the discrete divergence (adjoint of the forward difference gradient).
+           (Adapted from TVRegularizer for self-containment)
+        """
+        N_dim = len(grad_tensor_tuple)
+        # Ensure first component is on the correct device for zeros_like
+        first_grad_comp = torch.as_tensor(grad_tensor_tuple[0], device=self.device)
+        div_sum = torch.zeros_like(first_grad_comp, device=self.device, dtype=first_grad_comp.dtype)
+
+        for d in range(N_dim):
+            p_d = torch.as_tensor(grad_tensor_tuple[d], device=self.device, dtype=first_grad_comp.dtype)
+            rolled_pd = torch.roll(p_d, shifts=1, dims=d)
+            
+            idx_first_slice = [slice(None)] * p_d.ndim
+            idx_first_slice[d] = 0
+            rolled_pd[tuple(idx_first_slice)] = 0.0 
+            
+            div_d_comp = p_d - rolled_pd 
+            div_sum = div_sum + div_d_comp
+        return div_sum
+
+    def get_rhs_term(self):
+        """
+        Calculates lambda_gm * div(grad(x_ref)). This term is added to the RHS
+        in the x-update of a modified ADMM optimizer.
+        Term: lambda_gm * G^T (G x_ref)
+        """
+        # self.grad_constraint_image_tensor_tuple is grad(x_ref)
+        return self.lambda_gm * self._divergence(self.grad_constraint_image_tensor_tuple)
+
+    def get_lhs_operator_product(self, v_tensor):
+        """
+        Calculates lambda_gm * div(grad(v_tensor)). This term is added to the LHS
+        operator in the x-update of a modified ADMM optimizer.
+        Term: lambda_gm * G^T G v
+        """
+        # Ensure v_tensor is processed on the correct device and dtype
+        # The gradient and divergence methods handle this internally if v_tensor isn't already.
+        # For consistency with constraint_image_tensor, ensure float32 for v_tensor processing
+        v_tensor_proc = torch.as_tensor(v_tensor, device=self.device, dtype=torch.float32)
+        grad_v_tuple = self._gradient(v_tensor_proc)
+        return self.lambda_gm * self._divergence(grad_v_tuple)
+
+    def prox(self, x_tensor, step_size):
+        """This regularizer is quadratic and is handled by modifying the x-update step
+           in ADMM directly, rather than through a proximal operator.
+        """
+        raise NotImplementedError(
+            "GradientMatchingRegularizer does not have a simple proximal operator. "
+            "It should be incorporated directly into the x-update of an ADMM-like optimizer."
+        )
