@@ -2,33 +2,51 @@ import abc
 import torch
 import math
 import numpy as np
-from scipy.special import i0
+import scipy.special # For iv, i0
 
 class NUFFT(abc.ABC):
     def __init__(self, 
-                 image_shape: tuple | list[int], 
+                 image_shape: tuple[int, ...], 
                  k_trajectory: torch.Tensor, 
-                 oversamp_factor: float = 2.0, 
-                 width: int = 4, 
-                 beta: float | None = None, 
+                 oversamp_factor: tuple[float, ...],
+                 kb_J: tuple[int, ...],
+                 kb_alpha: tuple[float, ...],
+                 Ld: tuple[int, ...],
+                 kb_m: tuple[float, ...] | None = None,
+                 Kd: tuple[int, ...] | None = None,
                  device: str | torch.device = 'cpu'):
         """
-        Initialize the NUFFT operator.
+        Initialize the NUFFT operator with MIRT-style parameters.
 
         Args:
             image_shape: Shape of the image (e.g., (256, 256)).
-            k_trajectory: K-space trajectory, shape (N, D) or (N, M, D)
-                          where N is the number of points, M is batch/coil, D is dimensionality.
-            oversamp_factor: Oversampling factor for the grid.
-            width: Width of the Kaiser-Bessel kernel.
-            beta: Beta parameter for the Kaiser-Bessel kernel. 
-                  If None, calculated using a MIRT-like heuristic.
+            k_trajectory: K-space trajectory, shape (N, D) or (N, M, D).
+            oversamp_factor: Oversampling factor per dimension for the grid (e.g., (2.0, 2.0)).
+            kb_J: Kaiser-Bessel kernel width per dimension (e.g., (4, 4)).
+            kb_alpha: Kaiser-Bessel alpha shape parameter per dimension (e.g., (2.34*4, 2.34*4)).
+            Ld: Table oversampling factor per dimension (e.g., (2**10, 2**10)).
+            kb_m: Kaiser-Bessel m order parameter per dimension (e.g., (0.0, 0.0)).
+                  Defaults to (0.0,) * len(kb_J) if None.
+            Kd: Oversampled grid dimensions (e.g., (512, 512)). 
+                  If None, calculated as tuple(int(N * os) for N, os in zip(image_shape, oversamp_factor)).
             device: Computation device ('cpu' or 'cuda').
         """
         super().__init__()
         self.image_shape = tuple(image_shape)
-        self.oversamp_factor = oversamp_factor
-        self.width = width
+        self.oversamp_factor = tuple(oversamp_factor)
+        self.kb_J = tuple(kb_J)
+        self.kb_alpha = tuple(kb_alpha)
+        self.Ld = tuple(Ld)
+
+        if kb_m is None:
+            self.kb_m = (0.0,) * len(self.kb_J)
+        else:
+            self.kb_m = tuple(kb_m)
+
+        if Kd is None:
+            self.Kd = tuple(int(N * os) for N, os in zip(self.image_shape, self.oversamp_factor))
+        else:
+            self.Kd = tuple(Kd)
         
         if isinstance(device, str):
             self.device = torch.device(device)
@@ -40,16 +58,21 @@ class NUFFT(abc.ABC):
         else:
             self.k_trajectory = k_trajectory.to(self.device)
 
-        if beta is None:
-            # MIRT-like heuristic for beta
-            # Formula: pi * sqrt((width/oversamp_factor)^2 * (oversamp_factor-0.5)^2 - 0.8)
-            self.beta = math.pi * math.sqrt(
-                (self.width / self.oversamp_factor)**2 * (self.oversamp_factor - 0.5)**2 - 0.8
-            )
-            if self.beta < 0: 
-                self.beta = 10.0 
-        else:
-            self.beta = beta
+        # Validations for tuple lengths
+        num_dims = len(self.image_shape)
+        if len(self.oversamp_factor) != num_dims:
+            raise ValueError(f"Length of oversamp_factor {len(self.oversamp_factor)} must match image dimensionality {num_dims}")
+        if len(self.kb_J) != num_dims:
+            raise ValueError(f"Length of kb_J {len(self.kb_J)} must match image dimensionality {num_dims}")
+        if len(self.kb_alpha) != num_dims:
+            raise ValueError(f"Length of kb_alpha {len(self.kb_alpha)} must match image dimensionality {num_dims}")
+        if len(self.Ld) != num_dims:
+            raise ValueError(f"Length of Ld {len(self.Ld)} must match image dimensionality {num_dims}")
+        if len(self.kb_m) != num_dims:
+            raise ValueError(f"Length of kb_m {len(self.kb_m)} must match image dimensionality {num_dims}")
+        if len(self.Kd) != num_dims:
+            raise ValueError(f"Length of Kd {len(self.Kd)} must match image dimensionality {num_dims}")
+
 
     @abc.abstractmethod
     def forward(self, image_data: torch.Tensor) -> torch.Tensor:
@@ -88,488 +111,179 @@ class NUFFT(abc.ABC):
 
 class NUFFT2D(NUFFT):
     def __init__(self, 
-                 image_shape: tuple | list[int], 
+                 image_shape: tuple[int, int], 
                  k_trajectory: torch.Tensor, 
-                 oversamp_factor: float = 2.0, 
-                 width: int = 4, 
-                 beta: float | None = None, 
+                 oversamp_factor: tuple[float, float],
+                 kb_J: tuple[int, int],
+                 kb_alpha: tuple[float, float],
+                 Ld: tuple[int, int],
+                 kb_m: tuple[float, float] | None = None,
+                 Kd: tuple[int, int] | None = None,
                  device: str | torch.device = 'cpu'):
-        super().__init__(image_shape, k_trajectory, oversamp_factor, width, beta, device)
+        
+        super().__init__(image_shape=image_shape, 
+                         k_trajectory=k_trajectory, 
+                         oversamp_factor=oversamp_factor, 
+                         kb_J=kb_J, 
+                         kb_alpha=kb_alpha, 
+                         kb_m=kb_m, 
+                         Ld=Ld, 
+                         Kd=Kd, 
+                         device=device)
 
-        if len(self.image_shape) != 2:
+        if len(self.image_shape) != 2: # This check is also in parent, but good for explicitness
             raise ValueError(f"NUFFT2D expects a 2D image_shape, got {self.image_shape}")
         if self.k_trajectory.shape[-1] != 2:
             raise ValueError(f"NUFFT2D expects k_trajectory with last dimension 2, got {self.k_trajectory.shape}")
 
+        # Specific 2D validations for tuple lengths (already done in parent, but can be re-asserted for clarity)
+        # For example:
+        # if not (len(self.kb_J) == 2 and len(self.kb_alpha) == 2 and len(self.kb_m) == 2 and \
+        #         len(self.oversamp_factor) == 2 and len(self.Ld) == 2 and len(self.Kd) == 2):
+        #    raise ValueError("All tuple parameters (kb_J, kb_alpha, kb_m, oversamp_factor, Ld, Kd) must have length 2 for NUFFT2D.")
+
+
     def _kaiser_bessel_kernel(self, r: torch.Tensor) -> torch.Tensor:
-        mask = r < (self.width / 2)
-        val_inside_sqrt = torch.clamp(1 - (2 * r[mask] / self.width)**2, min=0.0)
-        z = torch.sqrt(val_inside_sqrt)
-        kb = torch.zeros_like(r)
-        # Ensure z is on CPU for i0, then move result to original device
-        kb_numpy_values = i0(self.beta * z.cpu().numpy())
-        kb[mask] = torch.from_numpy(kb_numpy_values.astype(np.float32)).to(r.device) / float(i0(self.beta))
-        return kb
+        """
+        Computes the generalized Kaiser-Bessel kernel for 2D (isotropic).
+        Formula: (f^m * I_m(alpha*f)) / I_m(alpha) where f = sqrt(1 - (r/(J/2))^2).
+        r: distance tensor |x|
+        J: self.kb_J[0] (kernel width)
+        alpha: self.kb_alpha[0] (shape parameter)
+        m: self.kb_m[0] (order parameter)
+        """
+        J_dim = self.kb_J[0]
+        alpha_dim = self.kb_alpha[0]
+        m_dim = self.kb_m[0]
+
+        # Create mask for r < J/2
+        mask = r < (J_dim / 2.0)
+        
+        # Calculate f = sqrt(1 - (r / (J/2))^2) for r within J/2
+        # Ensure values inside sqrt are non-negative due to potential floating point issues
+        val_inside_sqrt = torch.clamp(1.0 - (2.0 * r[mask] / J_dim)**2, min=0.0)
+        f = torch.sqrt(val_inside_sqrt)
+        
+        kb_vals = torch.zeros_like(r)
+
+        # Numerator: (f^m * I_m(alpha*f))
+        # Ensure f and alpha_dim * f are on CPU for scipy bessel functions
+        f_cpu = f.cpu().numpy()
+        alpha_f_cpu = alpha_dim * f_cpu
+        
+        if m_dim == 0.0:
+            numerator_bessel_vals = scipy.special.i0(alpha_f_cpu)
+            denominator_bessel_val = scipy.special.i0(alpha_dim)
+        else:
+            numerator_bessel_vals = scipy.special.iv(m_dim, alpha_f_cpu)
+            denominator_bessel_val = scipy.special.iv(m_dim, alpha_dim)
+
+        numerator_bessel_torch = torch.from_numpy(numerator_bessel_vals.astype(np.float32)).to(r.device)
+        
+        if m_dim == 0.0: # f^0 = 1
+            numerator = numerator_bessel_torch
+        else:
+            numerator = (f**m_dim) * numerator_bessel_torch
+            
+        # Denominator: I_m(alpha)
+        if np.isclose(denominator_bessel_val, 0.0): # Avoid division by zero if I_m(alpha) is zero
+             # This case should ideally not happen with typical alpha values for m=0. For m > 0, iv(m,0)=0.
+             # However, alpha_dim itself should not be zero with typical KB params.
+            kb_vals[mask] = 0.0 # Or handle as an error / specific value
+        else:
+            kb_vals[mask] = numerator / float(denominator_bessel_val)
+            
+        return kb_vals
 
     def _estimate_density_compensation(self, kx: torch.Tensor, ky: torch.Tensor) -> torch.Tensor:
         radius = torch.sqrt(kx**2 + ky**2)
         dcf = radius + 1e-3 # Small epsilon to avoid issues with zero radius
-        dcf /= dcf.max()
+        dcf /= dcf.max() # Normalize DCF to [epsilon, 1]
         return dcf
 
     def adjoint(self, kspace_data: torch.Tensor) -> torch.Tensor:
         """
         Apply the adjoint NUFFT operation (k-space to image) for 2D.
-
-        Args:
-            kspace_data: Input k-space data tensor (num_k_points,).
-                         Assumed to be complex-valued.
-
-        Returns:
-            Output image data tensor (image_shape[0], image_shape[1]).
         """
-        if kspace_data.ndim != 1:
-            raise ValueError(f"Expected kspace_data to be 1D, got shape {kspace_data.shape}")
+        if kspace_data.ndim != 1: # Assuming k_trajectory is (num_k_points, 2)
+            raise ValueError(f"Expected kspace_data to be 1D (num_k_points,), got shape {kspace_data.shape}")
         
-        kspace_data = kspace_data.to(self.device)
+        kspace_data = kspace_data.to(self.device) # Ensure data is on correct device
         kx, ky = self.k_trajectory[:, 0], self.k_trajectory[:, 1]
         
         Nx, Ny = self.image_shape
-        Nx_oversamp, Ny_oversamp = int(Nx * self.oversamp_factor), int(Ny * self.oversamp_factor)
+        # Use self.Kd for oversampled grid dimensions
+        Nx_oversamp, Ny_oversamp = self.Kd[0], self.Kd[1] 
         
         # Scale k-space coordinates to oversampled grid dimensions
-        # Original kx, ky are in [-0.5, 0.5], map to [0, N_oversamp]
+        # kx, ky in [-0.5, 0.5] map to [0, Kd]
         kx_scaled = (kx + 0.5) * Nx_oversamp 
         ky_scaled = (ky + 0.5) * Ny_oversamp
 
         dcf = self._estimate_density_compensation(kx, ky).to(self.device)
-        kspace_data_weighted = kspace_data * dcf
+        kspace_data_weighted = kspace_data * dcf # Element-wise multiplication
         
         grid = torch.zeros((Nx_oversamp, Ny_oversamp), dtype=torch.complex64, device=self.device)
         weight_grid = torch.zeros((Nx_oversamp, Ny_oversamp), dtype=torch.float32, device=self.device)
         
-        half_width = self.width // 2 # Integer division
+        # Use self.kb_J for kernel width (assuming isotropic for 2D, so kb_J[0])
+        half_width = self.kb_J[0] // 2 
 
-        # Iterate over kernel footprint
+        # Standard gridding: iterate kernel window around each k-space sample
         for dx_offset in range(-half_width, half_width + 1):
             for dy_offset in range(-half_width, half_width + 1):
-                # Calculate indices on the oversampled grid for each k-space point
-                # These are the centers of where the kernel for each k-point will be placed
-                x_idx_center = kx_scaled + dx_offset # Not floored yet
-                y_idx_center = ky_scaled + dy_offset # Not floored yet
-
-                # Distances from the actual k-space sample (after scaling) to the kernel sample point
-                # This seems inverted from typical gridding logic.
-                # Let's rethink: kernel is centered on kx_scaled, ky_scaled.
-                # We are iterating grid cells (x_grid, y_grid) around each k-point.
-                # No, the original logic seems to iterate kernel points around each k-point.
-                # Let (k_x, k_y) be a point in k-space.
-                # For each grid point (g_x, g_y) within kernel support of (k_x, k_y):
-                #   dist = sqrt( (k_x - g_x)^2 + (k_y - g_y)^2 )
-                #   w = kernel(dist)
-                #   grid[g_x, g_y] += w * kspace_data_pt
-                # This seems more standard for gridding.
-                # The provided code iterates dx, dy which are offsets from k-point for kernel evaluation.
-                # x_idx, y_idx are grid points.
-                # x_dist, y_dist are distances from k-point to *that* grid point.
+                # gx_absolute_cell_index: absolute grid cell index we are calculating contribution TO.
+                # dx_offset, dy_offset define which cell in the WxW neighborhood around kx_scaled.floor()
+                # This is the cell (floor(k_s_x) + dx, floor(k_s_y) + dy)
+                gx_absolute_cell_index = torch.floor(kx_scaled).long() + dx_offset
+                gy_absolute_cell_index = torch.floor(ky_scaled).long() + dy_offset
                 
-                # The original logic:
-                # x_idx and y_idx are the grid cells that each k-point (offset by dx,dy) maps to.
-                # x_dist and y_dist are then sub-pixel distances used for kernel evaluation.
-                # This seems to be a "spreading" or "gridding" operation.
-
-                # Let's follow the structure of _iternufft2d_nufft2d2_adjoint
-                # It uses x_idx, y_idx as integer grid indices, and x_dist, y_dist for kernel eval.
-                # kx_scaled, ky_scaled are the "true" locations of k-space samples on the oversampled grid.
-                # dx, dy are offsets defining the kernel extent.
-                # We are looking at grid points (ix, iy) = floor(kx_scaled + dx_offset), floor(ky_scaled + dy_offset)
-                # The distance `r` for the kernel should be from the *center* of the grid cell (ix+0.5, iy+0.5)
-                # to the actual k-space sample location (kx_scaled, ky_scaled).
-                # Or, if dx, dy are offsets from the k-point to sample points of the kernel:
+                # dist_x_k_to_cell_center: distance from k-space sample to *center* of this grid cell
+                dist_x_k_to_cell_center = kx_scaled - (gx_absolute_cell_index.float() + 0.5)
+                dist_y_k_to_cell_center = ky_scaled - (gy_absolute_cell_index.float() + 0.5)
                 
-                # Let's try to match the logic from _iternufft2d_nufft2d2_adjoint more closely.
-                # It seems the dx, dy loop is to iterate over the cells affected by each k-space sample.
-                # For each k-space sample (kx_s, ky_s) = (kx_scaled[i], ky_scaled[i]):
-                # Iterate grid cells (gx, gy) in the neighborhood of (kx_s, ky_s) of size width x width.
-                # gx_min = floor(kx_s - width/2), gx_max = floor(kx_s + width/2)
+                r_for_kb = torch.sqrt(dist_x_k_to_cell_center**2 + dist_y_k_to_cell_center**2)
+                kernel_weights = self._kaiser_bessel_kernel(r_for_kb)
+
+                # Modulo for periodic boundary conditions on the oversampled grid
+                gx_mod = gx_absolute_cell_index % Nx_oversamp
+                gy_mod = gy_absolute_cell_index % Ny_oversamp
                 
-                # The original code's dx, dy loop means: for each k-space point,
-                # consider a set of kernel evaluation points offset by (dx, dy) from it.
-                # Then find which grid cell this kernel evaluation point falls into.
-                # This seems more like interpolation (forward) than gridding (adjoint).
-
-                # Let's re-evaluate the loops from the source:
-                # `x_idx, y_idx = torch.floor(kx_scaled + dx).long(), torch.floor(ky_scaled + dy).long()`
-                # `x_dist, y_dist = kx_scaled - x_idx.float(), ky_scaled - y_idx.float()`
-                # This x_dist, y_dist is distance from k-point to top-left of grid cell.
-                # The kernel `r` is `torch.sqrt(x_dist**2 + y_dist**2)`.
-                # This `r` is used to calculate `w`.
-                # `grid[x_idx_mod, y_idx_mod] += kspace_data_weighted[i] * w[i]`
+                # Flatten target indices for index_add_
+                target_flat_indices = gx_mod * Ny_oversamp + gy_mod
                 
-                # This is a gridding operation. For each k-space point (kx_scaled, ky_scaled):
-                # it iterates over a width x width area of *grid cells* around it.
-                # dx, dy are offsets from the k-space point to the *center* of these grid cells.
-                # No, dx and dy are integer offsets for grid cells.
-                # Let k_s = (kx_scaled[i], ky_scaled[i]) be the i-th k-space sample.
-                # Let g_c = (cx, cy) be the *closest* grid cell index: cx = floor(kx_s), cy = floor(ky_s).
-                # The loop `for dx in range(-half_width, half_width + 1)`:
-                #   `idx_x = cx + dx` (this is a grid cell index)
-                #   `dist_x = kx_s - (idx_x + 0.5)` (dist from k-point to center of this grid cell)
-                # This is standard gridding.
+                # Accumulate weighted k-space data and kernel weights
+                grid.view(-1).index_add_(0, target_flat_indices, kspace_data_weighted * kernel_weights)
+                weight_grid.view(-1).index_add_(0, target_flat_indices, kernel_weights)
 
-                # Let's adapt the provided code's loop structure.
-                # For each k-space point k_pt = (kx_scaled[i], ky_scaled[i])
-                # Iterate integer grid cell offsets (kernel_dx, kernel_dy) from -W/2 to W/2
-                for kernel_gx_offset in range(-half_width, half_width + 1):
-                    for kernel_gy_offset in range(-half_width, half_width + 1):
-                        # Absolute grid cell index targeted by this kernel sample
-                        # This is the grid cell (gx, gy) we are currently considering.
-                        gx = torch.floor(kx_scaled + kernel_gx_offset).long()
-                        gy = torch.floor(ky_scaled + kernel_gy_offset).long()
-
-                        # Distances from the k-space point (kx_scaled, ky_scaled) to the *center* of the current grid cell (gx+0.5, gy+0.5)
-                        # No, the original code used:
-                        # x_dist = kx_scaled - gx.float()  (dist from k-point to left edge of cell gx)
-                        # y_dist = ky_scaled - gy.float()  (dist from k-point to top edge of cell gy)
-                        # This is not quite right for kernel centered on k-point.
-                        # The kernel argument 'r' should be the distance from the k-space sample
-                        # to the center of the grid cell being updated.
-                        # r_x = kx_scaled - (gx.float() + 0.5)
-                        # r_y = ky_scaled - (gy.float() + 0.5)
-                        # No, the original code's `r` is `sqrt((k_x - floor(k_x+dx))^2 + ...)`
-                        # This means `dx, dy` are NOT grid cell offsets relative to `floor(k_x)`.
-                        # They are offsets *added to k_x before flooring*.
-                        # So `x_idx = floor(k_x_scaled + dx_offset)` IS the grid cell.
-                        # And `x_dist = k_x_scaled - x_idx` means `k_x_scaled - floor(k_x_scaled + dx_offset)`.
-                        # This is not a distance to grid center.
-                        
-                        # Let's use the exact structure from the source _iternufft2d_nufft2d2_adjoint
-                        # dx, dy are offsets from the k-point, defining where kernel is sampled.
-                        # x_idx, y_idx are grid points where these samples are accumulated.
-                        
-                        # These are grid indices being updated.
-                        grid_x_indices = torch.floor(kx_scaled + dx_offset).long()
-                        grid_y_indices = torch.floor(ky_scaled + dy_offset).long()
-
-                        # Distances for kernel calculation: distance from k-point to the center of the kernel sample point (dx_offset, dy_offset away)
-                        # No, r is distance from k-point to the grid point (grid_x_indices, grid_y_indices)
-                        # dist_x_to_grid_cell_corner = kx_scaled - grid_x_indices.float()
-                        # dist_y_to_grid_cell_corner = ky_scaled - grid_y_indices.float()
-                        # r = torch.sqrt(dist_x_to_grid_cell_corner**2 + dist_y_to_grid_cell_corner**2)
-                        # This is not what _iternufft2d_kaiser_bessel_kernel expects for `r`.
-                        # The `r` for kaiser_bessel_kernel is typically |k - g| / (W/2) or similar.
-                        # In _iternufft2d_kaiser_bessel_kernel, r is distance from k-point to kernel sample point.
-                        # The kernel values w are computed based on distances dx_offset, dy_offset.
-                        
-                        # Let's use (dx_offset, dy_offset) as the argument to the kernel, representing distance.
-                        # This is `r_kernel_arg = sqrt(dx_offset^2 + dy_offset^2)`.
-                        # This must be a tensor for _kaiser_bessel_kernel.
-                        # This means for each k-point, we sum contributions from WxW kernel samples.
-                        # Each kernel sample value w(dx,dy) is placed onto grid cell floor(k_scaled + dx, k_scaled + dy).
-                        
-                        # Create a tensor for r for this (dx_offset, dy_offset)
-                        # This is the distance of this specific kernel tap (dx_offset, dy_offset) from the kernel center (0,0)
-                        r_kernel = torch.sqrt(torch.tensor(dx_offset**2 + dy_offset**2, dtype=torch.float32, device=self.device))
-                        
-                        # Kernel weight for this tap. r_kernel must be a tensor.
-                        w_kernel_tap = self._kaiser_bessel_kernel(r_kernel.expand(kx_scaled.shape[0])) # expand to all k-points
-
-                        # Grid cells to update
-                        gx_target = torch.floor(kx_scaled - dx_offset).long() # grid cell corresponding to this kernel tap
-                        gy_target = torch.floor(ky_scaled - dy_offset).long() # if kernel is centered at k_scaled
-
-                        # This interpretation seems more aligned with how KB kernels are used in gridding.
-                        # For each k-space point (k_x, k_y):
-                        #   Iterate grid cells (g_x, g_y) in its neighborhood (width x width around k_x, k_y)
-                        #   Calculate distance r = sqrt( (k_x - g_x)^2 + (k_y - g_y)^2 )
-                        #   Calculate kernel weight w = KB(r)
-                        #   grid[g_x, g_y] += w * data_k / sum_w_for_this_g_x_g_y
-                        #   weight_grid[g_x, g_y] += w
-                        
-                        # Let's follow the loop structure of the source code for now.
-                        # dx_offset, dy_offset are kernel sample positions relative to kernel center.
-                        
-                        # grid cell indices affected by k-space points when using this kernel tap
-                        # (kx_scaled is true k-space position on oversampled grid)
-                        # (dx_offset, dy_offset) is current part of kernel filter we are looking at
-                        # Target grid cells are floor(kx_scaled - dx_offset), floor(ky_scaled - dy_offset)
-                        # if kernel is centered at (0,0) and data point is at (kx_scaled, ky_scaled)
-                        # and we are summing onto the grid.
-                        
-                        # Let's use the original formulation as closely as possible.
-                        # x_idx, y_idx: grid cell where the data is placed.
-                        # x_dist, y_dist: distance from k-space point to that grid cell's origin.
-                        # r: based on x_dist, y_dist. This implies kernel value depends on sub-pixel location.
-                        
-                        x_idx = torch.floor(kx_scaled + dx_offset).long()
-                        y_idx = torch.floor(ky_scaled + dy_offset).long()
-                        
-                        # distance from k-space point (kx_scaled, ky_scaled) to the point (x_idx - dx_offset, y_idx - dy_offset)
-                        # This does not look like the 'r' for the KB kernel.
-                        # The 'r' should be distance from k-space point to grid cell center, normalized.
-                        # Or, if kernel is sampled at discrete points (dx,dy), then 'r' is distance of that sample point from kernel center.
-                        
-                        # The original code:
-                        # x_dist, y_dist = kx_scaled - x_idx.float(), ky_scaled - y_idx.float()
-                        # r = torch.sqrt(x_dist**2 + y_dist**2)
-                        # This implies r is distance from k-space point to the corner of the grid cell x_idx, y_idx.
-                        # And x_idx, y_idx are floor(k_scaled + dx_offset), floor(k_scaled + dy_offset)
-                        # This is confusing.
-
-                        # Let's assume the kernel is centered at each k-space point (kx_s, ky_s).
-                        # We iterate over grid cells (gx, gy) that are within W/2 of (kx_s, ky_s).
-                        # gx_min = floor(kx_s - W/2), gx_max = ceil(kx_s + W/2)
-                        # This is what typical gridding does.
-                        # The loop `for dx in range(-half_width, half_width + 1)` iterates W times.
-                        
-                        # Sticking to the original structure:
-                        # dx_offset, dy_offset are relative coordinates for kernel samples.
-                        # The kernel is evaluated AT these relative coordinates.
-                        r_for_kernel = torch.sqrt(torch.tensor(dx_offset**2 + dy_offset**2, dtype=torch.float32, device=self.device))
-                        # This needs to be tensor for each k-point if it varies, but here it's fixed for given (dx,dy)
-                        # The kernel function itself handles scalar r if needed, but here it's vectorized.
-                        # So, `r` must be a tensor of distances.
-                        # The original `_iternufft2d_kaiser_bessel_kernel` takes `r` as a tensor.
-                        # This `r` should be the distance from the center of the kernel to the sample point.
-                        # So, `r_values_for_this_offset` should be `sqrt(dx_offset^2 + dy_offset^2)`
-                        # This is a single scalar value for fixed (dx_offset, dy_offset).
-                        # We need to make it a tensor of the same size as kx_scaled for the kernel function.
-                        
-                        # `r_arg` should be the distance from the k-space sample to the grid point, scaled by width.
-                        # Let's use the structure from the forward pass for calculating w, as it seems more standard for interpolation.
-                        # For adjoint (gridding):
-                        # For each k-space point k_s = (kx_scaled[i], ky_scaled[i]):
-                        #   For each grid point g = (gx, gy) in the WxW neighborhood of k_s:
-                        #     dist_x = kx_scaled[i] - gx 
-                        #     dist_y = ky_scaled[i] - gy
-                        #     r = sqrt(dist_x^2 + dist_y^2)  <- this is the argument for KB kernel
-                        #     w = _kaiser_bessel_kernel(r)
-                        #     grid[gx % Nx_oversamp, gy % Ny_oversamp] += kspace_data_weighted[i] * w
-                        #     weight_grid[gx % Nx_oversamp, gy % Ny_oversamp] += w
-
-                        # This requires iterating neighborhood for EACH k-point.
-                        # The current loops iterate WxW times, and inside, vectorized over all k-points.
-                        
-                        # Let's use the provided `_iternufft2d_nufft2d2_adjoint` logic directly.
-                        # dx_offset, dy_offset are offsets from the *grid point* to the *k-space sample*.
-                        # No, this is also not right.
-
-                        # The loop structure `for dx_offset... for dy_offset...` implies that for each
-                        # k-space point, we are considering W*W "kernel taps".
-                        # `x_idx, y_idx` are the grid cells that the (k_point + offset) falls into.
-                        # `x_dist, y_dist` are `k_point - x_idx` (subpixel parts).
-                        # `r = sqrt(x_dist^2 + y_dist^2)` is the argument to the kernel.
-                        # This means the kernel shape depends on the subpixel location of (k_point+offset).
-                        # This is complex.
-
-                        # Let's use the exact formulation from the source:
-                        # `kx_scaled`, `ky_scaled` are the k-space sample positions on the oversampled grid.
-                        # `dx_offset`, `dy_offset` are integers from -W/2 to W/2.
-                        
-                        # `gx_absolute = torch.floor(kx_scaled + dx_offset).long()` : grid x-indices for these kernel points
-                        # `gy_absolute = torch.floor(ky_scaled + dy_offset).long()` : grid y-indices
-
-                        # `dist_x_to_gx_corner = kx_scaled - gx_absolute.float()`
-                        # `dist_y_to_gy_corner = ky_scaled - gy_absolute.float()`
-                        # `r_kernel_arg = torch.sqrt(dist_x_to_gx_corner**2 + dist_y_to_gy_corner**2)`
-                        # This `r` is the distance from k-space sample to corner of grid cell `(gx_absolute, gy_absolute)`.
-                        # This still feels off. The kernel argument `r` in `_iternufft2d_kaiser_bessel_kernel`
-                        # is `distance_from_center_of_kernel_support / (width/2)`.
-                        # If kernel is centered at `(kx_scaled, ky_scaled)`, and we are evaluating its effect on
-                        # grid cell `(gx,gy)`, then `r` should be `sqrt( (kx_scaled-gx)^2 + (ky_scaled-gy)^2 )`.
-
-                        # Let's use the forward pass's kernel evaluation logic as a reference, it's often more intuitive.
-                        # Forward: `x_idx = floor(kx_scaled + dx)`, `y_idx = floor(ky_scaled + dy)`
-                        # `x_dist = kx_scaled - x_idx`, `y_dist = ky_scaled - y_idx`
-                        # `r = sqrt(x_dist^2 + y_dist^2)`
-                        # `w = kernel(r)`
-                        # `kspace_data += grid[x_idx, y_idx] * w`
-                        # This `r` is distance from `kx_scaled` to `x_idx` (corner).
-                        # The roles of dx,dy are to select different grid points `x_idx, y_idx` around `kx_scaled`.
-
-                        # Re-interpreting the original _iternufft2d_nufft2d2_adjoint:
-                        # For each k-space point `k_s = (kx_scaled[i], ky_scaled[i])`:
-                        #   Loop `dx` from -W/2 to W/2, `dy` from -W/2 to W/2.
-                        #   These `dx, dy` define the grid cell `g = (floor(k_s_x + dx), floor(k_s_y + dy))`.
-                        #   No, this is not it. `dx,dy` are not offsets from `k_s`. They are absolute offsets.
-                        
-                        # The most straightforward gridding:
-                        # For each k-space point `k_s = (kx_scaled[i], ky_scaled[i])`:
-                        #   `center_gx = round(kx_scaled[i])`, `center_gy = round(ky_scaled[i])` (or floor)
-                        #   Loop `gx_offset` from -W/2 to W/2, `gy_offset` from -W/2 to W/2.
-                        #     `gx = center_gx + gx_offset`
-                        #     `gy = center_gy + gy_offset`
-                        #     `dist_x = kx_scaled[i] - gx` (or `gx_center = gx + 0.5`)
-                        #     `dist_y = ky_scaled[i] - gy`
-                        #     `r = torch.sqrt(dist_x**2 + dist_y**2)`
-                        #     `w = self._kaiser_bessel_kernel(r)`
-                        #     `grid[gx % Nxo, gy % Nyo] += kspace_data_weighted[i] * w`
-                        #     `weight_grid[gx % Nxo, gy % Nyo] += w`
-                        # This is how I'll implement it. It's standard.
-
-                        center_gx_approx = torch.round(kx_scaled).long() # nearest grid point to k_sample
-                        center_gy_approx = torch.round(ky_scaled).long()
-
-                        # Iterate over WxW grid cells around each k-space sample
-                        # dx_offset, dy_offset are offsets from center_gx_approx, center_gy_approx
-                        current_gx = center_gx_approx + dx_offset # absolute grid index
-                        current_gy = center_gy_approx + dy_offset # absolute grid index
-                        
-                        # Check bounds (optional, as modulo arithmetic handles it, but good for clarity)
-                        # if torch.any(current_gx < 0) or torch.any(current_gx >= Nx_oversamp) or \
-                        #    torch.any(current_gy < 0) or torch.any(current_gy >= Ny_oversamp):
-                        #    continue # This check is problematic with tensors. Rely on modulo.
-
-                        dist_x_to_cell_center = kx_scaled - (current_gx.float() + 0.5)
-                        dist_y_to_cell_center = ky_scaled - (current_gy.float() + 0.5)
-                        
-                        r_vals = torch.sqrt(dist_x_to_cell_center**2 + dist_y_to_cell_center**2)
-                        kernel_weights = self._kaiser_bessel_kernel(r_vals) # r_vals must be scaled by W/2 inside kernel or here
-
-                        # Modulo for periodic boundary conditions
-                        gx_target_mod = current_gx % Nx_oversamp
-                        gy_target_mod = current_gy % Ny_oversamp
-
-                        # Accumulate weighted k-space data onto the grid
-                        # This needs to be done carefully with tensor indexing if not looping k-points
-                        # The loop is over kernel offsets, operations inside are vectorized over k-points.
-                        # So, we need scatter_add_ or index_add_ for `grid` and `weight_grid`.
-                        
-                        # Using a simpler loop for now, similar to the original, assuming it was correct.
-                        # The original code's `x_idx, y_idx` were calculated based on `kx_scaled + dx_offset`.
-                        # This means `dx_offset, dy_offset` are not offsets from `center_gx_approx`.
-                        # They are offsets from the k-space sample location *used to determine which grid cell to update*.
-                        # And `r` was `kx_scaled - x_idx`, which is `kx_scaled - floor(kx_scaled + dx_offset)`.
-                        # This is `(kx_scaled + dx_offset) - floor(kx_scaled + dx_offset) - dx_offset`
-                        # i.e., `frac(kx_scaled + dx_offset) - dx_offset`. This `r` is unusual for KB.
-
-                        # Let's revert to the structure from the provided `_iternufft2d_nufft2d2_adjoint`
-                        # and trust its formulation of `r` and indexing.
-                        
-                        # gx_target = floor(kx_scaled + dx_offset)
-                        # gy_target = floor(ky_scaled + dy_offset)
-                        gx_target = torch.floor(kx_scaled + dx_offset).long()
-                        gy_target = torch.floor(ky_scaled + dy_offset).long()
-
-                        # dist_for_kernel_arg_x = kx_scaled - gx_target.float() # This is kx_s - floor(kx_s+dx) = frac(kx_s+dx) - dx (if dx != 0)
-                        # dist_for_kernel_arg_y = ky_scaled - gy_target.float()
-                        
-                        # The `r` in the original `_iternufft2d_kaiser_bessel_kernel` is distance from kernel sample point to kernel center.
-                        # So, if `(dx_offset, dy_offset)` is the coordinate of the kernel sample point relative to its center,
-                        # then `r = sqrt(dx_offset^2 + dy_offset^2)`.
-                        # This `r` is then used for `w`.
-                        # And `w` is applied to grid cell `floor(kx_scaled - dx_offset), floor(ky_scaled - dy_offset)`.
-                        # (Assuming kernel is centered at kx_scaled, and its tap at (-dx_offset, -dy_offset) affects grid cell floor(kx_scaled+dx_offset, k_scaled+dy_offset))
-                        # Or, if kernel tap is at (dx_offset, dy_offset) relative to kx_scaled, it affects grid cell floor(kx_scaled+dx_offset).
-                        
-                        # Using the direct translation of _iternufft2d_nufft2d_adjoint's r:
-                        dist_x = kx_scaled - gx_target.float() # dist from k-point to target grid cell's corner
-                        dist_y = ky_scaled - gy_target.float() # dist from k-point to target grid cell's corner
-                        r_kernel_arg = torch.sqrt(dist_x**2 + dist_y**2)
-                        # This `r` is passed to KB. KB expects `r` to be distance from center, normalized by W/2.
-                        # If `r` is `|k_actual - grid_target_corner|`, this seems not directly what KB expects.
-                        # However, the original code used this.
-                        
-                        # Let's assume `r` for `_kaiser_bessel_kernel` is simply the distance.
-                        # The normalization `2*r/width` happens inside `_kaiser_bessel_kernel`.
-                        # So `r` should be `sqrt( (k_center_x - grid_cell_center_x)^2 + ...)`
-                        # The original code: `r = torch.sqrt( (kx_scaled - x_idx.float())**2 + (ky_scaled - y_idx.float())**2 )`
-                        # where `x_idx = floor(kx_scaled + dx_offset)`.
-                        # This is `r = | k_s - floor(k_s + d) |`.
-                        
-                        # The most robust way is to calculate distance from k-space sample to the *center* of each grid cell in the window.
-                        # (current_gx_center, current_gy_center) = ( (gx_target.float() + 0.5), (gy_target.float() + 0.5) )
-                        # r_dist_k_to_cell_center_x = kx_scaled - (gx_target.float() + 0.5)
-                        # r_dist_k_to_cell_center_y = ky_scaled - (gy_target.float() + 0.5)
-                        # r_vals = torch.sqrt(r_dist_k_to_cell_center_x**2 + r_dist_k_to_cell_center_y**2)
-                        # kernel_weights = self._kaiser_bessel_kernel(r_vals)
-                        
-                        # This seems the most standard interpretation for gridding.
-                        # (gx_target, gy_target) are the grid cells we are iterating over relative to k-point.
-                        # Let dx_offset, dy_offset be the relative indices of grid cells around k_point.
-                        # gx_absolute = floor(kx_scaled) + dx_offset
-                        # gy_absolute = floor(ky_scaled) + dy_offset
-                        # r_x = kx_scaled - (gx_absolute.float() + 0.5)
-                        # r_y = ky_scaled - (gy_absolute.float() + 0.5)
-                        # r = sqrt(r_x^2 + r_y^2)
-                        # w = KB(r)
-                        # grid[gx_abs % Nxo, gy_abs % Nyo] += kspace_data_w[i] * w[i]
-                        # weight_grid[gx_abs % Nxo, gy_abs % Nyo] += w[i]
-                        # This is the structure I will use. dx_offset, dy_offset loop over kernel extent.
-
-                        gx_absolute_cell_index = torch.floor(kx_scaled).long() + dx_offset
-                        gy_absolute_cell_index = torch.floor(ky_scaled).long() + dy_offset
-                        
-                        dist_x_k_to_cell_center = kx_scaled - (gx_absolute_cell_index.float() + 0.5)
-                        dist_y_k_to_cell_center = ky_scaled - (gy_absolute_cell_index.float() + 0.5)
-                        
-                        r_for_kb = torch.sqrt(dist_x_k_to_cell_center**2 + dist_y_k_to_cell_center**2)
-                        kernel_sinc_weights = self._kaiser_bessel_kernel(r_for_kb) # these are w_j(k_i) in math notation
-
-                        gx_mod = gx_absolute_cell_index % Nx_oversamp
-                        gy_mod = gy_absolute_cell_index % Ny_oversamp
-                        
-                        # Vectorized update using index_add_ (scatter_add_)
-                        # Create flat indices for accumulation
-                        flat_indices = gx_mod * Ny_oversamp + gy_mod # Check if k-points dim is first or last
-                        
-                        # kspace_data_weighted and kernel_sinc_weights are (num_k_points,)
-                        # grid and weight_grid are (Nx_oversamp, Ny_oversamp)
-                        # Need to loop over k-points if using simple indexing, or use scatter_add.
-                        # The original code did:
-                        # for i in range(kspace_data_weighted.shape[0]):
-                        #   grid[gx_mod[i], gy_mod[i]] += kspace_data_weighted[i] * kernel_sinc_weights[i]
-                        #   weight_grid[gx_mod[i], gy_mod[i]] += kernel_sinc_weights[i]
-                        # This is correct but slow if not JITed.
-                        # PyTorch equivalent:
-                        # gx_mod_flat = gx_mod.flatten()
-                        # gy_mod_flat = gy_mod.flatten()
-                        # kspace_flat = kspace_data_weighted # already flat
-                        # kernel_w_flat = kernel_sinc_weights # already flat
-                        
-                        # grid.view(-1).index_add_(0, gx_mod * Ny_oversamp + gy_mod, kspace_data_weighted * kernel_sinc_weights)
-                        # weight_grid.view(-1).index_add_(0, gx_mod * Ny_oversamp + gy_mod, kernel_sinc_weights)
-                        # This is for unique indices. If indices repeat (multiple k-points map to same grid cell with this offset),
-                        # index_add_ is correct. gx_mod is (num_k_points), so indices can repeat.
-
-                        # Flatten target indices for grid
-                        target_flat_indices = gx_mod * Ny_oversamp + gy_mod
-                        
-                        grid.view(-1).index_add_(0, target_flat_indices, kspace_data_weighted * kernel_sinc_weights)
-                        weight_grid.view(-1).index_add_(0, target_flat_indices, kernel_sinc_weights)
-
-        weight_grid = torch.where(weight_grid == 0, torch.ones_like(weight_grid), weight_grid)
+        # Normalize grid by sum of weights
+        weight_grid = torch.where(weight_grid == 0, torch.ones_like(weight_grid), weight_grid) # Avoid div by zero
         grid = grid / weight_grid
         
-        # Inverse FFT and cropping
+        # Inverse FFT, shift, and crop to original image size
         img = torch.fft.ifftshift(torch.fft.ifft2(torch.fft.fftshift(grid)))
         start_x, start_y = (Nx_oversamp - Nx) // 2, (Ny_oversamp - Ny) // 2
         img_cropped = img[start_x:start_x + Nx, start_y:start_y + Ny]
         
-        return img_cropped * float(Nx_oversamp * Ny_oversamp) # Scaling factor based on FFT size (like sigpy)
+        # Scaling factor to approximate signal energy preservation (like sigpy, etc.)
+        return img_cropped * float(Nx_oversamp * Ny_oversamp)
 
 
     def forward(self, image_data: torch.Tensor) -> torch.Tensor:
         """
         Apply the forward NUFFT operation (image to k-space) for 2D.
-
-        Args:
-            image_data: Input image data tensor (image_shape[0], image_shape[1]).
-                        Assumed to be complex-valued.
-
-        Returns:
-            Output k-space data tensor (num_k_points,).
         """
         if image_data.shape != self.image_shape:
             raise ValueError(f"Input image_data shape {image_data.shape} does not match expected {self.image_shape}")
 
-        image_data = image_data.to(self.device)
+        image_data = image_data.to(self.device) # Ensure data is on correct device
         kx, ky = self.k_trajectory[:, 0], self.k_trajectory[:, 1]
 
         Nx, Ny = self.image_shape
-        Nx_oversamp, Ny_oversamp = int(Nx * self.oversamp_factor), int(Ny * self.oversamp_factor)
+        # Use self.Kd for oversampled grid dimensions
+        Nx_oversamp, Ny_oversamp = self.Kd[0], self.Kd[1]
 
-        # Pad image
+        # Pad image to oversampled size
         pad_x, pad_y = (Nx_oversamp - Nx) // 2, (Ny_oversamp - Ny) // 2
         image_padded = torch.zeros((Nx_oversamp, Ny_oversamp), dtype=torch.complex64, device=self.device)
         image_padded[pad_x:pad_x + Nx, pad_y:pad_y + Ny] = image_data
@@ -577,71 +291,559 @@ class NUFFT2D(NUFFT):
         # FFT of padded image
         kspace_cart_oversamp = torch.fft.fftshift(torch.fft.fft2(torch.fft.ifftshift(image_padded)))
         
-        # Scale k-space coordinates
+        # Scale k-space coordinates (target non-Cartesian points on oversampled grid)
         kx_scaled = (kx + 0.5) * Nx_oversamp
         ky_scaled = (ky + 0.5) * Ny_oversamp
         
-        half_width = self.width // 2
+        # Use self.kb_J for kernel width
+        half_width = self.kb_J[0] // 2 
         
         kspace_noncart = torch.zeros(kx.shape[0], dtype=torch.complex64, device=self.device)
         weight_sum = torch.zeros(kx.shape[0], dtype=torch.float32, device=self.device)
 
-        # Interpolation from oversampled Cartesian grid to non-Cartesian points
-        # For each non-Cartesian point (kx_s, ky_s) = (kx_scaled[i], ky_scaled[i]):
-        #   Loop `dx_offset` from -W/2 to W/2, `dy_offset` from -W/2 to W/2.
-        #   These `dx_offset, dy_offset` define the grid cell `g = (floor(kx_s + dx_offset), floor(ky_s + dy_offset))`
-        #   No, this is not right.
-        #   The loop is over kernel sample points relative to the *output* non-Cartesian point.
-        #   For each k-space point `k_s = (kx_scaled[i], ky_scaled[i])`:
-        #     `val = 0`, `w_sum = 0`
-        #     Loop `dx_offset` from -W/2 to W/2, `dy_offset` from -W/2 to W/2 (these are grid cell offsets from k_s)
-        #       `gx = floor(kx_scaled[i]) + dx_offset`
-        #       `gy = floor(ky_scaled[i]) + dy_offset`
-        #       `dist_x = kx_scaled[i] - (gx.float() + 0.5)` (dist from k-point to center of this grid cell)
-        #       `dist_y = ky_scaled[i] - (gy.float() + 0.5)`
-        #       `r = sqrt(dist_x^2 + dist_y^2)`
-        #       `w = self._kaiser_bessel_kernel(r)`
-        #       `val += kspace_cart_oversamp[gx % Nxo, gy % Nyo] * w`
-        #       `w_sum += w`
-        #     `kspace_noncart[i] = val / w_sum`
-        # This is the standard interpolation logic.
-
+        # Standard interpolation: iterate kernel window around each target k-space sample
         for dx_offset in range(-half_width, half_width + 1):
             for dy_offset in range(-half_width, half_width + 1):
-                # Grid cell indices from which to interpolate
-                # These are neighbors of the k-space sample point on the oversampled grid.
-                # gx_source = floor(kx_scaled) + dx_offset -> this is what I used for adjoint.
-                # The original code for forward:
-                # x_idx = floor(kx_scaled + dx_offset).long()
-                # y_idx = floor(ky_scaled + dy_offset).long()
-                # x_dist = kx_scaled - x_idx.float()
-                # y_dist = ky_scaled - y_idx.float()
-                # r = torch.sqrt(x_dist**2 + y_dist**2)
-                # w = _kaiser_bessel_kernel(r, self.width, self.beta)
-                # kspace_data += kspace_cart[x_idx_mod, y_idx_mod] * w
-                # weight_sum += w
-                # This means x_idx, y_idx are grid points. r is distance from kx_scaled to corner of x_idx,y_idx.
-                # This is not distance from kx_scaled to center of grid cell x_idx,y_idx.
-                # Let's use the standard interpolation interpretation.
-
-                # gx_source_absolute indices of grid points contributing to kx_scaled
+                # gx_source_absolute: absolute grid cell index on kspace_cart_oversamp we are reading FROM.
+                # dx_offset, dy_offset define which cell in the WxW neighborhood around kx_scaled.floor()
                 gx_source_absolute = torch.floor(kx_scaled).long() + dx_offset
                 gy_source_absolute = torch.floor(ky_scaled).long() + dy_offset
 
+                # dist_x_k_to_grid_center: distance from target k-space sample to *center* of this source grid cell
                 dist_x_k_to_grid_center = kx_scaled - (gx_source_absolute.float() + 0.5)
                 dist_y_k_to_grid_center = ky_scaled - (gy_source_absolute.float() + 0.5)
 
                 r_for_kb = torch.sqrt(dist_x_k_to_grid_center**2 + dist_y_k_to_grid_center**2)
                 kernel_interp_weights = self._kaiser_bessel_kernel(r_for_kb)
 
+                # Modulo for periodic boundary conditions when reading from kspace_cart_oversamp
                 gx_source_mod = gx_source_absolute % Nx_oversamp
                 gy_source_mod = gy_source_absolute % Ny_oversamp
                 
                 kspace_noncart += kspace_cart_oversamp[gx_source_mod, gy_source_mod] * kernel_interp_weights
                 weight_sum += kernel_interp_weights
         
-        weight_sum = torch.where(weight_sum == 0, torch.ones_like(weight_sum), weight_sum)
+        # Normalize by sum of weights
+        weight_sum = torch.where(weight_sum == 0, torch.ones_like(weight_sum), weight_sum) # Avoid div by zero
         kspace_noncart /= weight_sum
         
-        return kspace_noncart / float(Nx_oversamp * Ny_oversamp) # Scaling factor (like sigpy)
+        # Scaling factor (inverse of adjoint scaling)
+        return kspace_noncart / float(Nx_oversamp * Ny_oversamp)
 
+
+class NUFFT3D(NUFFT):
+    def __init__(self, 
+                 image_shape: tuple[int, int, int], 
+                 k_trajectory: torch.Tensor, 
+                 oversamp_factor: tuple[float, float, float],
+                 kb_J: tuple[int, int, int],
+                 kb_alpha: tuple[float, float, float],
+                 Ld: tuple[int, int, int],
+                 kb_m: tuple[float, float, float] | None = None,
+                 Kd: tuple[int, int, int] | None = None,
+                 n_shift: tuple[float, float, float] | None = None,
+                 device: str | torch.device = 'cpu'):
+        
+        super().__init__(image_shape=image_shape, 
+                         k_trajectory=k_trajectory, 
+                         oversamp_factor=oversamp_factor, 
+                         kb_J=kb_J, 
+                         kb_alpha=kb_alpha, 
+                         kb_m=kb_m, 
+                         Ld=Ld, 
+                         Kd=Kd, 
+                         device=device)
+
+        if len(self.image_shape) != 3:
+            raise ValueError(f"NUFFT3D expects a 3D image_shape, got {self.image_shape}")
+        if self.k_trajectory.shape[-1] != 3:
+            raise ValueError(f"NUFFT3D expects k_trajectory with last dimension 3, got {self.k_trajectory.shape}")
+
+        if n_shift is None:
+            self.n_shift = (0.0,) * len(self.image_shape)
+        else:
+            self.n_shift = tuple(n_shift)
+            if len(self.n_shift) != len(self.image_shape):
+                 raise ValueError(f"Length of n_shift {len(self.n_shift)} must match image dimensionality {len(self.image_shape)}")
+
+
+        self.interp_tables: list[torch.Tensor] | None = None
+        self.scaling_factors: torch.Tensor | None = None
+        self.phase_shifts: torch.Tensor | None = None
+        
+        self._precompute_interpolation_tables()
+        self._precompute_scaling_factors()
+
+        if not all(s == 0.0 for s in self.n_shift):
+            # k_trajectory is (num_k_points, D), n_shift is (D,)
+            # Phase shifts for k-space: exp(1j * k_traj @ n_shift_vec)
+            n_shift_tensor = torch.tensor(self.n_shift, dtype=torch.float32, device=self.device)
+            # Ensure k_trajectory is float for matmul if it's not already
+            k_traj_float = self.k_trajectory.float() 
+            self.phase_shifts = torch.exp(1j * (k_traj_float @ n_shift_tensor))
+            # phase_shifts will be (num_k_points,)
+
+    def _compute_kb_values_1d(self, r_vals: torch.Tensor, J: int, alpha: float, m: float) -> torch.Tensor:
+        """
+        Computes 1D generalized Kaiser-Bessel kernel values.
+        r_vals: distances |x|, can be outside [-J/2, J/2]
+        J: kernel width for this dimension
+        alpha: shape parameter for this dimension
+        m: order parameter for this dimension
+        """
+        kb_kernel_vals = torch.zeros_like(r_vals, dtype=torch.complex64) # Output complex
+        
+        # Mask for r_vals within kernel support abs(r_vals) <= J/2
+        # Note: r_vals are distances, so they are non-negative.
+        # The original MIRT code uses x for r_vals, which can be negative.
+        # Here, if r_vals are |x|, then mask is r_vals <= J/2.
+        # If r_vals are x, then mask is torch.abs(r_vals) <= (J / 2.0)
+        # Assuming r_vals are actual coordinates x, not necessarily |x|.
+        mask = torch.abs(r_vals) <= (J / 2.0)
+        
+        # f = sqrt(1 - (x / (J/2))^2) for x within support
+        # We use r_vals[mask] to ensure we only compute for valid points.
+        val_inside_sqrt = torch.clamp(1.0 - (r_vals[mask] / (J / 2.0))**2, min=0.0)
+        f = torch.sqrt(val_inside_sqrt)
+        
+        # Numerator: (f^m * I_m(alpha*f))
+        f_cpu = f.cpu().numpy()
+        alpha_f_cpu = alpha * f_cpu # alpha is scalar
+        
+        if m == 0.0:
+            numerator_bessel_vals_np = scipy.special.i0(alpha_f_cpu)
+            denominator_bessel_val_np = scipy.special.i0(alpha)
+        else:
+            numerator_bessel_vals_np = scipy.special.iv(m, alpha_f_cpu)
+            denominator_bessel_val_np = scipy.special.iv(m, alpha)
+
+        numerator_bessel_torch = torch.from_numpy(numerator_bessel_vals_np.astype(np.float32)).to(r_vals.device)
+        
+        if m == 0.0: # f^0 = 1
+            numerator = numerator_bessel_torch
+        else:
+            numerator = (f**m) * numerator_bessel_torch
+            
+        if np.isclose(float(denominator_bessel_val_np), 0.0):
+            kb_kernel_vals[mask] = 0.0 # Or some other handling
+        else:
+            kb_kernel_vals[mask] = numerator / float(denominator_bessel_val_np)
+            
+        return kb_kernel_vals
+
+    def _precompute_interpolation_tables(self):
+        dd = len(self.image_shape)
+        self.interp_tables = []
+        for d_idx in range(dd):
+            J_d = self.kb_J[d_idx]
+            alpha_d = self.kb_alpha[d_idx]
+            m_d = self.kb_m[d_idx]
+            L_d = self.Ld[d_idx]
+            
+            # Table query points for one dimension from -J_d/2 to J_d/2
+            # These are the 'x' arguments (distances from center) for the KB kernel
+            table_query_points = torch.linspace(-J_d / 2.0, J_d / 2.0, steps=J_d * L_d + 1, device=self.device)
+            
+            h_d = self._compute_kb_values_1d(table_query_points, J_d, alpha_d, m_d)
+            self.interp_tables.append(h_d) # Already complex from _compute_kb_values_1d
+
+    def _kaiser_bessel_ft_1d(self, u: torch.Tensor, J: int, alpha: float, m: float) -> torch.Tensor:
+        """
+        Computes the 1D Fourier Transform of the Kaiser-Bessel kernel.
+        u: normalized frequency arguments (u_d / Kd_d)
+        J, alpha, m: kernel parameters for this dimension
+        Returns real-valued FT.
+        """
+        # z = sqrt( (2*pi*(J/2)*u)^2 - alpha^2 )
+        # Add small imaginary epsilon to sqrt argument to handle negative real parts correctly (for complex z)
+        z_arg_sq = (2 * np.pi * (J / 2.0) * u)**2 - alpha**2
+        z = torch.sqrt(z_arg_sq.to(torch.complex64) + 1e-12j) # Ensure complex sqrt
+        
+        nu = 0.5 + m
+
+        # Denominator I_m(alpha)
+        if m == 0.0:
+            den_bessel_val = scipy.special.i0(alpha)
+        else:
+            den_bessel_val = scipy.special.iv(m, alpha)
+        
+        if np.isclose(float(den_bessel_val), 0.0):
+            # This should not happen with typical alpha > 0
+            return torch.zeros_like(u, dtype=torch.float32)
+
+        # Term J_nu(z) / z^nu
+        # Handle z=0 case
+        # J_nu(z) / z^nu -> 1 / (2^nu * Gamma(nu+1)) as z -> 0
+        # J_0(0) = 1. So for nu=0, J_0(z)/z^0 = J_0(z), at z=0, this is 1.
+        # Limit for nu=0: 1 / (2^0 * Gamma(1)) = 1.
+        
+        z_cpu_numpy = z.cpu().numpy() # Scipy works on numpy arrays
+        jn_z_val_np = scipy.special.jv(nu, z_cpu_numpy)
+        
+        # Ratio J_nu(z) / z^nu
+        ratio_val = torch.zeros_like(z, dtype=torch.complex64)
+        
+        # Non-zero z
+        mask_z_nonzero = torch.abs(z) > 1e-9 # Threshold for non-zero
+        if torch.any(mask_z_nonzero):
+            ratio_val[mask_z_nonzero] = torch.from_numpy(
+                jn_z_val_np[mask_z_nonzero.cpu().numpy()]
+            ).to(z.device) / (z[mask_z_nonzero]**nu)
+
+        # Zero z
+        mask_z_zero = ~mask_z_nonzero
+        if torch.any(mask_z_zero):
+            limit_val = 1.0 / ( (2**nu) * math.gamma(nu + 1) )
+            ratio_val[mask_z_zero] = limit_val
+            
+        # Main formula: Y(u) = (2*pi)^(1/2) * (J/2) * alpha^m / I_m(alpha) * ratio_val
+        # MIRT formula seems to be (2*pi)^(d/2) * prod_d( (Jd/2) * alpha_d^m_d / I_m_d(alpha_d) * ratio_d )
+        # For 1D, d=1.
+        const_factor = np.sqrt(2 * np.pi) * (J / 2.0) * (alpha**m) / float(den_bessel_val)
+        ft_vals_complex = const_factor * ratio_val
+        
+        return ft_vals_complex.real # FT of KB kernel is real
+
+    def _precompute_scaling_factors(self):
+        dd = len(self.image_shape)
+        s_factors_list_1d = []
+
+        for d_idx in range(dd):
+            J_d = self.kb_J[d_idx]
+            alpha_d = self.kb_alpha[d_idx]
+            m_d = self.kb_m[d_idx]
+            Kd_d = self.Kd[d_idx]
+            Nd_d = self.image_shape[d_idx]
+
+            # Frequency coordinates for this dimension: -(Nd/2) to (Nd/2)-1 or similar
+            # MIRT uses: nc = [0:N-1] - N/2; if N is even, range is -N/2 to N/2-1
+            # if N is odd, range is -(N-1)/2 to (N-1)/2
+            # torch.arange(Nd_d) - (Nd_d -1)/2.0 gives correct center for both even/odd
+            u_d_grid = torch.arange(Nd_d, device=self.device) - (Nd_d - 1.0) / 2.0
+            u_d_normalized = u_d_grid / Kd_d # Normalized by oversampled grid size Kd
+
+            ft_kb_d = self._kaiser_bessel_ft_1d(u_d_normalized, J_d, alpha_d, m_d)
+            
+            # Inverse, handle potential division by zero if ft_kb_d can be zero
+            # (though FT of KB is generally non-zero in passband)
+            scaling_factor_1d = torch.where(
+                torch.abs(ft_kb_d) < 1e-9, # Threshold for effectively zero
+                torch.zeros_like(ft_kb_d), 
+                1.0 / ft_kb_d
+            ).to(torch.complex64) # Ensure complex type
+            s_factors_list_1d.append(scaling_factor_1d)
+
+        # Combine 1D scaling factors using broadcasting via meshgrid
+        # grids will be a list of tensors, each having shape like (N1,1,1), (1,N2,1), (1,1,N3) for 3D
+        # This is for 'ij' indexing. For 'xy' (Cartesian), shapes would be different.
+        # MIRT's st.sn is Nd1 x Nd2 x Nd3.
+        reshaped_factors = []
+        for i, sf_1d in enumerate(s_factors_list_1d):
+            new_shape = [1] * dd
+            new_shape[i] = self.image_shape[i]
+            reshaped_factors.append(sf_1d.view(new_shape))
+        
+        # Element-wise product via broadcasting
+        self.scaling_factors = reshaped_factors[0]
+        for i in range(1, dd):
+            self.scaling_factors = self.scaling_factors * reshaped_factors[i]
+        
+        # Ensure final scaling_factors has shape self.image_shape and is complex
+        self.scaling_factors = self.scaling_factors.reshape(self.image_shape).to(torch.complex64)
+
+
+    @abc.abstractmethod
+    def _lookup_1d_table(self, table: torch.Tensor, relative_offset_grid_units: torch.Tensor, L_d: int) -> torch.Tensor:
+        """
+        Performs 1D linear interpolation on a precomputed table.
+        Args:
+            table: The 1D interpolation table (complex tensor).
+            relative_offset_grid_units: Fractional offset from the nearest grid point, in grid units.
+                                         Shape should be compatible for broadcasting with table lookups.
+            L_d: Table oversampling factor for this dimension.
+        Returns:
+            Interpolated values (complex tensor).
+        """
+        if not table.is_complex():
+            # This should not happen if interp_tables are complex
+            table = table.to(torch.complex64)
+
+        table_len = table.shape[0]
+        table_center_idx = (table_len - 1) / 2.0
+
+        # Calculate floating point index into the table
+        # relative_offset_grid_units is (delta_d - j_offset_d)
+        # This value represents the distance from the true k-space sample (tm_d) to the
+        # (nearest_grid_idx_d + j_offset_d)-th grid point, which is where the kernel tap is centered.
+        # The table itself is indexed by (distance_from_kernel_center * L_d).
+        # So, if relative_offset_grid_units is this distance, then the index is center + this_dist * L_d.
+        table_idx_float = table_center_idx + relative_offset_grid_units * L_d
+
+        # Linear interpolation (order=1)
+        idx_low = torch.floor(table_idx_float).long()
+        idx_high = torch.ceil(table_idx_float).long()
+        
+        # Fractional part for interpolation
+        frac = table_idx_float - idx_low.float()
+
+        # Boundary conditions: clamp indices to table bounds
+        idx_low = torch.clamp(idx_low, 0, table_len - 1)
+        idx_high = torch.clamp(idx_high, 0, table_len - 1)
+
+        val_low = table[idx_low]
+        val_high = table[idx_high]
+        
+        # Perform interpolation: (1-frac)*val_low + frac*val_high
+        interpolated_val = (1.0 - frac) * val_low + frac * val_high
+        return interpolated_val
+
+    def forward(self, image_data: torch.Tensor) -> torch.Tensor:
+        """
+        Apply the forward NUFFT operation (image to k-space) for 3D using table interpolation.
+        """
+        # 1. Input Validation
+        if image_data.shape != self.image_shape:
+            raise ValueError(f"Input image_data shape {image_data.shape} must match NUFFT image_shape {self.image_shape}")
+        if image_data.device != self.device:
+            image_data = image_data.to(self.device)
+        if not image_data.is_complex():
+            image_data = image_data.to(torch.complex64)
+        
+        # 2. Apply Scaling Factors (Image Domain)
+        if self.scaling_factors is None:
+            raise RuntimeError("Scaling factors not precomputed. Call _precompute_scaling_factors first.")
+        scaled_image = image_data * self.scaling_factors
+
+        # 3. Oversampled FFT
+        # Pad to self.Kd if image_shape is smaller, then FFT
+        pad_amount = []
+        for kd_dim, im_dim in zip(self.Kd, self.image_shape):
+            pad_before = (kd_dim - im_dim) // 2
+            pad_after = kd_dim - im_dim - pad_before
+            pad_amount.extend([pad_before, pad_after])
+        
+        # PyTorch padding format is (pad_dimN_start, pad_dimN_end, pad_dimN-1_start, ...)
+        # We need to reverse it for torch.nn.functional.pad
+        # For 3D: (pad_dim2_start, pad_dim2_end, pad_dim1_start, pad_dim1_end, pad_dim0_start, pad_dim0_end)
+        torch_pad_format = []
+        for i in range(len(self.image_shape) -1, -1, -1): # Iterate dims from last to first
+            torch_pad_format.extend([pad_amount[2*i], pad_amount[2*i+1]])
+
+        padded_scaled_image = torch.nn.functional.pad(scaled_image, torch_pad_format, mode='constant', value=0)
+        
+        Xk_grid = torch.fft.fftshift(torch.fft.fftn(torch.fft.ifftshift(padded_scaled_image), s=self.Kd))
+
+        # 4. Prepare for Interpolation
+        dd = len(self.image_shape) # Should be 3
+        if dd != 3: # Should have been caught by __init__ but good to be safe
+            raise ValueError(f"NUFFT3D forward method expects 3D data, image_shape has {dd} dimensions.")
+
+        num_k_points = self.k_trajectory.shape[0]
+        interpolated_k_space_values = torch.zeros(num_k_points, dtype=torch.complex64, device=self.device)
+        interpolated_k_space_weights = torch.zeros(num_k_points, dtype=torch.float32, device=self.device) # For sum of kernel weights
+
+        om = self.k_trajectory # Shape (num_k_points, dd)
+
+        # 5. Coordinate Scaling (tm)
+        scaled_coords_tm = [] # List to store tm_d for each dimension
+        for d_idx in range(dd):
+            gamma_d = 2 * np.pi / self.Kd[d_idx]
+            # om already on self.device, ensure float for division safety
+            tm_d = om[:, d_idx].float() / gamma_d 
+            scaled_coords_tm.append(tm_d)
+
+        # 6. Table-Based Interpolation
+        if self.interp_tables is None:
+             raise RuntimeError("Interpolation tables not precomputed. Call _precompute_interpolation_tables first.")
+
+        # Nearest grid points and fractional offsets for all k-points (vectorized)
+        k_nearest_all_kpoints = [] # List of tensors [k_nearest_x_all, k_nearest_y_all, k_nearest_z_all]
+        delta_all_kpoints = []   # List of tensors [delta_x_all, delta_y_all, delta_z_all]
+        for d_idx in range(dd):
+            current_tm_d_all_kpoints = scaled_coords_tm[d_idx] # (num_k_points,)
+            k_nearest_d = torch.round(current_tm_d_all_kpoints) # .long() later for indexing
+            delta_d = current_tm_d_all_kpoints - k_nearest_d
+            k_nearest_all_kpoints.append(k_nearest_d.long())
+            delta_all_kpoints.append(delta_d)
+
+        # Kernel tap iteration loops (innermost part of the MIRT interp)
+        # These loops iterate over Jx * Jy * Jz taps for the kernel
+        # For each k-point, we sum contributions from these Jx*Jy*Jz grid points around it.
+        
+        # Create indices for J taps for each dimension
+        # j_offsets_dim[d] will be a tensor of offsets: [-Jd/2, ..., Jd/2-1] or similar
+        j_offsets_dim = []
+        for d_idx in range(dd):
+            J_d = self.kb_J[d_idx]
+            # Offsets from kernel center, e.g., for J=4: -2, -1, 0, 1. For J=5: -2, -1, 0, 1, 2
+            # MIRT typically uses j = 0..J-1, and then offset by -J/2 or similar.
+            # Let's use offsets directly: range from -floor(J/2) to ceil(J/2)-1 or similar
+            # A simple way: j_coords = torch.arange(J_d, device=self.device) - J_d // 2
+            # This gives for J=4: [-2, -1, 0, 1]. For J=5: [-2, -1, 0, 1, 2] (center at index 2)
+            j_coords = torch.arange(-(J_d // 2), (J_d + 1) // 2, device=self.device) # e.g. J=4 -> -2,-1,0,1. J=5 -> -2,-1,0,1,2
+            j_offsets_dim.append(j_coords)
+
+        # Iterate over all k-points (can be slow, but per instructions)
+        for m_idx in range(num_k_points):
+            current_val_sum = torch.tensor(0.0, dtype=torch.complex64, device=self.device)
+            current_weight_sum = torch.tensor(0.0, dtype=torch.float32, device=self.device)
+
+            # Get nearest grid point and delta for the current k-point m_idx
+            k_nearest_m = [k_nearest_all_kpoints[d][m_idx] for d in range(dd)] # [k_near_x_m, k_near_y_m, k_near_z_m]
+            delta_m = [delta_all_kpoints[d][m_idx] for d in range(dd)]         # [delta_x_m, delta_y_m, delta_z_m]
+
+            # Nested loops for Jz, Jy, Jx kernel taps
+            for jz_offset in j_offsets_dim[2]:
+                abs_gz = k_nearest_m[2] + jz_offset
+                # Relative offset for table lookup: delta_z - jz_offset
+                # This is distance from k-space sample (tm_z) to this specific grid tap (k_nearest_z + jz_offset)
+                kernel_val_z = self._lookup_1d_table(self.interp_tables[2], delta_m[2] - jz_offset, self.Ld[2])
+
+                for jy_offset in j_offsets_dim[1]:
+                    abs_gy = k_nearest_m[1] + jy_offset
+                    kernel_val_y = self._lookup_1d_table(self.interp_tables[1], delta_m[1] - jy_offset, self.Ld[1])
+
+                    for jx_offset in j_offsets_dim[0]:
+                        abs_gx = k_nearest_m[0] + jx_offset
+                        kernel_val_x = self._lookup_1d_table(self.interp_tables[0], delta_m[0] - jx_offset, self.Ld[0])
+                        
+                        effective_kernel_weight = kernel_val_x * kernel_val_y * kernel_val_z
+                        
+                        # Apply modulo for periodic boundary conditions on Xk_grid
+                        gz_mod = abs_gz % self.Kd[2]
+                        gy_mod = abs_gy % self.Kd[1]
+                        gx_mod = abs_gx % self.Kd[0]
+                        
+                        grid_val_from_Xk = Xk_grid[gz_mod, gy_mod, gx_mod]
+                        
+                        current_val_sum += grid_val_from_Xk * effective_kernel_weight
+                        current_weight_sum += effective_kernel_weight.real # As per MIRT for complex kernel
+
+            if torch.abs(current_weight_sum) > 1e-9: # Avoid division by zero
+                interpolated_k_space_values[m_idx] = current_val_sum / current_weight_sum
+            else:
+                interpolated_k_space_values[m_idx] = 0.0 # Or handle as error/NaN
+        
+        # 7. Apply Phase Shift
+        if self.phase_shifts is not None:
+            interpolated_k_space_values = interpolated_k_space_values * self.phase_shifts
+
+        # 8. Return
+        return interpolated_k_space_values
+
+    def adjoint(self, kspace_data: torch.Tensor) -> torch.Tensor:
+        """
+        Apply the adjoint NUFFT operation (k-space to image) for 3D using table-based gridding.
+
+        Note on Density Compensation (DCF): This method, similar to MIRT's nufft_adj,
+        does NOT internally apply density compensation. If DCF is required, the input
+        `kspace_data` should be pre-multiplied by the DCF weights by the user.
+        E.g., `dcf_kspace_data = kspace_data * dcf_weights; output_image = nufft_op.adjoint(dcf_kspace_data)`.
+        """
+        # 1. Input Validation
+        if kspace_data.ndim != 1:
+            raise ValueError(f"Input kspace_data must be a 1D tensor, got shape {kspace_data.shape}")
+        if kspace_data.shape[0] != self.k_trajectory.shape[0]:
+            raise ValueError(f"Input kspace_data shape {kspace_data.shape[0]} must match k_trajectory points {self.k_trajectory.shape[0]}")
+        if kspace_data.device != self.device:
+            kspace_data = kspace_data.to(self.device)
+        if not kspace_data.is_complex():
+            kspace_data = kspace_data.to(torch.complex64)
+
+        # 2. Density Compensation (User responsibility - see docstring)
+        
+        # 3. Apply Adjoint Phase Shift
+        if self.phase_shifts is not None:
+            phase_adjusted_kspace_data = kspace_data * self.phase_shifts.conj()
+        else:
+            phase_adjusted_kspace_data = kspace_data
+
+        # 4. Prepare for Gridding
+        dd = len(self.image_shape) # Should be 3
+        num_k_points = self.k_trajectory.shape[0]
+        gridded_k_space = torch.zeros(self.Kd, dtype=torch.complex64, device=self.device)
+        om = self.k_trajectory
+
+        # 5. Coordinate Scaling (tm) & Nearest Grid Points/Deltas (vectorized over k-points)
+        scaled_coords_tm = []
+        k_nearest_all_kpoints = []
+        delta_all_kpoints = []
+        for d_idx in range(dd):
+            gamma_d = 2 * np.pi / self.Kd[d_idx]
+            tm_d_all = om[:, d_idx].float() / gamma_d
+            scaled_coords_tm.append(tm_d_all)
+            
+            k_nearest_d_all = torch.round(tm_d_all)
+            delta_d_all = tm_d_all - k_nearest_d_all
+            k_nearest_all_kpoints.append(k_nearest_d_all.long())
+            delta_all_kpoints.append(delta_d_all)
+
+        # 6. Table-Based Gridding
+        if self.interp_tables is None:
+             raise RuntimeError("Interpolation tables not precomputed. Call _precompute_interpolation_tables first.")
+
+        j_offsets_dim = []
+        for d_idx in range(dd):
+            J_d = self.kb_J[d_idx]
+            j_coords = torch.arange(-(J_d // 2), (J_d + 1) // 2, device=self.device)
+            j_offsets_dim.append(j_coords)
+        
+        # Loop over k-points
+        for m_idx in range(num_k_points):
+            current_k_sample_val = phase_adjusted_kspace_data[m_idx]
+            if torch.abs(current_k_sample_val) < 1e-15: # Optimization: skip if sample is effectively zero
+                continue
+
+            k_nearest_m = [k_nearest_all_kpoints[d][m_idx] for d in range(dd)]
+            delta_m = [delta_all_kpoints[d][m_idx] for d in range(dd)]
+
+            # Innermost 3D loop for kernel taps
+            for jz_offset in j_offsets_dim[2]:
+                abs_gz = k_nearest_m[2] + jz_offset
+                kernel_val_z = self._lookup_1d_table(self.interp_tables[2], delta_m[2] - jz_offset, self.Ld[2])
+
+                for jy_offset in j_offsets_dim[1]:
+                    abs_gy = k_nearest_m[1] + jy_offset
+                    kernel_val_y = self._lookup_1d_table(self.interp_tables[1], delta_m[1] - jy_offset, self.Ld[1])
+                    
+                    # Potential optimization: if kernel_val_z * kernel_val_y is too small, skip inner loop
+                    # if torch.abs(kernel_val_z * kernel_val_y) < 1e-9: continue 
+
+                    for jx_offset in j_offsets_dim[0]:
+                        abs_gx = k_nearest_m[0] + jx_offset
+                        kernel_val_x = self._lookup_1d_table(self.interp_tables[0], delta_m[0] - jx_offset, self.Ld[0])
+                        
+                        effective_kernel_weight = kernel_val_x * kernel_val_y * kernel_val_z
+                        
+                        # if torch.abs(effective_kernel_weight) < 1e-9: continue # Optimization
+
+                        value_to_add = current_k_sample_val * effective_kernel_weight.conj()
+                        
+                        # Modulo for periodic boundary conditions
+                        gz_mod = abs_gz % self.Kd[2]
+                        gy_mod = abs_gy % self.Kd[1]
+                        gx_mod = abs_gx % self.Kd[0]
+                        
+                        gridded_k_space[gz_mod, gy_mod, gx_mod] += value_to_add
+        
+        # 7. Inverse FFT
+        # Scaling by prod(Kd) is common for adjoint NUFFT to match forward scaling
+        image_oversampled = torch.fft.fftshift(torch.fft.ifftn(torch.fft.ifftshift(gridded_k_space), s=self.Kd))
+        image_oversampled = image_oversampled * float(torch.prod(torch.tensor(self.Kd, dtype=torch.float32)))
+
+        # 8. Cropping
+        start_indices = [(kd_dim - self.image_shape[d_idx]) // 2 for d_idx, kd_dim in enumerate(self.Kd)]
+        
+        image_cropped = image_oversampled[
+            start_indices[0] : start_indices[0] + self.image_shape[0],
+            start_indices[1] : start_indices[1] + self.image_shape[1],
+            start_indices[2] : start_indices[2] + self.image_shape[2]
+        ]
+
+        # 9. Apply Conjugate Scaling Factors (Image Domain)
+        if self.scaling_factors is None: # Should have been caught by forward, but good practice
+            raise RuntimeError("Scaling factors not precomputed.")
+        final_image = image_cropped * self.scaling_factors.conj()
+        
+        # 10. Return
+        return final_image
