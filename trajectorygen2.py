@@ -23,18 +23,14 @@ class KSpaceTrajectoryGenerator:
         custom_traj_func: Optional[Callable[..., Any]] = None,
         per_interleaf_params: Optional[Dict[int, Dict[str, Any]]] = None,
         time_varying_params: Optional[Callable[[float], Dict[str, float]]] = None,
-    ):
-        """
-        Initialize trajectory generator with imaging and hardware parameters.
-
-        Additional parameters for 3D and custom shapes:
-        - dim: 2 or 3 (for 2D or 3D)
-        - n_stacks: number of stacks (z-slices) for 3D stack-of-spirals/stars
-        - zmax: maximum kz value for 3D
-        - custom_traj_func: function handle for user-defined custom trajectory
-        - per_interleaf_params: dict of per-interleaf parameter overrides
-        - time_varying_params: function of t returning dict of param values
-        """
+        use_golden_angle: bool = False,
+        vd_method: str = "power",          # New: Select variable density method
+        vd_alpha: Optional[float] = None,  # Used for power-law and hybrid
+        vd_func: Optional[Callable[[np.ndarray], np.ndarray]] = None,
+        vd_flat: Optional[float] = None,   # For hybrid/flat-top
+        vd_sigma: Optional[float] = None,  # For Gaussian
+        vd_rho: Optional[float] = None,    # For exponential
+        ):
         self.fov = fov
         self.resolution = resolution
         self.dt = dt
@@ -54,8 +50,15 @@ class KSpaceTrajectoryGenerator:
         self.custom_traj_func = custom_traj_func
         self.per_interleaf_params = per_interleaf_params or {}
         self.time_varying_params = time_varying_params
+        self.use_golden_angle = use_golden_angle
+        # Variable density spiral params
+        self.vd_method = vd_method
+        self.vd_alpha = vd_alpha
+        self.vd_func = vd_func
+        self.vd_flat = vd_flat
+        self.vd_sigma = vd_sigma
+        self.vd_rho = vd_rho
 
-        # Derived quantities
         self.k_max = 1 / (2 * self.resolution)
         self.g_required = min(self.k_max / (self.gamma * self.dt), self.g_max)
         self.n_samples = int(np.ceil((self.k_max * 2 * np.pi * self.fov) / (self.gamma * self.g_required * self.dt)))
@@ -65,7 +68,7 @@ class KSpaceTrajectoryGenerator:
 
     def _slew_limited_ramp(self, N, sign=1):
         t_ramp = np.linspace(0, 1, N)
-        ramp = 0.5 * (1 - np.cos(np.pi * t_ramp))  # [0,1], smooth
+        ramp = 0.5 * (1 - np.cos(np.pi * t_ramp))
         return sign * ramp
 
     def _make_radius_profile(self, n_samples=None):
@@ -82,6 +85,42 @@ class KSpaceTrajectoryGenerator:
             r_profile[:ramp_samples] = np.linspace(0, 1, ramp_samples)
             r_profile[-ramp_samples:] = np.linspace(1, 0, ramp_samples)
         return r_profile
+
+    def _variable_density_spiral(self, t):
+        """
+        General variable density spiral radius profile selector.
+        Supported: 'power', 'hybrid', 'gaussian', 'exponential', 'flat', 'custom'
+        """
+        if self.vd_func is not None or self.vd_method == "custom":
+            return self.vd_func(t)
+        if self.vd_method == "power":
+            # Power-law: r = t^alpha
+            alpha = self.vd_alpha if self.vd_alpha is not None else 1
+            return t ** alpha
+        elif self.vd_method == "hybrid":
+            # Flat in center, power-law in outer region (flat-top)
+            flat = self.vd_flat if self.vd_flat is not None else 0.2
+            alpha = self.vd_alpha if self.vd_alpha is not None else 2
+            r = np.zeros_like(t)
+            mask = t < flat
+            r[mask] = t[mask] / flat
+            r[~mask] = ((t[~mask] - flat) / (1 - flat)) ** alpha
+            return r
+        elif self.vd_method == "gaussian":
+            # Gaussian variable density: r = erf(t/sigma)
+            sigma = self.vd_sigma if self.vd_sigma is not None else 0.25
+            from scipy.special import erf
+            return erf(t / sigma)
+        elif self.vd_method == "exponential":
+            # Exponential variable density: r = (exp(rho*t)-1)/(exp(rho)-1)
+            rho = self.vd_rho if self.vd_rho is not None else 3
+            return (np.exp(rho * t) - 1) / (np.exp(rho) - 1)
+        elif self.vd_method == "flat":
+            # Uniform: r = t
+            return t
+        else:
+            # Default to uniform
+            return t
 
     def _enforce_gradient_limits(self, gx, gy, gz=None):
         g_norm = np.sqrt(gx ** 2 + gy ** 2 + (gz**2 if gz is not None else 0))
@@ -105,18 +144,24 @@ class KSpaceTrajectoryGenerator:
                 gz[over_smax] *= scale
         return gx, gy, gz
 
-    # 2D/3D Standard Trajectories
+    def _golden_angle(self, idx):
+        if self.dim == 2:
+            golden = np.pi * (3 - np.sqrt(5))
+            return idx * golden
+        elif self.dim == 3:
+            indices = idx + 0.5
+            phi = np.arccos(1 - 2*indices/self.n_interleaves)
+            theta = np.pi * (1 + 5**0.5) * indices
+            return theta, phi
+
     def _generate_standard(self, interleaf_idx, t, n_samples, **params):
-        # Per-interleaf overrides
         local_params = {**self.__dict__, **params}
         fov = local_params.get("fov", self.fov)
         resolution = local_params.get("resolution", self.resolution)
         turns = local_params.get("turns", self.turns)
         k_max = 1 / (2 * resolution)
         r_profile = self._make_radius_profile(n_samples)
-        # Time-varying parameter support
         if self.time_varying_params is not None:
-            # param_func = lambda ti: self.time_varying_params(ti)
             for i, ti in enumerate(t):
                 for key, val in self.time_varying_params(ti).items():
                     if key == "fov":
@@ -126,23 +171,27 @@ class KSpaceTrajectoryGenerator:
                 k_max = 1 / (2 * resolution)
                 r_profile[i] = min(r_profile[i], k_max / self.k_max)
 
-        # 2D
         if self.dim == 2:
             if self.traj_type == "spiral":
-                phi = 2 * np.pi * interleaf_idx / self.n_interleaves
+                t_norm = np.linspace(0, 1, n_samples)
+                vd = self._variable_density_spiral(t_norm)
+                r = vd * k_max * r_profile
+                if self.use_golden_angle:
+                    phi = self._golden_angle(interleaf_idx)
+                else:
+                    phi = 2 * np.pi * interleaf_idx / self.n_interleaves
                 theta = turns * 2 * np.pi * t / t[-1] + phi
-                r = r_profile * k_max
                 kx = r * np.cos(theta)
                 ky = r * np.sin(theta)
                 kz = None
             elif self.traj_type == "radial":
-                angle = np.pi * interleaf_idx / self.n_interleaves
+                angle = (self._golden_angle(interleaf_idx) if self.use_golden_angle
+                         else np.pi * interleaf_idx / self.n_interleaves)
                 k_line = np.linspace(-k_max, k_max, n_samples) * r_profile
                 kx = k_line * np.cos(angle)
                 ky = k_line * np.sin(angle)
                 kz = None
             elif self.traj_type == "epi":
-                # Example: simple EPI (rectilinear, zigzag)
                 kx = np.linspace(-k_max, k_max, n_samples)
                 ky = np.zeros(n_samples)
                 kz = None
@@ -160,9 +209,7 @@ class KSpaceTrajectoryGenerator:
             gx = np.gradient(kx, self.dt) / self.gamma
             gy = np.gradient(ky, self.dt) / self.gamma
             gz = None
-        # 3D
         elif self.dim == 3:
-            # Stack of Spirals
             if self.traj_type == "stackofspirals":
                 n_stacks = self.n_stacks or 8
                 zmax = self.zmax or k_max
@@ -171,12 +218,13 @@ class KSpaceTrajectoryGenerator:
                 z_locations = np.linspace(-zmax, zmax, n_stacks)
                 z = z_locations[stack_idx]
                 phi = 2 * np.pi * slice_idx / self.n_interleaves
+                t_norm = np.linspace(0, 1, n_samples)
+                vd = self._variable_density_spiral(t_norm)
+                r = vd * k_max * r_profile
                 theta = turns * 2 * np.pi * t / t[-1] + phi
-                r = r_profile * k_max
                 kx = r * np.cos(theta)
                 ky = r * np.sin(theta)
                 kz = np.ones(n_samples) * z
-            # Phyllotaxis 3D
             elif self.traj_type == "phyllotaxis":
                 golden_angle = np.pi * (3 - np.sqrt(5))
                 theta = golden_angle * interleaf_idx
@@ -185,18 +233,16 @@ class KSpaceTrajectoryGenerator:
                 kx = k_max * radius * np.cos(theta)
                 ky = k_max * radius * np.sin(theta)
                 kz = k_max * z
-            # Cones
             elif self.traj_type == "cones":
                 phi = 2 * np.pi * interleaf_idx / self.n_interleaves
                 tt = np.linspace(0, 1, n_samples)
                 theta = np.arccos(1 - 2*tt)
-                kx = k_max * tt * np.sin(theta) * np.cos(phi)
-                ky = k_max * tt * np.sin(theta) * np.sin(phi)
-                kz = k_max * tt * np.cos(theta)
-            # 3D radial
+                vd = self._variable_density_spiral(tt)
+                kx = k_max * vd * np.sin(theta) * np.cos(phi)
+                ky = k_max * vd * np.sin(theta) * np.sin(phi)
+                kz = k_max * vd * np.cos(theta)
             elif self.traj_type == "radial3d":
-                phi = 2 * np.pi * interleaf_idx / self.n_interleaves
-                theta = np.arccos(1 - 2*interleaf_idx/self.n_interleaves)
+                theta, phi = self._golden_angle(interleaf_idx)
                 k_line = np.linspace(-k_max, k_max, n_samples)
                 kx = k_line * np.sin(theta) * np.cos(phi)
                 ky = k_line * np.sin(theta) * np.sin(phi)
@@ -211,12 +257,92 @@ class KSpaceTrajectoryGenerator:
         gx, gy, gz = self._enforce_gradient_limits(gx, gy, gz)
         return kx, ky, kz, gx, gy, gz
 
+    def _add_spoiler(self, kx, ky, kz, gx, gy, gz):
+        n_spoil = self.ramp_samples
+        spoil_area = 2 * self.k_max
+        kx_out, ky_out, kz_out, gx_out, gy_out, gz_out = [], [], [], [], [], []
+        for idx in range(self.n_interleaves):
+            if self.dim == 2:
+                end_g = np.array([gx[idx, -1], gy[idx, -1]])
+                if np.linalg.norm(end_g) == 0:
+                    end_g = np.array([1, 0])
+                else:
+                    end_g /= np.linalg.norm(end_g)
+                g_spoil = end_g * (spoil_area / (self.gamma * self.dt * n_spoil))
+                kx_s = np.full(n_spoil, kx[idx, -1])
+                ky_s = np.full(n_spoil, ky[idx, -1])
+                gx_s = np.full(n_spoil, g_spoil[0])
+                gy_s = np.full(n_spoil, g_spoil[1])
+                kx_out.append(np.concatenate([kx[idx], kx_s]))
+                ky_out.append(np.concatenate([ky[idx], ky_s]))
+                gx_out.append(np.concatenate([gx[idx], gx_s]))
+                gy_out.append(np.concatenate([gy[idx], gy_s]))
+            else:
+                end_g = np.array([gx[idx, -1], gy[idx, -1], gz[idx, -1]])
+                if np.linalg.norm(end_g) == 0:
+                    spoil_dir = np.array([0, 0, 1])
+                else:
+                    spoil_dir = end_g / np.linalg.norm(end_g)
+                g_spoil = spoil_dir * (spoil_area / (self.gamma * self.dt * n_spoil))
+                kx_s = np.full(n_spoil, kx[idx, -1])
+                ky_s = np.full(n_spoil, ky[idx, -1])
+                kz_s = np.full(n_spoil, kz[idx, -1])
+                gx_s = np.full(n_spoil, g_spoil[0])
+                gy_s = np.full(n_spoil, g_spoil[1])
+                gz_s = np.full(n_spoil, g_spoil[2])
+                kx_out.append(np.concatenate([kx[idx], kx_s]))
+                ky_out.append(np.concatenate([ky[idx], ky_s]))
+                kz_out.append(np.concatenate([kz[idx], kz_s]))
+                gx_out.append(np.concatenate([gx[idx], gx_s]))
+                gy_out.append(np.concatenate([gy[idx], gy_s]))
+                gz_out.append(np.concatenate([gz[idx], gz_s]))
+        if self.dim == 2:
+            return (np.array(kx_out), np.array(ky_out), None,
+                    np.array(gx_out), np.array(gy_out), None)
+        else:
+            return (np.array(kx_out), np.array(ky_out), np.array(kz_out),
+                    np.array(gx_out), np.array(gy_out), np.array(gz_out))
+
+    def _add_rewinder(self, kx, ky, kz, gx, gy, gz):
+        n_rw = self.ramp_samples
+        kx_out, ky_out, kz_out, gx_out, gy_out, gz_out = [], [], [], [], [], []
+        for idx in range(self.n_interleaves):
+            if self.dim == 2:
+                net_kx = kx[idx, -1]
+                net_ky = ky[idx, -1]
+                k_rewind = np.linspace([net_kx, net_ky], [0, 0], n_rw)
+                gx_rewind = np.gradient(k_rewind[:, 0], self.dt) / self.gamma
+                gy_rewind = np.gradient(k_rewind[:, 1], self.dt) / self.gamma
+                kx_out.append(np.concatenate([kx[idx], k_rewind[:, 0]]))
+                ky_out.append(np.concatenate([ky[idx], k_rewind[:, 1]]))
+                gx_out.append(np.concatenate([gx[idx], gx_rewind]))
+                gy_out.append(np.concatenate([gy[idx], gy_rewind]))
+            else:
+                net_kx = kx[idx, -1]
+                net_ky = ky[idx, -1]
+                net_kz = kz[idx, -1]
+                k_rewind = np.linspace([net_kx, net_ky, net_kz], [0, 0, 0], n_rw)
+                gx_rewind = np.gradient(k_rewind[:, 0], self.dt) / self.gamma
+                gy_rewind = np.gradient(k_rewind[:, 1], self.dt) / self.gamma
+                gz_rewind = np.gradient(k_rewind[:, 2], self.dt) / self.gamma
+                kx_out.append(np.concatenate([kx[idx], k_rewind[:, 0]]))
+                ky_out.append(np.concatenate([ky[idx], k_rewind[:, 1]]))
+                kz_out.append(np.concatenate([kz[idx], k_rewind[:, 2]]))
+                gx_out.append(np.concatenate([gx[idx], gx_rewind]))
+                gy_out.append(np.concatenate([gy[idx], gy_rewind]))
+                gz_out.append(np.concatenate([gz[idx], gz_rewind]))
+        if self.dim == 2:
+            return (np.array(kx_out), np.array(ky_out), None,
+                    np.array(gx_out), np.array(gy_out), None)
+        else:
+            return (np.array(kx_out), np.array(ky_out), np.array(kz_out),
+                    np.array(gx_out), np.array(gy_out), np.array(gz_out))
+
     def generate(self):
         n_interleaves = self.n_interleaves
         n_samples = self.n_samples
         t = np.arange(n_samples) * self.dt
 
-        # Determine dimensionality
         if self.dim == 2:
             kx = np.zeros((n_interleaves, n_samples))
             ky = np.zeros((n_interleaves, n_samples))
@@ -232,9 +358,7 @@ class KSpaceTrajectoryGenerator:
             gz = np.zeros((n_interleaves, n_samples))
 
         for idx in range(n_interleaves):
-            # Per-interleaf param overrides
             params = self.per_interleaf_params.get(idx, {})
-            # Custom trajectory plugin
             if self.custom_traj_func is not None:
                 k_vals, g_vals = self.custom_traj_func(idx, t, n_samples, **params)
                 kx[idx], ky[idx] = k_vals[:2]
@@ -243,7 +367,6 @@ class KSpaceTrajectoryGenerator:
                     kz[idx] = k_vals[2]
                     gz[idx] = g_vals[2]
                 continue
-            # Standard trajectory
             kx_i, ky_i, kz_i, gx_i, gy_i, gz_i = self._generate_standard(idx, t, n_samples, **params)
             kx[idx], ky[idx] = kx_i, ky_i
             gx[idx], gy[idx] = gx_i, gy_i
@@ -251,7 +374,10 @@ class KSpaceTrajectoryGenerator:
                 kz[idx] = kz_i
                 gz[idx] = gz_i
 
-        # TODO: Add spoiler and rewinder for 3D, if needed
+        if self.add_spoiler:
+            kx, ky, kz, gx, gy, gz = self._add_spoiler(kx, ky, kz, gx, gy, gz)
+        if self.add_rewinder:
+            kx, ky, kz, gx, gy, gz = self._add_rewinder(kx, ky, kz, gx, gy, gz)
 
         t = np.arange(kx.shape[1]) * self.dt
         if self.dim == 2:
@@ -259,10 +385,8 @@ class KSpaceTrajectoryGenerator:
         else:
             return kx, ky, kz, gx, gy, gz, t
 
-    # Example interface for user plugin
     @staticmethod
     def plugin_example(idx, t, n_samples, **kwargs):
-        # Example: circle trajectory
         kx = np.cos(2 * np.pi * t / t[-1])
         ky = np.sin(2 * np.pi * t / t[-1])
         gx = np.gradient(kx, t)
@@ -280,13 +404,9 @@ class KSpaceTrajectoryGenerator:
 # Example usage:
 # gen = KSpaceTrajectoryGenerator(
 #     fov=0.24, resolution=0.001, dt=4e-6, g_max=40e-3, s_max=150.0,
-#     n_interleaves=16, traj_type='stackofspirals', dim=3, n_stacks=8, zmax=1.5,
-#     ramp_fraction=0.1, add_rewinder=True, add_spoiler=False, add_slew_limited_ramps=True
+#     n_interleaves=32, traj_type='spiral', ramp_fraction=0.1,
+#     add_rewinder=True, add_spoiler=True, add_slew_limited_ramps=True,
+#     use_golden_angle=True, vd_method="hybrid", vd_alpha=4.0, vd_flat=0.15,
+#     dim=2
 # )
-# kx, ky, kz, gx, gy, gz, t = gen.generate()
-#
-# # Or with a custom plugin:
-# gen2 = KSpaceTrajectoryGenerator(
-#     n_interleaves=1, traj_type='custom', custom_traj_func=KSpaceTrajectoryGenerator.plugin_example
-# )
-# kx, ky, gx, gy, t = gen2.generate()
+# kx, ky, gx, gy, t = gen.generate()
