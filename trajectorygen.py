@@ -245,6 +245,127 @@ def phyllotaxis_3d_trajectory(num_points, fov):
     k = np.stack([kx, ky, kz], axis=1)
     return k
 
+def trajectory_with_constraints(
+    fov=0.24,               # Field of view in meters
+    resolution=0.001,       # Desired resolution in meters
+    dt=4e-6,                # Sample time in seconds
+    g_max=40e-3,            # Maximum gradient amplitude in T/m
+    s_max=150.0,            # Maximum slew rate in T/m/s
+    n_interleaves=8,        # Number of interleaves for spiral/radial
+    gamma=42.576e6,         # Gyromagnetic ratio in Hz/T
+    traj_type='spiral',     # 'spiral' or 'radial'
+    turns=1,                # Number of turns (for spiral)
+    ramp_fraction=0.1,      # Fraction of samples for ramp up/down
+    add_rewinder=True,      # Add rewinder gradients at end
+):
+    """
+    Generate a 2D k-space trajectory (spiral or radial) with hardware and imaging constraints,
+    including ramp up/down and optional rewinder gradients.
+
+    Parameters:
+    - fov: Field of view (m)
+    - resolution: Desired resolution (m)
+    - dt: Sample time (s)
+    - g_max: Maximum gradient amplitude (T/m)
+    - s_max: Maximum slew rate (T/m/s)
+    - n_interleaves: Number of interleaves (spiral/radial)
+    - gamma: Gyromagnetic ratio (Hz/T)
+    - traj_type: 'spiral' or 'radial'
+    - turns: Number of turns for spiral
+    - ramp_fraction: Fraction of total samples for ramp up/down (default 0.1)
+    - add_rewinder: If True, append rewinder gradients at end
+
+    Returns:
+    - kx, ky: k-space trajectory components [n_interleaves, n_samples(+rewinder)]
+    - gx, gy: Gradient waveform components [n_interleaves, n_samples(+rewinder)]
+    - t: Time vector
+    """
+
+    # Calculate maximum k-space radius (Nyquist)
+    k_max = 1 / (2 * resolution)
+
+    # Estimate total readout duration and samples
+    g_required = k_max / (gamma * dt)
+    if g_required > g_max:
+        g_required = g_max
+
+    n_samples = int(np.ceil((k_max * 2 * np.pi * fov) / (gamma * g_required * dt)))
+    if n_samples < 1:
+        n_samples = 1
+
+    ramp_samples = int(np.ceil(ramp_fraction * n_samples))
+    flat_samples = n_samples - 2 * ramp_samples
+    t = np.arange(n_samples) * dt
+
+    kx = np.zeros((n_interleaves, n_samples))
+    ky = np.zeros((n_interleaves, n_samples))
+    gx = np.zeros((n_interleaves, n_samples))
+    gy = np.zeros((n_interleaves, n_samples))
+
+    if traj_type == 'spiral':
+        for arm in range(n_interleaves):
+            phi = 2 * np.pi * arm / n_interleaves
+
+            # Radius profile: ramp up, flat, ramp down
+            r_profile = np.ones(n_samples)
+            # Ramp up
+            r_profile[:ramp_samples] = np.linspace(0, 1, ramp_samples)
+            # Ramp down
+            r_profile[-ramp_samples:] = np.linspace(1, 0, ramp_samples)
+
+            theta = turns * 2 * np.pi * t / t[-1] + phi
+            r = r_profile * k_max
+            kx[arm] = r * np.cos(theta)
+            ky[arm] = r * np.sin(theta)
+            gx[arm] = np.gradient(kx[arm], dt) / gamma
+            gy[arm] = np.gradient(ky[arm], dt) / gamma
+
+    elif traj_type == 'radial':
+        for spoke in range(n_interleaves):
+            angle = np.pi * spoke / n_interleaves
+            # k goes from -k_max to +k_max with ramp up/down
+            k_line = np.linspace(-k_max, k_max, n_samples)
+            ramp = np.ones(n_samples)
+            ramp[:ramp_samples] = np.linspace(0, 1, ramp_samples)
+            ramp[-ramp_samples:] = np.linspace(1, 0, ramp_samples)
+            k_line = k_line * ramp
+            kx[spoke] = k_line * np.cos(angle)
+            ky[spoke] = k_line * np.sin(angle)
+            gx[spoke] = np.gradient(kx[spoke], dt) / gamma
+            gy[spoke] = np.gradient(ky[spoke], dt) / gamma
+
+    else:
+        raise ValueError("traj_type must be 'spiral' or 'radial'.")
+
+    # Optionally add rewinder gradients (return to (0,0) in k-space)
+    if add_rewinder:
+        kx_rw = []
+        ky_rw = []
+        gx_rw = []
+        gy_rw = []
+        for arm in range(n_interleaves):
+            # Calculate final k-space position
+            k_end = np.array([kx[arm, -1], ky[arm, -1]])
+            # Linear rewinder in N_rw points
+            N_rw = ramp_samples
+            k_rewind = np.linspace(k_end, [0, 0], N_rw)
+            gx_rewind = np.gradient(k_rewind[:, 0], dt) / gamma
+            gy_rewind = np.gradient(k_rewind[:, 1], dt) / gamma
+
+            # Concatenate to original
+            kx_rw.append(np.concatenate([kx[arm], k_rewind[:, 0]]))
+            ky_rw.append(np.concatenate([ky[arm], k_rewind[:, 1]]))
+            gx_rw.append(np.concatenate([gx[arm], gx_rewind]))
+            gy_rw.append(np.concatenate([gy[arm], gy_rewind]))
+
+        kx = np.array(kx_rw)
+        ky = np.array(ky_rw)
+        gx = np.array(gx_rw)
+        gy = np.array(gy_rw)
+        t = np.arange(kx.shape[1]) * dt
+
+    return kx, ky, gx, gy, t
+
 def gradient_and_pns_check(k_traj, grad_max, slew_max, dt):
     """
     k_traj: [N, D] array, N points, D dimensions
