@@ -15,13 +15,14 @@ class Optimizer(ABC):
     def solve(self, k_space_data, forward_op, regularizer, initial_guess=None):
         """
         Solves the optimization problem.
-        This signature is for FISTA and older ADMM. ADMM will be adapted.
 
         Args:
             k_space_data: The k-space data (PyTorch tensor).
             forward_op: The forward operator (instance of reconlib.operators.Operator).
-            regularizer: The regularizer (instance of reconlib.regularizers.Regularizer).
-                         For ADMM, this will be the prox_regularizer.
+            regularizer: An instance of a class adhering to the Regularizer interface
+                         (e.g., from reconlib.regularizers.base.Regularizer),
+                         expected to have a `proximal_operator` method.
+                         For ADMM, this is the `prox_regularizer`.
             initial_guess: An optional initial guess for the solution (PyTorch tensor, default None).
 
         Returns:
@@ -65,7 +66,7 @@ class FISTA(Optimizer):
             current_L_k = L_k 
             for ls_iter in range(self.max_line_search_iter):
                 step = 1.0 / current_L_k 
-                x_new = regularizer.prox(y_k - step * grad_y_k, step)
+                x_new = regularizer.proximal_operator(y_k - step * grad_y_k, step)
                 
                 f_yk_op_output = forward_op.op(y_k.to(torch.complex64))
                 f_x_new_op_output = forward_op.op(x_new.to(torch.complex64))
@@ -243,7 +244,7 @@ class ADMM(Optimizer):
 
             # z-update: z_k+1 = prox_g(x_k+1 + u_k, 1.0 / rho)
             if prox_regularizer is not None:
-                z_k_plus_1 = prox_regularizer.prox(x_k_plus_1 + u_k, 1.0 / self.rho)
+                z_k_plus_1 = prox_regularizer.proximal_operator(x_k_plus_1 + u_k, 1.0 / self.rho)
             else: 
                 z_k_plus_1 = x_k_plus_1 + u_k # If no prox_regularizer, g_prox(z) = 0
 
