@@ -25,33 +25,7 @@ except ImportError:
     def generate_radial_trajectory_2d(**kwargs): return torch.zeros((100,2), device=kwargs.get('device','cpu'))
     def generate_radial_trajectory_3d(**kwargs): return torch.zeros((100,3), device=kwargs.get('device','cpu'))
 
-# Basic PSNR and SSIM (structural similarity) functions for evaluation
-# For SSIM, a library like scikit-image might be preferred for a robust implementation,
-# but here's a simple version for demonstration if skimage is not a direct dependency.
-
-def psnr_torch(gt, pred, data_range=None):
-    if data_range is None:
-        data_range = gt.max() - gt.min()
-    mse = torch.mean((gt - pred) ** 2)
-    if mse == 0:
-        return float('inf')
-    return 20 * torch.log10(data_range / torch.sqrt(mse))
-
-def ssim_torch_simple(gt, pred, data_range=None, C1=0.01**2, C2=0.03**2):
-    """ Simplified SSIM for single channel images, assumes gt/pred are (H,W) """
-    if data_range is None:
-        data_range = gt.max() - gt.min()
-    
-    mu_x = torch.mean(pred)
-    mu_y = torch.mean(gt)
-    sigma_x_sq = torch.mean((pred - mu_x)**2)
-    sigma_y_sq = torch.mean((gt - mu_y)**2)
-    sigma_xy = torch.mean((pred - mu_x)*(gt - mu_y))
-    
-    ssim_num = (2*mu_x*mu_y + C1*data_range**2) * (2*sigma_xy + C2*data_range**2)
-    ssim_den = (mu_x**2 + mu_y**2 + C1*data_range**2) * (sigma_x_sq + sigma_y_sq + C2*data_range**2)
-    
-    return ssim_num / ssim_den
+from reconlib.metrics.image_metrics import mse, psnr, ssim
 
 
 def evaluate_modl_network(args):
@@ -152,6 +126,7 @@ def evaluate_modl_network(args):
     print(f"Loaded model from {args.checkpoint_path}")
 
     # --- Evaluation Loop ---
+    total_mse = 0.0
     total_psnr = 0.0
     total_ssim = 0.0
     
@@ -163,47 +138,74 @@ def evaluate_modl_network(args):
             # MoDLNet forward pass expects single instance inputs: x0 (*image_shape), y (num_k_points,)
             reconstructed_x = modl_network(y_observed, x0)
 
-        # Ensure reconstructed_x and x_true are on CPU for metrics/plotting if functions expect numpy
-        rec_np = reconstructed_x.abs().cpu() # Often evaluate on magnitude
-        gt_np = x_true.abs().cpu()
+        rec_abs = reconstructed_x.abs() 
+        gt_abs = x_true.abs() # x_true is also a tensor on device
         
-        current_psnr = psnr_torch(gt_np, rec_np)
-        current_ssim = ssim_torch_simple(gt_np, rec_np) # Simple SSIM for single slice
+        # Ensure they are on the same device if not already (though they should be from dataset and model)
+        # device = reconstructed_x.device 
+        # gt_abs = gt_abs.to(device) # Already on device
         
-        total_psnr += current_psnr
-        total_ssim += current_ssim
+        data_range_eval = gt_abs.max() - gt_abs.min()
+        if data_range_eval == 0: data_range_eval = 1.0 # Avoid div by zero for flat gt
+
+        if args.dim == 3:
+            center_slice_idx_eval = reconstructed_x.shape[0] // 2 # Assuming shape is (D,H,W)
+            rec_abs_slice = rec_abs[center_slice_idx_eval, :, :]
+            gt_abs_slice = gt_abs[center_slice_idx_eval, :, :]
+            data_range_slice_eval = gt_abs_slice.max() - gt_abs_slice.min()
+            if data_range_slice_eval == 0: data_range_slice_eval = 1.0
+
+            current_mse = mse(gt_abs_slice, rec_abs_slice)
+            current_psnr = psnr(gt_abs_slice, rec_abs_slice, data_range=data_range_slice_eval)
+            current_ssim = ssim(gt_abs_slice, rec_abs_slice, data_range=data_range_slice_eval) # SSIM on 2D slice
+            print(f"Sample {i+1}/{test_dataset_size} - Slice {center_slice_idx_eval} - MSE: {current_mse.item():.4e}, PSNR: {current_psnr.item():.2f} dB, SSIM: {current_ssim.item():.4f}")
+        else: # 2D
+            current_mse = mse(gt_abs, rec_abs)
+            current_psnr = psnr(gt_abs, rec_abs, data_range=data_range_eval)
+            current_ssim = ssim(gt_abs, rec_abs, data_range=data_range_eval)
+            print(f"Sample {i+1}/{test_dataset_size} - MSE: {current_mse.item():.4e}, PSNR: {current_psnr.item():.2f} dB, SSIM: {current_ssim.item():.4f}")
         
-        print(f"Sample {i+1}/{test_dataset_size} - PSNR: {current_psnr:.2f} dB, SSIM: {current_ssim:.4f}")
+        total_mse += current_mse.item()
+        total_psnr += current_psnr.item() if not torch.isinf(current_psnr) else 0 # Handle inf PSNR if MSE is 0
+        total_ssim += current_ssim.item()
+        
 
         if args.save_images_dir and (i < args.num_images_to_save): # Save a few examples
             if not os.path.exists(args.save_images_dir):
                 os.makedirs(args.save_images_dir)
             
+            # Prepare for plotting (move to CPU, convert to numpy)
+            gt_plot = gt_abs.cpu().numpy()
+            x0_plot = x0.abs().cpu().numpy()
+            rec_plot = rec_abs.cpu().numpy()
+
             fig, axs = plt.subplots(1, 3, figsize=(15, 5))
             if args.dim == 2:
-                axs[0].imshow(gt_np.numpy(), cmap='gray')
+                axs[0].imshow(gt_plot, cmap='gray')
                 axs[0].set_title("Ground Truth")
-                axs[1].imshow(x0.abs().cpu().numpy(), cmap='gray') # Initial/Zero-filled
+                axs[1].imshow(x0_plot, cmap='gray') # Initial/Zero-filled
                 axs[1].set_title("Initial Recon (A^H y)")
-                axs[2].imshow(rec_np.numpy(), cmap='gray')
+                axs[2].imshow(rec_plot, cmap='gray')
                 axs[2].set_title("MoDL Reconstructed")
             elif args.dim == 3:
-                center_slice = gt_np.shape[0] // 2
-                axs[0].imshow(gt_np[center_slice].numpy(), cmap='gray')
-                axs[0].set_title(f"GT (Slice {center_slice})")
-                axs[1].imshow(x0.abs().cpu()[center_slice].numpy(), cmap='gray')
-                axs[1].set_title(f"A^H y (Slice {center_slice})")
-                axs[2].imshow(rec_np[center_slice].numpy(), cmap='gray')
-                axs[2].set_title(f"MoDL (Slice {center_slice})")
+                center_slice_plot = image_shape[0] // 2 # Use image_shape for consistency
+                axs[0].imshow(gt_plot[center_slice_plot], cmap='gray')
+                axs[0].set_title(f"GT (Slice {center_slice_plot})")
+                axs[1].imshow(x0_plot[center_slice_plot], cmap='gray')
+                axs[1].set_title(f"A^H y (Slice {center_slice_plot})")
+                axs[2].imshow(rec_plot[center_slice_plot], cmap='gray')
+                axs[2].set_title(f"MoDL (Slice {center_slice_plot})")
             
             for ax_ in axs: ax_.axis('off')
             plt.savefig(os.path.join(args.save_images_dir, f"eval_sample_{i+1}.png"))
             plt.close(fig)
             print(f"  Saved image for sample {i+1}")
 
+    avg_mse = total_mse / test_dataset_size
     avg_psnr = total_psnr / test_dataset_size
     avg_ssim = total_ssim / test_dataset_size
-    print(f"\nAverage PSNR over {test_dataset_size} samples: {avg_psnr:.2f} dB")
+    print(f"\nAverage MSE over {test_dataset_size} samples: {avg_mse:.4e}")
+    print(f"Average PSNR over {test_dataset_size} samples: {avg_psnr:.2f} dB")
     print(f"Average SSIM over {test_dataset_size} samples: {avg_ssim:.4f}")
 
 

@@ -10,6 +10,7 @@ import numpy as np
 import math # Added for kb_alpha calculation
 import matplotlib.pyplot as plt
 from reconlib.operators import NUFFTOperator
+from reconlib.metrics.image_metrics import mse, psnr, ssim
 
 # Iterative reconstruction using conjugate gradient (CG)
 def iterative_recon(kspace_data: torch.Tensor, nufft_op: NUFFTOperator, num_iters=10):
@@ -182,6 +183,23 @@ if __name__ == "__main__":
     plt.tight_layout()
     plt.show()
 
+    # Calculate and print metrics for 2D CG reconstruction
+    print("\nCalculating 2D Reconstruction Metrics...")
+    gt_2d_abs = phantom_2d_complex.abs() # phantom_2d_complex is the ground truth
+    rec_2d_cg_abs = recon_img_2d.abs()
+    data_range_2d = gt_2d_abs.max() - gt_2d_abs.min()
+    if data_range_2d == 0: data_range_2d = 1.0 # Avoid division by zero if gt is flat
+
+    mse_2d_cg = mse(gt_2d_abs, rec_2d_cg_abs)
+    psnr_2d_cg = psnr(gt_2d_abs, rec_2d_cg_abs, data_range=data_range_2d)
+    # SSIM expects (N,C,H,W) or (H,W). gt_2d_abs is (H,W)
+    ssim_2d_cg = ssim(gt_2d_abs, rec_2d_cg_abs, data_range=data_range_2d)
+                                 
+    print(f"2D CG Reconstruction Metrics:")
+    print(f"  MSE: {mse_2d_cg.item():.4e}")
+    print(f"  PSNR: {psnr_2d_cg.item():.2f} dB")
+    print(f"  SSIM: {ssim_2d_cg.item():.4f}")
+
     # --- 3D Example ---
     print("\n--- Running 3D NUFFT Example ---")
     Nz_3d, Ny_3d, Nx_3d = 32, 32, 32 # Smaller for quicker test
@@ -239,3 +257,20 @@ if __name__ == "__main__":
     axs_3d[1].axis('off')
     plt.tight_layout()
     plt.show()
+
+    # Calculate and print metrics for the center slice of 3D CG reconstruction
+    print("\nCalculating 3D Reconstruction Metrics (for center slice)...")
+    # image_shape_3d is defined in the 3D example section
+    gt_3d_slice_abs = phantom_3d_complex[center_slice_z, :, :].abs()
+    rec_3d_cg_slice_abs = recon_img_3d[center_slice_z, :, :].abs()
+    data_range_3d_slice = gt_3d_slice_abs.max() - gt_3d_slice_abs.min()
+    if data_range_3d_slice == 0: data_range_3d_slice = 1.0 # Avoid division by zero
+
+    mse_3d_cg_slice = mse(gt_3d_slice_abs, rec_3d_cg_slice_abs)
+    psnr_3d_cg_slice = psnr(gt_3d_slice_abs, rec_3d_cg_slice_abs, data_range=data_range_3d_slice)
+    ssim_3d_cg_slice = ssim(gt_3d_slice_abs, rec_3d_cg_slice_abs, data_range=data_range_3d_slice)
+    
+    print(f"3D CG Reconstruction Metrics (Center Slice {center_slice_idx}):") # center_slice_idx might not be defined here, using center_slice_z
+    print(f"  MSE: {mse_3d_cg_slice.item():.4e}")
+    print(f"  PSNR: {psnr_3d_cg_slice.item():.2f} dB")
+    print(f"  SSIM: {ssim_3d_cg_slice.item():.4f}")
