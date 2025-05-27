@@ -20,6 +20,9 @@ from .wavelets_scratch import WaveletTransform
 from .wavelets_scratch import WaveletRegularizationTerm
 from .wavelets_scratch import NUFFTWaveletRegularizedReconstructor
 
+# Export from nufft_multi_coil.py
+from .nufft_multi_coil import MultiCoilNUFFTOperator
+
 
 # Optionally, define __all__ to specify what `from reconlib import *` imports
 __all__ = [
@@ -35,4 +38,6 @@ __all__ = [
     'WaveletTransform',
     'WaveletRegularizationTerm',
     'NUFFTWaveletRegularizedReconstructor',
+    # Added multi-coil NUFFT operator
+    'MultiCoilNUFFTOperator',
 ]
