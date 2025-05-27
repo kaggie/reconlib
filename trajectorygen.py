@@ -25,6 +25,70 @@ def spiral_trajectory(num_arms, num_points, fov, dwell_time, turns=1):
         k[i, :, 1] = ky
     return k
 
+import numpy as np
+
+def generate_spiral_trajectory(
+    fov=0.24,               # Field of view in meters
+    resolution=0.001,       # Desired resolution in meters
+    dt=4e-6,                # Sample time in seconds
+    g_max=40e-3,            # Maximum gradient amplitude in T/m
+    s_max=150.0,            # Maximum slew rate in T/m/s
+    n_interleaves=8,         # Number of interleaves
+    gamma = 42.576e6  # Gyromagnetic ratio in Hz/T
+):
+    """
+    Generate a spiral k-space trajectory based on imaging specifications.
+
+    Parameters:
+    - fov: Field of view (m)
+    - resolution: Desired resolution (m)
+    - dt: Sample time (s)
+    - g_max: Maximum gradient amplitude (T/m)
+    - s_max: Maximum slew rate (T/m/s)
+    - n_interleaves: Number of interleaves
+
+    Returns:
+    - kx, ky: k-space trajectory components
+    - gx, gy: Gradient waveform components
+    - t: Time vector
+    """
+
+
+    # Calculate maximum k-space radius
+    k_max = 1 / (2 * resolution)
+
+    # Time to reach k_max at maximum gradient amplitude
+    g_required = k_max / (gamma * dt)
+    if g_required > g_max:
+        g_required = g_max
+        print("Warning: Desired resolution exceeds maximum gradient amplitude. Adjusting gradient amplitude.")
+
+    # Time to reach g_required at maximum slew rate
+    t_ramp = g_required / s_max
+
+    # Total number of samples
+    n_samples = int(np.ceil((k_max * 2 * np.pi * fov) / (gamma * g_required * dt)))
+
+    # Time vector
+    t = np.arange(n_samples) * dt
+
+    # Angular position
+    theta = 2 * np.pi * n_interleaves * t / t[-1]
+
+    # Radius as a function of time
+    r = (g_required * gamma * t) / (2 * np.pi)
+
+    # k-space trajectory
+    kx = r * np.cos(theta)
+    ky = r * np.sin(theta)
+
+    # Gradient waveforms
+    gx = np.gradient(kx, dt) / gamma
+    gy = np.gradient(ky, dt) / gamma
+
+    return kx, ky, gx, gy, t
+
+
 def stack_of_spirals(num_arms, num_points, num_stacks, fov, zmax, turns=1):
     """
     3D Stack of Spirals:
