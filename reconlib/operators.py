@@ -937,3 +937,186 @@ class PETForwardProjection(Operator):
         return backprojected_image
 
 
+# --- Photoacoustic Tomography (PAT) Forward Projection Operator ---
+class PATForwardProjection(Operator):
+    """
+    Basic PAT Forward Projection Operator for a 2D scenario.
+    Models the generation of sensor data from an initial pressure distribution.
+    op: InitialPressureImage -> SensorData (Time-series for each sensor)
+    op_adj: Not implemented for this task.
+    """
+    def __init__(self, 
+                 img_shape: tuple[int, int], 
+                 sensor_positions: torch.Tensor | np.ndarray, 
+                 sound_speed: float, 
+                 time_points: torch.Tensor | np.ndarray, 
+                 device: str | torch.device = 'cpu'):
+        """
+        Args:
+            img_shape (tuple[int, int]): Shape of the 2D image grid (ny, nx) i.e. (height, width).
+            sensor_positions (torch.Tensor | np.ndarray): Positions of sensors, shape (num_sensors, 2).
+                                                          Assumed to be in the same coordinate system as the image pixels.
+            sound_speed (float): Speed of sound in the medium.
+            time_points (torch.Tensor | np.ndarray): Time samples at which data is recorded, shape (num_time_samples,).
+            device (str | torch.device): Device to perform computations on.
+        """
+        self.img_shape = img_shape # (ny, nx) -> (height, width)
+        self.sound_speed = sound_speed
+        
+        if isinstance(device, str):
+            self.device = torch.device(device)
+        else:
+            self.device = device
+
+        if isinstance(sensor_positions, np.ndarray):
+            sensor_positions = torch.from_numpy(sensor_positions).float()
+        self.sensor_positions = sensor_positions.to(self.device)
+
+        if isinstance(time_points, np.ndarray):
+            time_points = torch.from_numpy(time_points).float()
+        self.time_points = time_points.to(self.device)
+
+        if self.sensor_positions.ndim != 2 or self.sensor_positions.shape[1] != 2:
+            raise ValueError(f"sensor_positions must have shape (num_sensors, 2), got {self.sensor_positions.shape}")
+        if self.time_points.ndim != 1:
+            raise ValueError(f"time_points must have shape (num_time_samples,), got {self.time_points.shape}")
+
+        # Create pixel coordinate grid
+        # Assume pixel spacing is 1.0 for simplicity.
+        # Coordinates are relative to the center of the image.
+        ny, nx = self.img_shape
+        
+        # Create 1D coordinate vectors for y and x
+        # y_coords from -(ny-1)/2 to (ny-1)/2
+        # x_coords from -(nx-1)/2 to (nx-1)/2
+        y_coords_1d = torch.arange(ny, device=self.device, dtype=torch.float32) - (ny - 1) / 2.0
+        x_coords_1d = torch.arange(nx, device=self.device, dtype=torch.float32) - (nx - 1) / 2.0
+
+        # Create 2D meshgrid
+        # self.pixel_y_coords will have shape (ny, nx)
+        # self.pixel_x_coords will have shape (ny, nx)
+        self.pixel_y_coords, self.pixel_x_coords = torch.meshgrid(y_coords_1d, x_coords_1d, indexing='ij')
+        
+        # Store pixel coordinates as (ny, nx, 2) for easier iteration if needed, or flatten
+        # For the current loop structure, separate meshgrids are fine.
+        # self.pixel_coords = torch.stack((self.pixel_x_coords, self.pixel_y_coords), dim=-1) # Shape (ny, nx, 2)
+
+        # Pixel size approximation (assuming square pixels with spacing 1.0)
+        self.pixel_size = 1.0 
+
+
+    def op(self, initial_pressure_image: torch.Tensor) -> torch.Tensor:
+        """
+        Calculates the photoacoustic sensor data for a given initial pressure distribution.
+        Args:
+            initial_pressure_image (torch.Tensor): 2D tensor of shape self.img_shape (ny, nx).
+        Returns:
+            torch.Tensor: Sensor data, shape (num_sensors, num_time_samples).
+        """
+        if not isinstance(initial_pressure_image, torch.Tensor):
+            initial_pressure_image = torch.from_numpy(initial_pressure_image).float()
+        initial_pressure_image = initial_pressure_image.to(self.device)
+
+        if initial_pressure_image.shape != self.img_shape:
+            raise ValueError(f"Input initial_pressure_image shape {initial_pressure_image.shape} "
+                             f"does not match expected {self.img_shape}")
+
+        num_sensors = self.sensor_positions.shape[0]
+        num_time_samples = self.time_points.shape[0]
+        ny, nx = self.img_shape
+
+        sensor_data = torch.zeros((num_sensors, num_time_samples), device=self.device, dtype=torch.float32)
+
+        # Tolerance for checking if a pixel is on the integration shell (approx. half pixel size)
+        # This defines the "thickness" of the spherical/circular shell for integration.
+        shell_tolerance = self.pixel_size / 2.0
+
+        for s in range(num_sensors):
+            sensor_pos_x, sensor_pos_y = self.sensor_positions[s, 0], self.sensor_positions[s, 1]
+            
+            for t_idx in range(num_time_samples):
+                current_t = self.time_points[t_idx]
+                radius_of_integration = self.sound_speed * current_t
+
+                # Calculate distances from all pixels to the current sensor
+                # dist_sq = (self.pixel_x_coords - sensor_pos_x)**2 + (self.pixel_y_coords - sensor_pos_y)**2
+                # distances = torch.sqrt(dist_sq) # Shape (ny, nx)
+                
+                # Instead of calculating all distances and then masking, 
+                # iterate pixels for clarity, as per prompt, though less efficient.
+                accumulated_pressure = 0.0
+                for y_idx in range(ny):
+                    for x_idx in range(nx):
+                        pixel_x = self.pixel_x_coords[y_idx, x_idx]
+                        pixel_y = self.pixel_y_coords[y_idx, x_idx]
+                        
+                        distance = torch.sqrt((pixel_x - sensor_pos_x)**2 + (pixel_y - sensor_pos_y)**2)
+                        
+                        if torch.abs(distance - radius_of_integration) < shell_tolerance:
+                            accumulated_pressure += initial_pressure_image[y_idx, x_idx]
+                
+                sensor_data[s, t_idx] = accumulated_pressure
+        
+        return sensor_data
+
+    def op_adj(self, sensor_data_tensor: torch.Tensor) -> torch.Tensor:
+        """
+        Adjoint of PAT Forward Projection. This performs backprojection of sensor data.
+        Args:
+            sensor_data_tensor (torch.Tensor): 2D tensor of shape (num_sensors, num_time_samples).
+        Returns:
+            torch.Tensor: Reconstructed image, shape self.img_shape (ny, nx).
+        """
+        if not isinstance(sensor_data_tensor, torch.Tensor):
+            sensor_data_tensor = torch.from_numpy(sensor_data_tensor).float()
+        sensor_data_tensor = sensor_data_tensor.to(self.device)
+
+        num_sensors_data = sensor_data_tensor.shape[0]
+        num_time_samples_data = sensor_data_tensor.shape[1]
+
+        num_sensors_op = self.sensor_positions.shape[0]
+        num_time_samples_op = self.time_points.shape[0]
+
+        if num_sensors_data != num_sensors_op or num_time_samples_data != num_time_samples_op:
+            raise ValueError(
+                f"Input sensor_data_tensor shape ({num_sensors_data}, {num_time_samples_data}) "
+                f"does not match expected operator dimensions ({num_sensors_op}, {num_time_samples_op})."
+            )
+
+        reconstructed_image = torch.zeros(self.img_shape, device=self.device, dtype=torch.float32)
+        ny, nx = self.img_shape
+
+        # Tolerance for checking if a pixel is on the integration shell (approx. half pixel size)
+        shell_tolerance = self.pixel_size / 2.0
+        epsilon = 1e-9 # To avoid computation for zero values
+
+        for s in range(num_sensors_op):
+            sensor_pos_x, sensor_pos_y = self.sensor_positions[s, 0], self.sensor_positions[s, 1]
+            
+            for t_idx in range(num_time_samples_op):
+                current_val = sensor_data_tensor[s, t_idx]
+
+                # If val is non-zero (or above a small epsilon)
+                if torch.abs(current_val) < epsilon:
+                    continue
+
+                current_t = self.time_points[t_idx]
+                radius_of_integration = self.sound_speed * current_t
+                
+                # This part can be slow due to iterating all pixels for each sensor/time point.
+                # For a more efficient implementation, one might consider a different approach,
+                # but following the provided algorithm structure.
+                for y_idx in range(ny):
+                    for x_idx in range(nx):
+                        pixel_x = self.pixel_x_coords[y_idx, x_idx]
+                        pixel_y = self.pixel_y_coords[y_idx, x_idx]
+                        
+                        distance = torch.sqrt((pixel_x - sensor_pos_x)**2 + (pixel_y - sensor_pos_y)**2)
+                        
+                        if torch.abs(distance - radius_of_integration) < shell_tolerance:
+                            reconstructed_image[y_idx, x_idx] += current_val
+                            
+        return reconstructed_image
+
+
+

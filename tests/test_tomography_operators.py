@@ -307,6 +307,155 @@ class TestPETForwardProjection(unittest.TestCase):
         # The operations are linear interpolation and its adjoint.
         torch.testing.assert_close(dot_Ax_y, dot_x_A_adj_y, rtol=1e-4, atol=1e-4)
 
+from reconlib.operators import PATForwardProjection
+
+class TestPATForwardProjection(unittest.TestCase):
+    def setUp(self):
+        self.img_shape = (16, 16) # ny, nx
+        # Sensor positions are relative to the center of the image.
+        # Image pixel coords in PATForwardProjection are from -(N-1)/2 to (N-1)/2.
+        # For N=16, range is -7.5 to 7.5. Sensors at +/-8 are just outside.
+        self.sensor_positions = torch.tensor([
+            [0.0, 8.0],  # Top, outside
+            [8.0, 0.0],  # Right, outside
+            [0.0, -8.0], # Bottom, outside
+            [-8.0, 0.0]  # Left, outside
+        ], dtype=torch.float32)
+        self.num_sensors = self.sensor_positions.shape[0]
+        
+        self.sound_speed = 1.0
+        # Time points: from 0 up to a time that allows sound to cross the image and reach sensors.
+        # Max distance from center (0,0) to a corner (7.5, 7.5) is sqrt(7.5^2 + 7.5^2) approx 10.6.
+        # Sensor at (0,8) to corner (-7.5, 7.5) is distance sqrt((-7.5-0)^2 + (7.5-8)^2) = sqrt(56.25 + 0.25) = sqrt(56.5) approx 7.5
+        # Sensor at (0,8) to opposite corner (-7.5, -7.5) is distance sqrt((-7.5-0)^2 + (-7.5-8)^2) = sqrt(56.25 + 240.25) = sqrt(296.5) approx 17.2
+        # So, time_points up to ~18-20 should be enough if sound_speed is 1.
+        self.time_points = torch.linspace(0, 20, 40, dtype=torch.float32) # 40 time samples
+        self.num_time_samples = len(self.time_points)
+
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # self.device = torch.device("cpu") # Forcing CPU
+
+        self.pat_op = PATForwardProjection(
+            img_shape=self.img_shape,
+            sensor_positions=self.sensor_positions,
+            sound_speed=self.sound_speed,
+            time_points=self.time_points,
+            device=self.device
+        )
+        
+        # Move local copies of tensors to device as well for direct use in tests
+        self.sensor_positions = self.sensor_positions.to(self.device)
+        self.time_points = self.time_points.to(self.device)
+
+
+    def test_instantiation_pat(self):
+        self.assertIsNotNone(self.pat_op)
+        self.assertEqual(self.pat_op.img_shape, self.img_shape)
+        torch.testing.assert_close(self.pat_op.sensor_positions, self.sensor_positions)
+        self.assertEqual(self.pat_op.sound_speed, self.sound_speed)
+        torch.testing.assert_close(self.pat_op.time_points, self.time_points)
+        self.assertEqual(self.pat_op.device, self.device)
+        self.assertIsNotNone(self.pat_op.pixel_x_coords) # Check if pixel grids were created
+        self.assertIsNotNone(self.pat_op.pixel_y_coords)
+
+    def test_op_forward_projection(self):
+        phantom_image = torch.zeros(self.img_shape, device=self.device, dtype=torch.float32)
+        # Place a single bright pixel at the center of the image.
+        # For (16,16), center indices are (7,7) or (8,8).
+        # Pixel coordinates are -(N-1)/2 to (N-1)/2. For N=16, this is -7.5 to 7.5.
+        # The pixel (0,0) in PATForwardProjection internal coords is at img_idx (img_shape[0]//2 -1 , img_shape[1]//2 -1) if N is even.
+        # Or more simply, the pixel whose world coordinate is (0,0).
+        # Let's put a point at image index (cy, cx) corresponding to physical (0,0) if possible.
+        # cy_idx, cx_idx = self.img_shape[0] // 2, self.img_shape[1] // 2 # This is one of the 4 center pixels
+        # A single point source at the origin of the coordinate system (center of the image grid)
+        # The PAT operator's internal grid has (0,0) at the center.
+        # If img_shape is (16,16), indices 7 and 8 are around the center.
+        # Pixel coord for index i is i - (N-1)/2. For N=16, (N-1)/2 = 7.5.
+        # Index 7 -> 7 - 7.5 = -0.5. Index 8 -> 8 - 7.5 = 0.5.
+        # So a source at pixel (7,7) has coords (-0.5, -0.5).
+        # A source at (8,8) has coords (0.5, 0.5).
+        # Let's use a small 2x2 square at the center for robustness.
+        cy, cx = self.img_shape[0] // 2, self.img_shape[1] // 2
+        phantom_image[cy-1:cy+1, cx-1:cx+1] = 1.0 # Small 2x2 square around center
+        
+        sensor_data = self.pat_op.op(phantom_image)
+        
+        self.assertEqual(sensor_data.shape, (self.num_sensors, self.num_time_samples))
+        self.assertEqual(sensor_data.device, self.device)
+
+        # Basic property check:
+        # Source is near (0,0). Sensors are at distance 8. Sound speed 1.
+        # Expected time of arrival: t = distance / sound_speed = 8.0 / 1.0 = 8.0.
+        expected_time = 8.0
+        
+        # Find the time_points index closest to expected_time
+        time_diffs = torch.abs(self.time_points - expected_time)
+        closest_time_idx = torch.argmin(time_diffs)
+        
+        # Check if there's significant signal around this time index for all sensors
+        # Due to shell thickness, signal might be spread over a few time points
+        # And due to 2x2 source, it's not a perfect point.
+        start_idx = max(0, closest_time_idx - 2)
+        end_idx = min(self.num_time_samples, closest_time_idx + 3) # check a small window of 5 points
+
+        for s_idx in range(self.num_sensors):
+            signal_window = sensor_data[s_idx, start_idx:end_idx]
+            self.assertTrue(torch.sum(signal_window) > 1e-3, 
+                            f"Sensor {s_idx} should have received a signal around t={expected_time} (indices {start_idx}-{end_idx-1}). Sum was {torch.sum(signal_window)}")
+        self.assertTrue(torch.sum(sensor_data) > 1e-3) # Overall check
+
+    def test_op_adj_backprojection(self):
+        sensor_data_input = torch.zeros((self.num_sensors, self.num_time_samples), device=self.device, dtype=torch.float32)
+        
+        # Simulate a signal from sensor 0 (at [0.0, 8.0]) at a time corresponding to a source at origin (0,0)
+        # Distance = 8.0. Time = 8.0 / 1.0 = 8.0.
+        expected_time = 8.0
+        closest_time_idx = torch.argmin(torch.abs(self.time_points - expected_time))
+        
+        sensor_data_input[0, closest_time_idx] = 1.0 # Signal at sensor 0 at this specific time
+        
+        reconstructed_image = self.pat_op.op_adj(sensor_data_input)
+        
+        self.assertEqual(reconstructed_image.shape, self.img_shape)
+        self.assertEqual(reconstructed_image.device, self.device)
+        self.assertTrue(torch.sum(reconstructed_image) > 1e-3, "Reconstructed image should have some energy.")
+
+        # The backprojection should create a circular/arc pattern.
+        # The highest intensity should be on a circle of radius `expected_time * sound_speed`
+        # centered at `sensor_positions[0]`.
+        # For this test, just checking total energy is a start.
+        # A more specific check: pixels around the true source location (0,0) should have some intensity.
+        # The pixel at (0,0) relative to center is around img_idx (cy,cx).
+        cy, cx = self.img_shape[0] // 2, self.img_shape[1] // 2
+        # Check a small patch around the center. Because sensor 0 is at (0,8), the arc from this
+        # specific sensor data point should pass through points like (0,0) if radius is 8.
+        center_patch = reconstructed_image[cy-2:cy+2, cx-2:cx+2]
+        self.assertTrue(torch.sum(center_patch) > 1e-4, 
+                        f"Center patch of reconstructed image should have energy. Sum was {torch.sum(center_patch)}")
+
+    def test_adjoint_property_pat(self):
+        torch.manual_seed(42) # For reproducibility
+        img_x = torch.rand(self.img_shape, device=self.device, dtype=torch.float32)
+        sensor_data_y = torch.rand((self.num_sensors, self.num_time_samples), device=self.device, dtype=torch.float32)
+        
+        # Ax = A(img_x)
+        Ax = self.pat_op.op(img_x)
+        
+        # A_adj_y = A_adj(sensor_data_y)
+        A_adj_y = self.pat_op.op_adj(sensor_data_y)
+        
+        # Dot products
+        dot_Ax_y = torch.vdot(Ax.flatten(), sensor_data_y.flatten())
+        dot_x_A_adj_y = torch.vdot(img_x.flatten(), A_adj_y.flatten())
+        
+        # print(f"PAT Dot <Ax,y>: {dot_Ax_y.item()}")
+        # print(f"PAT Dot <x,A_adj_y>: {dot_x_A_adj_y.item()}")
+        
+        # Due to the binary shell condition (pixel is either in or out), this might not be perfectly adjoint
+        # without very fine discretization or a smoother shell.
+        # The tolerance might need to be relatively loose.
+        torch.testing.assert_close(dot_Ax_y, dot_x_A_adj_y, rtol=1e-3, atol=1e-3)
+
 
 if __name__ == '__main__':
     unittest.main()
