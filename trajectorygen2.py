@@ -1,6 +1,121 @@
 import numpy as np
 from typing import Callable, Optional, Dict, Any
 
+import numpy as np
+
+import numpy as np
+
+class Trajectory:
+    """
+    Container for a k-space trajectory and associated data.
+    Includes additional trajectory metrics like max PNS, max slew, FOV, and resolution.
+    """
+    def __init__(self, name, points, gradients=None, dt=None, metadata=None):
+        """
+        Args:
+            name (str): Trajectory name/description.
+            points (np.ndarray): [D, N] or [N, D] k-space coordinates (usually D=2 or 3).
+            gradients (np.ndarray, optional): [D, N] or [N, D] gradient waveforms.
+            dt (float, optional): Dwell/sample time in seconds.
+            metadata (dict, optional): Additional information.
+        """
+        self.name = name
+        self.points = np.array(points)
+        self.gradients = np.array(gradients) if gradients is not None else None
+        self.dt = dt
+        self.metadata = metadata or {}
+
+        # Automatically populate additional metrics
+        self._compute_metrics()
+
+    def _compute_metrics(self):
+        if self.gradients is not None and self.dt is not None:
+            # Slew rate: dG/dt (T/m/s)
+            slew = np.diff(self.gradients, axis=-1) / self.dt
+            max_slew = np.max(np.linalg.norm(slew, axis=0))
+            self.metadata['max_slew_rate'] = max_slew  # T/m/s
+
+            # Estimate PNS (simplified): max slew as proxy
+            self.metadata['max_pns_proxy'] = max_slew  # Not real units, use as indicator
+
+        # FOV estimation from max extent in k-space
+        if self.points is not None:
+            k_extent = np.max(np.abs(self.points), axis=-1)
+            fov = 1 / (2 * k_extent + 1e-9)  # avoid divide by zero
+            self.metadata['fov_estimate_mm'] = (fov * 1e3).tolist()  # convert to mm
+
+            # Resolution estimate ~ 1 / max k-space radius
+            max_k_radius = np.max(np.linalg.norm(self.points, axis=0))
+            resolution = 1 / (2 * max_k_radius + 1e-9)
+            self.metadata['resolution_estimate_mm'] = resolution * 1e3
+
+    def export(self, filename, filetype=None):
+        """
+        Export trajectory to file (CSV, .npy, .npz, .txt).
+        Args:
+            filename (str): Output file name.
+            filetype (str, optional): 'csv', 'npy', 'npz', or 'txt'. Inferred from extension if not given.
+        """
+        if filetype is None:
+            if filename.endswith('.csv'):
+                filetype = 'csv'
+            elif filename.endswith('.npy'):
+                filetype = 'npy'
+            elif filename.endswith('.npz'):
+                filetype = 'npz'
+            else:
+                filetype = 'txt'
+        arr = self.points.T if self.points.shape[0] < self.points.shape[1] else self.points
+        if filetype == 'csv':
+            np.savetxt(filename, arr, delimiter=',')
+        elif filetype == 'npy':
+            np.save(filename, arr)
+        elif filetype == 'npz':
+            np.savez(filename, kspace=arr, gradients=self.gradients, dt=self.dt, metadata=self.metadata)
+        elif filetype == 'txt':
+            np.savetxt(filename, arr)
+        else:
+            raise ValueError(f"Unsupported filetype: {filetype}")
+
+    @classmethod
+    def import_from(cls, filename):
+        """
+        Import a trajectory from a file.
+        """
+        if filename.endswith('.csv') or filename.endswith('.txt'):
+            points = np.loadtxt(filename, delimiter=',' if filename.endswith('.csv') else None)
+            return cls(name=filename, points=points)
+        elif filename.endswith('.npy'):
+            points = np.load(filename)
+            return cls(name=filename, points=points)
+        elif filename.endswith('.npz'):
+            data = np.load(filename, allow_pickle=True)
+            points = data['kspace']
+            gradients = data['gradients'] if 'gradients' in data else None
+            dt = data['dt'].item() if 'dt' in data else None
+            metadata = data['metadata'].item() if 'metadata' in data else {}
+            return cls(name=filename, points=points, gradients=gradients, dt=dt, metadata=metadata)
+        else:
+            raise ValueError(f"Unsupported filetype: {filename}")
+
+    def summary(self):
+        """
+        Print a summary of the trajectory.
+        """
+        d, n = self.points.shape if self.points.shape[0] < self.points.shape[1] else self.points.T.shape
+        print(f"Trajectory '{self.name}': {n} points, {d} dimensions")
+        if self.gradients is not None:
+            print("Gradients present.")
+        if self.dt is not None:
+            print(f"Sample time: {self.dt * 1e6:.2f} us")
+        if self.metadata:
+            for key, value in self.metadata.items():
+                print(f"{key}: {value}")
+
+
+
+
+
 class KSpaceTrajectoryGenerator:
     def __init__(
         self,
