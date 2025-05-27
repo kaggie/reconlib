@@ -24,12 +24,14 @@ class KSpaceTrajectoryGenerator:
         per_interleaf_params: Optional[Dict[int, Dict[str, Any]]] = None,
         time_varying_params: Optional[Callable[[float], Dict[str, float]]] = None,
         use_golden_angle: bool = False,
-        vd_method: str = "power",          # New: Select variable density method
-        vd_alpha: Optional[float] = None,  # Used for power-law and hybrid
+        vd_method: str = "power",
+        vd_alpha: Optional[float] = None,
         vd_func: Optional[Callable[[np.ndarray], np.ndarray]] = None,
-        vd_flat: Optional[float] = None,   # For hybrid/flat-top
-        vd_sigma: Optional[float] = None,  # For Gaussian
-        vd_rho: Optional[float] = None,    # For exponential
+        vd_flat: Optional[float] = None,
+        vd_sigma: Optional[float] = None,
+        vd_rho: Optional[float] = None,
+        spiral_out_out: bool = False,          # <--- New option
+        spiral_out_out_split: float = 0.5,     # <--- Fraction of samples for first spiral out (0.5=even split)
         ):
         self.fov = fov
         self.resolution = resolution
@@ -51,13 +53,14 @@ class KSpaceTrajectoryGenerator:
         self.per_interleaf_params = per_interleaf_params or {}
         self.time_varying_params = time_varying_params
         self.use_golden_angle = use_golden_angle
-        # Variable density spiral params
         self.vd_method = vd_method
         self.vd_alpha = vd_alpha
         self.vd_func = vd_func
         self.vd_flat = vd_flat
         self.vd_sigma = vd_sigma
         self.vd_rho = vd_rho
+        self.spiral_out_out = spiral_out_out
+        self.spiral_out_out_split = spiral_out_out_split
 
         self.k_max = 1 / (2 * self.resolution)
         self.g_required = min(self.k_max / (self.gamma * self.dt), self.g_max)
@@ -87,18 +90,12 @@ class KSpaceTrajectoryGenerator:
         return r_profile
 
     def _variable_density_spiral(self, t):
-        """
-        General variable density spiral radius profile selector.
-        Supported: 'power', 'hybrid', 'gaussian', 'exponential', 'flat', 'custom'
-        """
         if self.vd_func is not None or self.vd_method == "custom":
             return self.vd_func(t)
         if self.vd_method == "power":
-            # Power-law: r = t^alpha
             alpha = self.vd_alpha if self.vd_alpha is not None else 1
             return t ** alpha
         elif self.vd_method == "hybrid":
-            # Flat in center, power-law in outer region (flat-top)
             flat = self.vd_flat if self.vd_flat is not None else 0.2
             alpha = self.vd_alpha if self.vd_alpha is not None else 2
             r = np.zeros_like(t)
@@ -107,19 +104,15 @@ class KSpaceTrajectoryGenerator:
             r[~mask] = ((t[~mask] - flat) / (1 - flat)) ** alpha
             return r
         elif self.vd_method == "gaussian":
-            # Gaussian variable density: r = erf(t/sigma)
             sigma = self.vd_sigma if self.vd_sigma is not None else 0.25
             from scipy.special import erf
             return erf(t / sigma)
         elif self.vd_method == "exponential":
-            # Exponential variable density: r = (exp(rho*t)-1)/(exp(rho)-1)
             rho = self.vd_rho if self.vd_rho is not None else 3
             return (np.exp(rho * t) - 1) / (np.exp(rho) - 1)
         elif self.vd_method == "flat":
-            # Uniform: r = t
             return t
         else:
-            # Default to uniform
             return t
 
     def _enforce_gradient_limits(self, gx, gy, gz=None):
@@ -154,6 +147,38 @@ class KSpaceTrajectoryGenerator:
             theta = np.pi * (1 + 5**0.5) * indices
             return theta, phi
 
+    def _generate_spiral_out_out(self, t, n_samples, k_max, turns, phi, r_profile):
+        """
+        Generate a spiral-out-spiral-out trajectory (see e.g. https://onlinelibrary.wiley.com/doi/full/10.1002/mrm.24476)
+        """
+        split = self.spiral_out_out_split
+        n1 = int(np.floor(split * n_samples))
+        n2 = n_samples - n1
+
+        # First spiral out (0 -> k_max)
+        t1 = np.linspace(0, 1, n1, endpoint=False)
+        vd1 = self._variable_density_spiral(t1)
+        r1 = vd1 * k_max * r_profile[:n1]
+        theta1 = turns * 2 * np.pi * t1 + phi
+
+        # Second spiral out (0 -> k_max), starting at origin but shifted in angle
+        t2 = np.linspace(0, 1, n2)
+        vd2 = self._variable_density_spiral(t2)
+        # angle offset for the second spiral
+        phi2 = phi + np.pi  # 180 deg offset (can be parameter)
+        r2 = vd2 * k_max * r_profile[n1:]
+        theta2 = turns * 2 * np.pi * t2 + phi2
+
+        # Both start at (0,0), end at (k_max, angle)
+        kx1 = r1 * np.cos(theta1)
+        ky1 = r1 * np.sin(theta1)
+        kx2 = r2 * np.cos(theta2)
+        ky2 = r2 * np.sin(theta2)
+
+        kx = np.concatenate([kx1, kx2])
+        ky = np.concatenate([ky1, ky2])
+        return kx, ky
+
     def _generate_standard(self, interleaf_idx, t, n_samples, **params):
         local_params = {**self.__dict__, **params}
         fov = local_params.get("fov", self.fov)
@@ -173,16 +198,23 @@ class KSpaceTrajectoryGenerator:
 
         if self.dim == 2:
             if self.traj_type == "spiral":
-                t_norm = np.linspace(0, 1, n_samples)
-                vd = self._variable_density_spiral(t_norm)
-                r = vd * k_max * r_profile
-                if self.use_golden_angle:
-                    phi = self._golden_angle(interleaf_idx)
+                if self.spiral_out_out:
+                    if self.use_golden_angle:
+                        phi = self._golden_angle(interleaf_idx)
+                    else:
+                        phi = 2 * np.pi * interleaf_idx / self.n_interleaves
+                    kx, ky = self._generate_spiral_out_out(t, n_samples, k_max, turns, phi, r_profile)
                 else:
-                    phi = 2 * np.pi * interleaf_idx / self.n_interleaves
-                theta = turns * 2 * np.pi * t / t[-1] + phi
-                kx = r * np.cos(theta)
-                ky = r * np.sin(theta)
+                    t_norm = np.linspace(0, 1, n_samples)
+                    vd = self._variable_density_spiral(t_norm)
+                    r = vd * k_max * r_profile
+                    if self.use_golden_angle:
+                        phi = self._golden_angle(interleaf_idx)
+                    else:
+                        phi = 2 * np.pi * interleaf_idx / self.n_interleaves
+                    theta = turns * 2 * np.pi * t / t[-1] + phi
+                    kx = r * np.cos(theta)
+                    ky = r * np.sin(theta)
                 kz = None
             elif self.traj_type == "radial":
                 angle = (self._golden_angle(interleaf_idx) if self.use_golden_angle
@@ -401,12 +433,10 @@ class KSpaceTrajectoryGenerator:
         slew_ok = np.all(np.abs(slew) <= self.s_max)
         return grad_ok, slew_ok, G, slew
 
-# Example usage:
+# Example usage for spiral out-out:
 # gen = KSpaceTrajectoryGenerator(
 #     fov=0.24, resolution=0.001, dt=4e-6, g_max=40e-3, s_max=150.0,
-#     n_interleaves=32, traj_type='spiral', ramp_fraction=0.1,
-#     add_rewinder=True, add_spoiler=True, add_slew_limited_ramps=True,
-#     use_golden_angle=True, vd_method="hybrid", vd_alpha=4.0, vd_flat=0.15,
-#     dim=2
+#     n_interleaves=8, traj_type='spiral', spiral_out_out=True,
+#     spiral_out_out_split=0.5, use_golden_angle=True, vd_method="power", vd_alpha=1.2
 # )
 # kx, ky, gx, gy, t = gen.generate()
