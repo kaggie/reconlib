@@ -342,6 +342,7 @@ class NUFFT3D(NUFFT):
                  kb_m: tuple[float, float, float] | None = None,
                  Kd: tuple[int, int, int] | None = None,
                  n_shift: tuple[float, float, float] | None = None,
+                 interpolation_order: int = 1,
                  device: str | torch.device = 'cpu'):
         
         super().__init__(image_shape=image_shape, 
@@ -366,6 +367,9 @@ class NUFFT3D(NUFFT):
             if len(self.n_shift) != len(self.image_shape):
                  raise ValueError(f"Length of n_shift {len(self.n_shift)} must match image dimensionality {len(self.image_shape)}")
 
+        self.interpolation_order = interpolation_order
+        if self.interpolation_order not in [0, 1]:
+            raise ValueError("interpolation_order must be 0 (Nearest Neighbor) or 1 (Linear)")
 
         self.interp_tables: list[torch.Tensor] | None = None
         self.scaling_factors: torch.Tensor | None = None
@@ -386,7 +390,7 @@ class NUFFT3D(NUFFT):
     def _compute_kb_values_1d(self, r_vals: torch.Tensor, J: int, alpha: float, m: float) -> torch.Tensor:
         """
         Computes 1D generalized Kaiser-Bessel kernel values.
-        r_vals: distances |x|, can be outside [-J/2, J/2]
+        r_vals: distances |x|, can be outside [-J/2, J/2].
         J: kernel width for this dimension
         alpha: shape parameter for this dimension
         m: order parameter for this dimension
@@ -579,22 +583,30 @@ class NUFFT3D(NUFFT):
         # So, if relative_offset_grid_units is this distance, then the index is center + this_dist * L_d.
         table_idx_float = table_center_idx + relative_offset_grid_units * L_d
 
-        # Linear interpolation (order=1)
-        idx_low = torch.floor(table_idx_float).long()
-        idx_high = torch.ceil(table_idx_float).long()
-        
-        # Fractional part for interpolation
-        frac = table_idx_float - idx_low.float()
+        if self.interpolation_order == 0: # Nearest Neighbor
+            nearest_idx = torch.round(table_idx_float).long()
+            nearest_idx = torch.clamp(nearest_idx, 0, table_len - 1)
+            interpolated_val = table[nearest_idx]
+        elif self.interpolation_order == 1: # Linear Interpolation
+            idx_low = torch.floor(table_idx_float).long()
+            idx_high = torch.ceil(table_idx_float).long()
+            
+            # Fractional part for interpolation
+            frac = table_idx_float - idx_low.float()
 
-        # Boundary conditions: clamp indices to table bounds
-        idx_low = torch.clamp(idx_low, 0, table_len - 1)
-        idx_high = torch.clamp(idx_high, 0, table_len - 1)
+            # Boundary conditions: clamp indices to table bounds
+            idx_low = torch.clamp(idx_low, 0, table_len - 1)
+            idx_high = torch.clamp(idx_high, 0, table_len - 1)
 
-        val_low = table[idx_low]
-        val_high = table[idx_high]
-        
-        # Perform interpolation: (1-frac)*val_low + frac*val_high
-        interpolated_val = (1.0 - frac) * val_low + frac * val_high
+            val_low = table[idx_low]
+            val_high = table[idx_high]
+            
+            # Perform interpolation: (1-frac)*val_low + frac*val_high
+            interpolated_val = (1.0 - frac) * val_low + frac * val_high
+        else:
+            # This case should be caught by __init__ validation
+            raise ValueError(f"Unsupported interpolation_order: {self.interpolation_order}")
+            
         return interpolated_val
 
     def forward(self, image_data: torch.Tensor) -> torch.Tensor:
