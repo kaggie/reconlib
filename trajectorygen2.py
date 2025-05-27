@@ -416,6 +416,117 @@ class KSpaceTrajectoryGenerator:
             return kx, ky, gx, gy, t
         else:
             return kx, ky, kz, gx, gy, gz, t
+    def generate_3d_from_2d(
+        self,
+        n_3d_shots: int,
+        fov_3d: float = None,
+        resolution_3d: float = None,
+        phi_theta_func: Optional[Callable[[int], tuple]] = None,
+        traj2d_type: str = "spiral",
+        **kwargs
+    ):
+        """
+        Generate a 3D k-space trajectory by rotating a 2D trajectory (e.g., spiral, radial) 
+        according to phi and theta angles, with logic for full 3D k-space coverage.
+        
+        Args:
+            n_3d_shots: Number of shots (orientations) covering 3D k-space
+            fov_3d: 3D field of view (if None, uses self.fov)
+            resolution_3d: 3D resolution (if None, uses self.resolution)
+            phi_theta_func: User callback for phi, theta for each shot (idx) (optional)
+            traj2d_type: Type of 2D trajectory to generate ("spiral", "radial", etc.)
+            kwargs: Passed to 2D trajectory generator
+        
+        Returns:
+            kx, ky, kz: [n_3d_shots, n_samples] arrays
+            gx, gy, gz: [n_3d_shots, n_samples] arrays
+            t: time vector
+            
+            # Example usage:
+            # gen = KSpaceTrajectoryGenerator(fov=0.22, resolution=0.0015, traj_type='spiral', vd_method='power', vd_alpha=1.5)
+            # kx, ky, kz, gx, gy, gz, t = gen.generate_3d_from_2d(n_3d_shots=64)
+        """
+        fov_3d = fov_3d if fov_3d is not None else self.fov
+        resolution_3d = resolution_3d if resolution_3d is not None else self.resolution
+        k_max_3d = 1/(2 * resolution_3d)
+        # Estimate number of samples for 2D trajectory in the 3D context
+        n_samples = int(np.ceil((k_max_3d * 2 * np.pi * fov_3d) / (self.gamma * self.g_max * self.dt)))
+        n_samples = max(n_samples, 1)
+        t = np.arange(n_samples) * self.dt
+
+        # Uniform sphere coverage: use spherical Fibonacci or golden angle
+        def default_phi_theta(idx):
+            # Spherical Fibonacci lattice for uniform 3D coverage
+            ga = np.pi * (3 - np.sqrt(5))
+            z = 1 - 2 * (idx + 0.5) / n_3d_shots
+            phi = ga * idx
+            theta = np.arccos(z)
+            return phi, theta
+
+        phi_theta = phi_theta_func if phi_theta_func is not None else default_phi_theta
+
+        kx = np.zeros((n_3d_shots, n_samples))
+        ky = np.zeros((n_3d_shots, n_samples))
+        kz = np.zeros((n_3d_shots, n_samples))
+        gx = np.zeros((n_3d_shots, n_samples))
+        gy = np.zeros((n_3d_shots, n_samples))
+        gz = np.zeros((n_3d_shots, n_samples))
+
+        # Prepare a 2D trajectory generator for the base (xy) plane
+        base2d = KSpaceTrajectoryGenerator(
+            fov=fov_3d, resolution=resolution_3d, dt=self.dt, g_max=self.g_max, s_max=self.s_max,
+            n_interleaves=1, gamma=self.gamma, traj_type=traj2d_type, turns=self.turns,
+            ramp_fraction=self.ramp_fraction, add_slew_limited_ramps=self.add_slew_limited_ramps,
+            vd_method=self.vd_method, vd_alpha=self.vd_alpha, vd_func=self.vd_func,
+            vd_flat=self.vd_flat, vd_sigma=self.vd_sigma, vd_rho=self.vd_rho
+        )
+
+        # Generate a single "base" 2D trajectory
+        kx2d, ky2d, gx2d, gy2d, t2d = base2d.generate()
+        kx2d = kx2d[0]
+        ky2d = ky2d[0]
+        gx2d = gx2d[0]
+        gy2d = gy2d[0]
+
+        # Pad or cut to n_samples for consistency
+        if len(kx2d) > n_samples:
+            kx2d = kx2d[:n_samples]; ky2d = ky2d[:n_samples]
+            gx2d = gx2d[:n_samples]; gy2d = gy2d[:n_samples]
+        elif len(kx2d) < n_samples:
+            pad = n_samples - len(kx2d)
+            kx2d = np.pad(kx2d, (0, pad))
+            ky2d = np.pad(ky2d, (0, pad))
+            gx2d = np.pad(gx2d, (0, pad))
+            gy2d = np.pad(gy2d, (0, pad))
+
+        # For each 3D shot, rotate the 2D trajectory by phi and theta
+        for idx in range(n_3d_shots):
+            phi, theta = phi_theta(idx)
+            # 3D rotation matrix (first rotate around y by theta, then around z by phi)
+            # Ry(theta) * Rz(phi)
+            # [cos(phi)*cos(theta) -sin(phi) cos(phi)*sin(theta)]
+            # [sin(phi)*cos(theta)  cos(phi) sin(phi)*sin(theta)]
+            # [      -sin(theta)         0         cos(theta) ]
+            cphi, sphi = np.cos(phi), np.sin(phi)
+            ctheta, stheta = np.cos(theta), np.sin(theta)
+            R = np.array([
+                [cphi*ctheta, -sphi, cphi*stheta],
+                [sphi*ctheta,  cphi, sphi*stheta],
+                [      -stheta,     0,      ctheta]
+            ])
+            # Stack 2D trajectory as [x, y, 0]
+            traj2d = np.stack([kx2d, ky2d, np.zeros_like(kx2d)], axis=0)
+            grad2d = np.stack([gx2d, gy2d, np.zeros_like(gx2d)], axis=0)
+            traj3d = R @ traj2d
+            grad3d = R @ grad2d
+            kx[idx] = traj3d[0]
+            ky[idx] = traj3d[1]
+            kz[idx] = traj3d[2]
+            gx[idx] = grad3d[0]
+            gy[idx] = grad3d[1]
+            gz[idx] = grad3d[2]
+
+        return kx, ky, kz, gx, gy, gz, t
 
     @staticmethod
     def plugin_example(idx, t, n_samples, **kwargs):
