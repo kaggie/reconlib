@@ -1245,4 +1245,245 @@ class RadioInterferometryOperator(Operator):
         return sky_image_estimate
 
 
+# --- Field Corrected NUFFT Operator ---
+class FieldCorrectedNUFFTOperator(Operator):
+    """
+    NUFFT Operator corrected for B0 field inhomogeneities using time segmentation.
+    """
+    def __init__(self, 
+                 k_trajectory: torch.Tensor, 
+                 image_shape: tuple[int, ...], 
+                 b0_map: torch.Tensor,
+                 time_per_kspace_point: torch.Tensor,
+                 num_segments: int = 8, # Default number of time segments
+                 oversamp_factor: tuple[float, ...] = (2.0, 2.0), # Example default
+                 kb_J: tuple[int, ...] = (6, 6),             # Example default
+                 kb_alpha: tuple[float, ...] = (2.34*6, 2.34*6), # Example default for J=6
+                 Ld: tuple[int, ...] = None, # For table NUFFT, e.g. image_shape * oversamp_factor
+                 device: str = 'cpu',
+                 nufft_class_for_segments = None # Allow passing NUFFT2D or NUFFT3D constructor
+                 ):
+        """
+        Initializes the FieldCorrectedNUFFTOperator.
+
+        Args:
+            k_trajectory (torch.Tensor): Shape (num_k_points, ndims). Assumed normalized to [-0.5, 0.5].
+            image_shape (tuple[int, ...]): Shape of the image (e.g., (Ny, Nx) or (Nz, Ny, Nx)).
+            b0_map (torch.Tensor): B0 field inhomogeneity map in Hz. Shape must match image_shape.
+            time_per_kspace_point (torch.Tensor): Acquisition time for each k-space point in seconds.
+                                                 Shape (num_k_points,).
+            num_segments (int): Number of time segments to divide the k-space trajectory into.
+            oversamp_factor, kb_J, kb_alpha, Ld: Standard NUFFT parameters.
+            device (str): 'cpu' or 'cuda'.
+            nufft_class_for_segments: The NUFFT implementation to use (e.g., NUFFT2D or NUFFT3D class).
+                                      If None, it will be inferred from dimensionality.
+        """
+        super().__init__() # Operator is ABC, no specific super init needed unless it becomes nn.Module
+        self.image_shape = tuple(image_shape)
+        self.device = torch.device(device)
+        
+        if not isinstance(b0_map, torch.Tensor):
+            b0_map = torch.from_numpy(b0_map).float()
+        self.b0_map_rad_s = (2 * np.pi * b0_map).to(self.device) # Convert Hz to rad/s and move to device
+
+        if self.b0_map_rad_s.shape != self.image_shape:
+            raise ValueError(f"b0_map shape {b0_map.shape} must match image_shape {self.image_shape}.")
+        
+        if not isinstance(time_per_kspace_point, torch.Tensor):
+            time_per_kspace_point = torch.from_numpy(time_per_kspace_point).float()
+        if time_per_kspace_point.shape[0] != k_trajectory.shape[0]:
+            raise ValueError("Length of time_per_kspace_point must match number of k-space points.")
+
+        if not isinstance(k_trajectory, torch.Tensor):
+            k_trajectory = torch.from_numpy(k_trajectory).float()
+        self.k_trajectory = k_trajectory.to(self.device)
+        self.time_per_kspace_point = time_per_kspace_point.to(self.device)
+        
+        if num_segments <= 0:
+            raise ValueError("num_segments must be positive.")
+        self.num_segments = num_segments
+
+        # Store NUFFT params for instantiating per-segment NUFFTs
+        self.oversamp_factor = oversamp_factor
+        self.kb_J = kb_J
+        self.kb_alpha = kb_alpha
+        self.Ld = Ld if Ld is not None else tuple(int(ims * ovs) for ims, ovs in zip(self.image_shape, self.oversamp_factor))
+
+
+        self.dimensionality = len(image_shape)
+        if nufft_class_for_segments is None:
+            if self.dimensionality == 2:
+                self._nufft_impl_class = NUFFT2D
+            elif self.dimensionality == 3:
+                self._nufft_impl_class = NUFFT3D
+            else:
+                raise ValueError(f"Unsupported dimensionality: {self.dimensionality}. Must be 2 or 3.")
+        else:
+            self._nufft_impl_class = nufft_class_for_segments
+
+
+        # Segment the trajectory
+        self._segment_indices_list = []  # List of tensors, each containing original k-space point indices for a segment
+        self.segment_avg_times_list = [] # List of average times for each segment
+        self._segment_k_trajectories_list = [] # List of k-space trajectories for each segment
+
+        # Sort k-space points by time to make segmentation straightforward
+        sorted_times, sort_indices = torch.sort(self.time_per_kspace_point)
+        
+        num_k_points = self.k_trajectory.shape[0]
+        
+        # Ensure num_segments is not greater than num_k_points to avoid empty segments leading to errors.
+        # If it is, adjust num_segments.
+        actual_num_segments = min(self.num_segments, num_k_points)
+        if actual_num_segments != self.num_segments:
+            print(f"Warning: num_segments ({self.num_segments}) > num_k_points ({num_k_points}). "
+                  f"Adjusting num_segments to {actual_num_segments}.")
+            self.num_segments = actual_num_segments # Update self.num_segments
+        
+        if self.num_segments == 0 and num_k_points > 0: # Should not happen if num_k_points > 0 due to min()
+             self.num_segments = 1 # Must have at least one segment if there are points
+
+        points_per_segment = num_k_points // self.num_segments if self.num_segments > 0 else 0
+        
+        current_point_idx_in_sorted_array = 0
+        for i in range(self.num_segments):
+            start_idx_in_sorted = current_point_idx_in_sorted_array
+            end_idx_in_sorted = current_point_idx_in_sorted_array + points_per_segment
+            if i == self.num_segments - 1: # Last segment takes all remaining points
+                end_idx_in_sorted = num_k_points
+            
+            if start_idx_in_sorted == end_idx_in_sorted and num_k_points > 0 : # Segment would be empty but there are points
+                if i > 0 : # If not the first segment, this means previous segments were too small.
+                           # This logic path should ideally not be hit if points_per_segment is calculated well
+                           # or if num_segments is <= num_k_points.
+                    continue # Skip creating an empty segment if there are no points left for it.
+                else: # If first segment is empty, but there are k-points (e.g. num_segments > num_k_points initially)
+                      # This case is less likely now due to actual_num_segments logic.
+                      # However, if num_segments was 1 and points_per_segment became 0 due to num_k_points=0, handle this.
+                      if num_k_points == 0: continue # No points, so no segments.
+                      # This implies all points should go to this single segment if num_segments = 1
+                      end_idx_in_sorted = num_k_points
+
+
+            original_indices_for_segment = sort_indices[start_idx_in_sorted:end_idx_in_sorted]
+            
+            if len(original_indices_for_segment) > 0:
+                self._segment_indices_list.append(original_indices_for_segment)
+                self.segment_avg_times_list.append(torch.mean(sorted_times[start_idx_in_sorted:end_idx_in_sorted]))
+                self._segment_k_trajectories_list.append(self.k_trajectory[original_indices_for_segment])
+            # No else needed, as empty segments are skipped or actual_num_segments handles it.
+
+            current_point_idx_in_sorted_array = end_idx_in_sorted
+        
+        # Update num_segments to reflect the actual number of non-empty segments created
+        self.num_segments = len(self._segment_indices_list)
+
+        # We don't store sort_indices as it's only used for initial segmentation.
+        # The lists _segment_indices_list, segment_avg_times_list, _segment_k_trajectories_list
+        # now define the segments based on the original k-trajectory and time_per_kspace_point.
+
+    def op(self, image_data_tensor: torch.Tensor) -> torch.Tensor:
+        """
+        Forward operation: Image to B0-corrupted k-space data using time segmentation.
+        """
+        if image_data_tensor.shape != self.image_shape:
+            raise ValueError(f"Input image_data_tensor shape {image_data_tensor.shape} "
+                             f"does not match expected image_shape {self.image_shape}.")
+        if image_data_tensor.device != self.device:
+            image_data_tensor = image_data_tensor.to(self.device)
+        if not image_data_tensor.is_complex():
+            # Ensure input is complex for phase multiplication and NUFFT
+            image_data_tensor = image_data_tensor.to(torch.complex64)
+
+        num_total_k_points = self.k_trajectory.shape[0]
+        # Initialize output_kspace based on the original, unsorted k-trajectory order
+        output_kspace = torch.zeros(num_total_k_points, dtype=torch.complex64, device=self.device)
+
+        for i in range(self.num_segments):
+            # Use self._segment_indices_list and self.segment_avg_times_list as defined in __init__
+            segment_k_indices_original_order = self._segment_indices_list[i] # These are original indices
+            
+            if len(segment_k_indices_original_order) == 0:
+                continue # Skip empty segments
+
+            # Get the k-space trajectory points corresponding to these original indices
+            # These points are already stored in self._segment_k_trajectories_list
+            segment_k_trajectory_points = self._segment_k_trajectories_list[i]
+            segment_time_avg = self.segment_avg_times_list[i]
+
+            # Apply B0 phase correction for this segment's average time
+            phase_correction = torch.exp(-1j * self.b0_map_rad_s * segment_time_avg) # b0_map_rad_s is (image_shape)
+            image_eff_segment = image_data_tensor * phase_correction # Element-wise multiplication
+
+            # Instantiate a NUFFT object for this specific segment's k-trajectory
+            segment_nufft_op = self._nufft_impl_class(
+                k_trajectory=segment_k_trajectory_points, # K-space points for this segment
+                image_shape=self.image_shape,
+                oversamp_factor=self.oversamp_factor,
+                kb_J=self.kb_J,
+                kb_alpha=self.kb_alpha,
+                Ld=self.Ld,
+                device=self.device
+            )
+            
+            # Compute k-space for this segment
+            kspace_segment_values = segment_nufft_op.forward(image_eff_segment)
+            
+            # Place the computed values into the output_kspace tensor at their original indices
+            output_kspace[segment_k_indices_original_order] = kspace_segment_values
+            
+        return output_kspace
+
+    def op_adj(self, k_space_data_tensor: torch.Tensor) -> torch.Tensor:
+        """
+        Adjoint operation: B0-corrupted k-space data to image using time segmentation.
+        """
+        if k_space_data_tensor.shape[0] != self.k_trajectory.shape[0] or k_space_data_tensor.ndim != 1:
+            raise ValueError(f"Input k_space_data_tensor has incorrect shape. "
+                             f"Expected 1D tensor of length {self.k_trajectory.shape[0]}, "
+                             f"got shape {k_space_data_tensor.shape}.")
+        if k_space_data_tensor.device != self.device:
+            k_space_data_tensor = k_space_data_tensor.to(self.device)
+        if not k_space_data_tensor.is_complex():
+            k_space_data_tensor = k_space_data_tensor.to(torch.complex64)
+
+        accumulated_image = torch.zeros(self.image_shape, dtype=torch.complex64, device=self.device)
+
+        for i in range(self.num_segments):
+            # Use self._segment_indices_list and self.segment_avg_times_list as defined in __init__
+            segment_k_indices_original_order = self._segment_indices_list[i] # Original indices for this segment
+            
+            if len(segment_k_indices_original_order) == 0:
+                continue # Skip empty segments
+
+            # Get the k-space trajectory points and data for this segment
+            # segment_k_trajectory_points = self.k_trajectory[segment_k_indices_original_order] # This is already stored
+            segment_k_trajectory_points = self._segment_k_trajectories_list[i]
+            segment_k_space_data = k_space_data_tensor[segment_k_indices_original_order]
+            segment_time_avg = self.segment_avg_times_list[i]
+
+            # Instantiate a NUFFT object for this specific segment's k-trajectory
+            segment_nufft_op = self._nufft_impl_class(
+                k_trajectory=segment_k_trajectory_points,
+                image_shape=self.image_shape,
+                oversamp_factor=self.oversamp_factor,
+                kb_J=self.kb_J,
+                kb_alpha=self.kb_alpha,
+                Ld=self.Ld,
+                device=self.device
+            )
+            
+            # Compute adjoint NUFFT for this segment
+            image_segment = segment_nufft_op.adjoint(segment_k_space_data) 
+            
+            # Apply conjugate B0 phase correction for this segment's average time
+            phase_correction_conj = torch.exp(1j * self.b0_map_rad_s * segment_time_avg)
+            image_segment_corrected = image_segment * phase_correction_conj
+            
+            # Accumulate the result
+            accumulated_image += image_segment_corrected
+            
+        return accumulated_image
+
+
 

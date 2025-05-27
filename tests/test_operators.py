@@ -102,3 +102,134 @@ class TestRadioInterferometryOperator(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+from reconlib.operators import FieldCorrectedNUFFTOperator, NUFFTOperator # Added imports
+
+class TestFieldCorrectedNUFFTOperator(unittest.TestCase):
+    def setUp(self):
+        self.device = DEVICE # Use global DEVICE
+        self.image_shape_2d = (16, 16) # Ny, Nx
+        self.num_k_points_2d = 64
+
+        # Simple linear k-space trajectory (more for testing logic than realism)
+        kx = torch.linspace(-0.5, 0.5, self.num_k_points_2d, device=self.device)
+        ky = torch.zeros(self.num_k_points_2d, device=self.device)
+        # For NUFFT2D, k_trajectory shape should be (num_k_points, 2)
+        # The order usually expected is (kx, ky) or (ku, kv)
+        # If reconlib.nufft.NUFFT2D expects (ky, kx) for (Ny, Nx) image, then this is fine.
+        # Let's assume it expects (ku, kv) where u maps to x-dim and v to y-dim.
+        # So, stack([kx, ky], dim=-1) would be more standard if kx is for image_shape[1] (width).
+        # The example in FieldCorrectedNUFFTOperator shows k_trajectory is (num_k_points, ndims)
+        # For a (Ny, Nx) image, ndims=2. Coordinates are (u,v)
+        # u corresponds to x (width, image_shape[1]), v to y (height, image_shape[0])
+        # NUFFT2D.py likely maps k_trajectory[:,0] to first spatial dim (y), k_trajectory[:,1] to second (x)
+        # if its image_shape is (Ny,Nx). So k_trajectory should be (v,u).
+        # If kx is for the x-dim (width) and ky for y-dim (height):
+        self.k_trajectory_2d = torch.stack([ky, kx], dim=-1) # (v,u) for (Ny,Nx) image if NUFFT maps k_traj dim 0 to img_dim 0
+
+        # Time vector: simple linear ramp
+        self.time_per_kpoint_2d = torch.linspace(0, 0.01, self.num_k_points_2d, device=self.device) # 10 ms readout
+
+        # B0 map: simple linear gradient in x (image columns) from -20Hz to 20Hz
+        self.b0_map_2d_hz = torch.zeros(self.image_shape_2d, device=self.device)
+        for c in range(self.image_shape_2d[1]): # Iterate through columns (x-dimension)
+            self.b0_map_2d_hz[:, c] = (c / (self.image_shape_2d[1] -1) - 0.5) * 40.0 # -20Hz to 20Hz
+
+        self.num_segments = 4 # Fewer segments for faster testing
+
+        # Basic NUFFT parameters (can be simple for unit testing the logic)
+        self.oversamp_factor = (1.25, 1.25) # Small oversampling for speed
+        self.kb_J = (3, 3) # Smaller kernel
+        self.kb_alpha = tuple(2.34 * j for j in self.kb_J)
+        # Ld will be calculated internally by FieldCorrectedNUFFTOperator's __init__
+
+        self.fc_nufft_op_2d = FieldCorrectedNUFFTOperator(
+            k_trajectory=self.k_trajectory_2d,
+            image_shape=self.image_shape_2d,
+            b0_map=self.b0_map_2d_hz,
+            time_per_kspace_point=self.time_per_kpoint_2d,
+            num_segments=self.num_segments,
+            oversamp_factor=self.oversamp_factor,
+            kb_J=self.kb_J,
+            kb_alpha=self.kb_alpha,
+            device=self.device.type # pass 'cpu' or 'cuda' string
+        )
+        
+        # Create a simple test image (e.g., point source)
+        self.test_image_2d = torch.zeros(self.image_shape_2d, dtype=torch.complex64, device=self.device)
+        # Place point source at image center
+        self.test_image_2d[self.image_shape_2d[0]//2, self.image_shape_2d[1]//2] = 1.0 + 0.5j
+
+
+    def test_instantiation(self):
+        self.assertIsInstance(self.fc_nufft_op_2d, FieldCorrectedNUFFTOperator)
+        # The number of segments might be adjusted internally if num_segments > num_k_points
+        # So, we check against the operator's actual num_segments
+        self.assertEqual(self.fc_nufft_op_2d.num_segments, min(self.num_segments, self.num_k_points_2d))
+        self.assertEqual(len(self.fc_nufft_op_2d._segment_indices_list), self.fc_nufft_op_2d.num_segments)
+        self.assertEqual(len(self.fc_nufft_op_2d.segment_avg_times_list), self.fc_nufft_op_2d.num_segments)
+
+    def test_op_forward_basic_run(self):
+        # Test if op runs and produces output of correct shape
+        k_space_out = self.fc_nufft_op_2d.op(self.test_image_2d)
+        self.assertEqual(k_space_out.shape, (self.num_k_points_2d,))
+        self.assertTrue(k_space_out.is_complex())
+        self.assertEqual(k_space_out.device, self.device)
+
+    def test_op_adj_basic_run(self):
+        # Test if op_adj runs and produces output of correct shape
+        test_k_space_data = torch.randn(self.num_k_points_2d, dtype=torch.complex64, device=self.device)
+        image_out = self.fc_nufft_op_2d.op_adj(test_k_space_data)
+        self.assertEqual(image_out.shape, self.image_shape_2d)
+        self.assertTrue(image_out.is_complex())
+        self.assertEqual(image_out.device, self.device)
+
+    def test_adjoint_property_field_corrected(self):
+        # Test adjoint property: <A(x), y> = <x, A_adj(y)>
+        # This is a more rigorous test of correctness.
+        torch.manual_seed(1) # For reproducibility
+        img_x = torch.randn(self.image_shape_2d, dtype=torch.complex64, device=self.device)
+        kspace_y = torch.randn(self.num_k_points_2d, dtype=torch.complex64, device=self.device)
+
+        op_x = self.fc_nufft_op_2d.op(img_x)
+        op_adj_y = self.fc_nufft_op_2d.op_adj(kspace_y)
+
+        lhs = torch.vdot(op_x, kspace_y) # inner product in k-space
+        rhs = torch.vdot(img_x.flatten(), op_adj_y.flatten()) # inner product in image space
+        
+        # Tolerance might need to be adjusted depending on NUFFT precision and segmentation effects
+        torch.testing.assert_close(lhs, rhs, rtol=1e-3, atol=1e-4)
+
+    def test_op_no_b0_effect_if_b0_zero(self):
+        # If B0 map is zero, FieldCorrectedNUFFTOperator should behave like standard NUFFT
+        b0_map_zeros = torch.zeros_like(self.b0_map_2d_hz)
+        fc_nufft_op_no_b0 = FieldCorrectedNUFFTOperator(
+            k_trajectory=self.k_trajectory_2d,
+            image_shape=self.image_shape_2d,
+            b0_map=b0_map_zeros, # Zero B0 map
+            time_per_kspace_point=self.time_per_kpoint_2d,
+            num_segments=1, # Can even be 1 segment if b0 is zero for true comparison
+            oversamp_factor=self.oversamp_factor,
+            kb_J=self.kb_J,
+            kb_alpha=self.kb_alpha,
+            device=self.device.type
+        )
+        k_space_fc_no_b0 = fc_nufft_op_no_b0.op(self.test_image_2d)
+
+        # Compare with a standard NUFFTOperator (assuming one exists and is imported)
+        # NUFFTOperator is already imported
+        std_nufft_op = NUFFTOperator(
+            k_trajectory=self.k_trajectory_2d,
+            image_shape=self.image_shape_2d,
+            oversamp_factor=self.oversamp_factor,
+            kb_J=self.kb_J,
+            kb_alpha=self.kb_alpha,
+            device=self.device.type
+        )
+        k_space_std = std_nufft_op.op(self.test_image_2d)
+        torch.testing.assert_close(k_space_fc_no_b0, k_space_std, rtol=1e-4, atol=1e-5)
+
+# This ensures that if the script is run directly, unittest.main() is called.
+# It should be at the very end of the file.
+if __name__ == '__main__':
+    unittest.main()
