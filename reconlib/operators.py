@@ -1119,4 +1119,130 @@ class PATForwardProjection(Operator):
         return reconstructed_image
 
 
+# --- Radio Interferometry Operator ---
+class RadioInterferometryOperator(Operator):
+    """
+    Operator for Radio Interferometry.
+
+    Models the relationship between a sky image and measured visibilities,
+    which are samples of the image's 2D Fourier transform.
+    """
+    def __init__(self, uv_coordinates: torch.Tensor, image_shape: tuple[int, int], device: str = 'cpu'):
+        """
+        Initializes the RadioInterferometryOperator.
+
+        Args:
+            uv_coordinates (torch.Tensor): Tensor of shape (num_visibilities, 2)
+                representing the (u,v) spatial frequency coordinates.
+                These coordinates are assumed to be integers and pre-scaled to directly
+                index a zero-centered, fftshift-ed 2D FFT grid of the image.
+                For an image of shape (Ny, Nx):
+                u coordinates should range from -Nx/2 to Nx/2 - 1.
+                v coordinates should range from -Ny/2 to Ny/2 - 1.
+            image_shape (tuple[int, int]): Shape of the sky image (Ny, Nx).
+            device (str): Device ('cpu' or 'cuda').
+        """
+        super().__init__() # Operator is ABC, no specific super init needed unless it becomes nn.Module
+        self.device = torch.device(device)
+        self.uv_coordinates = uv_coordinates.to(device=self.device, dtype=torch.long)
+        self.image_shape = image_shape # (Ny, Nx)
+        
+        if self.uv_coordinates.ndim != 2 or self.uv_coordinates.shape[1] != 2:
+            raise ValueError("uv_coordinates must be a 2D tensor of shape (num_visibilities, 2).")
+
+        # Basic validation for uv_coordinates ranges based on image_shape
+        Ny, Nx = self.image_shape
+        u_min, u_max = -Nx // 2, (Nx - 1) // 2 # Integer division for range
+        v_min, v_max = -Ny // 2, (Ny - 1) // 2
+        
+        if not (torch.all(self.uv_coordinates[:, 0] >= u_min) and
+                torch.all(self.uv_coordinates[:, 0] <= u_max)):
+            raise ValueError(f"U coordinates are out of range [{u_min}, {u_max}]. Found min {self.uv_coordinates[:,0].min()}, max {self.uv_coordinates[:,0].max()}")
+        
+        if not (torch.all(self.uv_coordinates[:, 1] >= v_min) and
+                torch.all(self.uv_coordinates[:, 1] <= v_max)):
+            raise ValueError(f"V coordinates are out of range [{v_min}, {v_max}]. Found min {self.uv_coordinates[:,1].min()}, max {self.uv_coordinates[:,1].max()}")
+
+
+    def op(self, sky_image_tensor: torch.Tensor) -> torch.Tensor:
+        """
+        Forward operation: Sky image to visibilities.
+        Performs 2D FFT of the image and samples at uv_coordinates.
+        """
+        if sky_image_tensor.shape != self.image_shape:
+            raise ValueError(f"Input sky_image_tensor shape {sky_image_tensor.shape} "
+                             f"does not match expected image_shape {self.image_shape}.")
+        if sky_image_tensor.device != self.device:
+            sky_image_tensor = sky_image_tensor.to(self.device)
+        if not sky_image_tensor.is_complex():
+            # FFT expects complex input, or real and will output complex.
+            # To be safe, cast to complex if it's real.
+            sky_image_tensor = sky_image_tensor.to(torch.complex64)
+
+
+        # Perform 2D FFT
+        f_image = torch.fft.fft2(sky_image_tensor, norm='ortho')
+        f_image_shifted = torch.fft.fftshift(f_image) # Zero-frequency is at the center
+
+        # uv_coordinates are (u,v) where u is horizontal (corresponds to Nx, image_shape[1])
+        # and v is vertical (corresponds to Ny, image_shape[0])
+        # FFT output f_image_shifted has shape (Ny, Nx)
+        
+        # Map zero-centered uv_coordinates to array indices
+        # u-coords (dim 1, Nx) range -Nx/2 to Nx/2-1 -> 0 to Nx-1
+        # v-coords (dim 0, Ny) range -Ny/2 to Ny/2-1 -> 0 to Ny-1
+        u_indices = self.uv_coordinates[:, 0] + self.image_shape[1] // 2
+        v_indices = self.uv_coordinates[:, 1] + self.image_shape[0] // 2
+        
+        # Ensure indices are within bounds (clamping)
+        # This is important if uv_coordinates were not perfectly within the assumed range,
+        # although the __init__ method already validates this. Clamping is a safeguard.
+        u_indices = torch.clamp(u_indices, 0, self.image_shape[1] - 1)
+        v_indices = torch.clamp(v_indices, 0, self.image_shape[0] - 1)
+
+        # Sample the Fourier plane
+        visibilities = f_image_shifted[v_indices, u_indices]
+        
+        return visibilities
+
+    def op_adj(self, visibilities_tensor: torch.Tensor) -> torch.Tensor:
+        """
+        Adjoint operation: Visibilities to sky image (dirty image).
+        Places visibilities onto a Fourier grid and performs inverse 2D FFT.
+        """
+        if visibilities_tensor.ndim != 1 or visibilities_tensor.shape[0] != self.uv_coordinates.shape[0]:
+            raise ValueError(f"Input visibilities_tensor has incorrect shape or length. "
+                             f"Expected 1D tensor of length {self.uv_coordinates.shape[0]}, "
+                             f"got shape {visibilities_tensor.shape}.")
+        if visibilities_tensor.device != self.device:
+            visibilities_tensor = visibilities_tensor.to(self.device)
+        if not visibilities_tensor.is_complex():
+            # Ensure visibilities are complex, matching typical FFT output
+            visibilities_tensor = visibilities_tensor.to(torch.complex64)
+
+        # Create an empty Fourier grid (for fftshifted data)
+        f_grid_shifted = torch.zeros(self.image_shape, dtype=torch.complex64, device=self.device)
+
+        # Map zero-centered uv_coordinates to array indices
+        u_indices = self.uv_coordinates[:, 0] + self.image_shape[1] // 2
+        v_indices = self.uv_coordinates[:, 1] + self.image_shape[0] // 2
+        
+        # Ensure indices are within bounds (clamping)
+        u_indices = torch.clamp(u_indices, 0, self.image_shape[1] - 1)
+        v_indices = torch.clamp(v_indices, 0, self.image_shape[0] - 1)
+
+        # Place visibilities onto the grid.
+        # Using index_put with accumulate=True ensures summation if multiple uv-points
+        # map to the same grid cell, which is crucial for a correct adjoint.
+        f_grid_shifted.index_put_((v_indices, u_indices), visibilities_tensor, accumulate=True)
+        
+        # Inverse FFT
+        # First, inverse shift (zero-frequency from center to corner)
+        f_grid_ifftshifted = torch.fft.ifftshift(f_grid_shifted)
+        # Then, inverse FFT
+        sky_image_estimate = torch.fft.ifft2(f_grid_ifftshifted, norm='ortho')
+        
+        return sky_image_estimate
+
+
 
