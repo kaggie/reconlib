@@ -2,6 +2,8 @@
 
 import torch
 import numpy as np
+import math # Added for IRadon
+import torch.nn.functional as F # Added for IRadon, though not used in current IRadon draft
 from abc import ABC, abstractmethod
 from scipy.signal.windows import tukey # For SlidingWindowNUFFTOperator
 from reconlib.nufft import NUFFT2D, NUFFT3D
@@ -335,3 +337,1153 @@ class SlidingWindowNUFFTOperator(Operator):
         # Normalize by weight map
         final_image = final_image / (weight_map + 1e-9) # Avoid division by zero
         return final_image
+
+# --- Inverse Radon Transform Operator ---
+class IRadon(Operator):
+    """
+    Inverse Radon Transform Operator (Filtered Backprojection).
+    """
+    def __init__(self, 
+                 img_size: tuple[int, int], 
+                 angles: np.ndarray | torch.Tensor, 
+                 filter_type: str | None = "ramp", 
+                 device: str | torch.device = 'cpu'):
+        """
+        Args:
+            img_size (tuple[int, int]): Size of the image (height, width).
+            angles (np.ndarray | torch.Tensor): Projection angles in radians.
+            filter_type (str | None): Type of filter to use ('ramp', 'shepp-logan', 'cosine', 'hamming', 'hann', None).
+                                      If None, no filtering is applied. Defaults to "ramp".
+            device (str | torch.device): Device to perform computations on.
+        """
+        self.img_size = img_size
+        if isinstance(angles, np.ndarray):
+            angles = torch.from_numpy(angles).float()
+        self.angles = angles.to(device)
+        self.filter_type = filter_type
+        if isinstance(device, str):
+            self.device = torch.device(device)
+        else:
+            self.device = device
+
+        self.grid = self._create_grid()
+        self.filter = self._ramp_filter()
+
+    def _create_grid(self) -> torch.Tensor:
+        """
+        Creates the reconstruction grid.
+        The grid is normalized to be in the range [-1, 1] for both x and y.
+        """
+        nx, ny = self.img_size
+        x = torch.arange(nx, device=self.device, dtype=torch.float32) - (nx - 1) / 2
+        y = torch.arange(ny, device=self.device, dtype=torch.float32) - (ny - 1) / 2
+        Y, X = torch.meshgrid(y, x, indexing='ij') # Consistent with common image indexing
+
+        # Normalize grid to [-1, 1] range based on the image diagonal for proper projection coverage
+        max_dim = max(nx, ny) 
+        norm_factor = (max_dim -1) / 2 
+        
+        X_norm = X / norm_factor
+        Y_norm = Y / norm_factor
+        
+        num_angles = len(self.angles)
+        grid_repeated_X = X_norm.unsqueeze(0).repeat(num_angles, 1, 1)
+        grid_repeated_Y = Y_norm.unsqueeze(0).repeat(num_angles, 1, 1)
+
+        cos_a = torch.cos(self.angles).view(-1, 1, 1)
+        sin_a = torch.sin(self.angles).view(-1, 1, 1)
+
+        # Calculate t-coordinates for each angle
+        # t = x*cos(theta) + y*sin(theta)
+        # This 't' corresponds to the radial distance in the sinogram
+        t_coords = grid_repeated_X * cos_a + grid_repeated_Y * sin_a
+        return t_coords # Shape: (num_angles, ny, nx) 
+
+    def _ramp_filter(self) -> torch.Tensor | None:
+        """
+        Creates the ramp filter or other specified filters in the frequency domain.
+        """
+        if self.filter_type is None:
+            return None
+
+        # Determine the size of the filter (length of the detector/sinogram width)
+        # This should match the number of radial samples in the sinogram.
+        # Assuming sinogram width is related to the diagonal of the image.
+        n_detector = int(np.ceil(np.sqrt(self.img_size[0]**2 + self.img_size[1]**2)))
+        if n_detector % 2 == 0: # Ensure odd length for FFT symmetry
+            n_detector += 1
+        
+        # Create frequency axis
+        freqs = torch.fft.fftfreq(n_detector, device=self.device).unsqueeze(0) # Shape (1, n_detector)
+
+        filter_val = torch.abs(freqs) # Ramp filter: |f|
+
+        if self.filter_type == "ramp":
+            pass # Already initialized
+        elif self.filter_type == "shepp-logan":
+            # sinc(f) = sin(pi*f) / (pi*f)
+            # Shepp-Logan: |f| * (sinc(f/2))^2 for some implementations, or |f| * sinc(f)
+            # Using a common version: |f| * sinc(f * pi / (2 * max_freq))
+            # Here, freqs are already scaled by 1/N, so effectively max_freq is 0.5
+            omega = torch.pi * freqs 
+            shepp_logan_filter = torch.where(omega == 0, torch.tensor(1.0, device=self.device), torch.sin(omega / 2) / (omega / 2))
+            filter_val *= shepp_logan_filter**2 # This is a common variant, others exist.
+        elif self.filter_type == "cosine":
+            filter_val *= torch.cos(torch.pi * freqs) # Cosine filter: |f| * cos(pi*f)
+        elif self.filter_type == "hamming":
+            # Hamming window in frequency domain: (0.54 + 0.46 * cos(2*pi*f/F_max))
+            # F_max corresponds to freqs = 0.5 here. So 2*pi*f / (0.5) = 4*pi*f
+            filter_val *= (0.54 + 0.46 * torch.cos(2 * torch.pi * freqs / (0.5 * 2))) # Correct scaling for freqs in [-0.5, 0.5]
+        elif self.filter_type == "hann":
+            # Hann window in frequency domain: (0.5 * (1 + cos(2*pi*f/F_max)))
+            filter_val *= (0.5 * (1 + torch.cos(2 * torch.pi * freqs / (0.5 * 2))))
+        else:
+            raise ValueError(f"Unknown filter type: {self.filter_type}")
+        
+        # The filter should be applied along the detector dimension of the sinogram
+        # Return shape (1, n_detector) for broadcasting with sinogram FFT
+        return filter_val.float() # Ensure float
+
+    def op(self, sino: torch.Tensor) -> torch.Tensor:
+        """
+        Performs filtered backprojection (inverse Radon transform).
+        Args:
+            sino (torch.Tensor): Sinogram data. Shape (num_angles, num_detector_pixels).
+        Returns:
+            torch.Tensor: Reconstructed image. Shape (img_height, img_width).
+        """
+        if not isinstance(sino, torch.Tensor):
+            sino = torch.from_numpy(sino).float()
+        sino = sino.to(self.device)
+
+        if sino.ndim != 2:
+            raise ValueError(f"Sinogram must be 2D (num_angles, num_detector_pixels), got {sino.shape}")
+        if sino.shape[0] != len(self.angles):
+            raise ValueError(f"Sinogram angle dimension ({sino.shape[0]}) does not match "
+                             f"number of angles provided at init ({len(self.angles)}).")
+
+        num_angles, n_detector_sino = sino.shape
+        
+        # Apply filter if specified
+        if self.filter is not None:
+            # Check if filter size matches sinogram detector size
+            if self.filter.shape[1] != n_detector_sino:
+                # If not, it implies the filter was created with a default n_detector.
+                # We need to recreate the filter or interpolate it.
+                # For simplicity, let's try to recreate with the actual sinogram detector size.
+                # This assumes the user might pass a sinogram with a different detector resolution
+                # than what was estimated from img_size.
+                # print(f"Warning: Filter size ({self.filter.shape[1]}) mismatch with sinogram detector size ({n_detector_sino}). "
+                #       f"Recreating filter. This may happen if sinogram resolution differs from image diagonal estimate.")
+                
+                original_filter_type = self.filter_type # Store original
+                original_n_detector = self.filter.shape[1]
+
+                # Temporarily update n_detector for filter creation based on sino
+                temp_n_detector = n_detector_sino
+                
+                # Create frequency axis for this specific sinogram
+                freqs_sino = torch.fft.fftfreq(temp_n_detector, device=self.device).unsqueeze(0)
+                
+                current_filter = torch.abs(freqs_sino) # Ramp
+
+                if self.filter_type == "ramp":
+                    pass
+                elif self.filter_type == "shepp-logan":
+                    omega = torch.pi * freqs_sino
+                    shepp_filter = torch.where(omega == 0, torch.tensor(1.0, device=self.device), torch.sin(omega/2) / (omega/2))
+                    current_filter *= shepp_filter**2
+                elif self.filter_type == "cosine":
+                    current_filter *= torch.cos(torch.pi * freqs_sino)
+                elif self.filter_type == "hamming":
+                    current_filter *= (0.54 + 0.46 * torch.cos(2 * torch.pi * freqs_sino / (0.5*2) ))
+                elif self.filter_type == "hann":
+                    current_filter *= (0.5 * (1 + torch.cos(2 * torch.pi * freqs_sino/ (0.5*2) )))
+                
+                filter_to_apply = current_filter.float()
+            else:
+                filter_to_apply = self.filter
+
+            # FFT of the sinogram (along detector dimension)
+            sino_fft = torch.fft.fft(sino, dim=1)
+            # Apply filter
+            filtered_sino_fft = sino_fft * filter_to_apply
+            # IFFT
+            filtered_sino = torch.fft.ifft(filtered_sino_fft, dim=1).real
+        else:
+            filtered_sino = sino.real # Ensure real if no filter applied
+
+        # Backprojection
+        # The self.grid (t_coords) has shape (num_angles, ny, nx)
+        # It contains the 't' sample locations for each pixel (x,y) and angle.
+        # These t_coords are normalized to [-1, 1] if the sinogram detector dimension also spans [-1, 1].
+        # We need to map these t_coords to indices in the filtered_sino.
+
+        # filtered_sino has shape (num_angles, n_detector_sino)
+        # Let detector pixels be indexed from 0 to n_detector_sino - 1.
+        # A t_coord of -1 should map to index 0.
+        # A t_coord of +1 should map to index n_detector_sino - 1.
+        # So, index = (t_coord + 1) / 2 * (n_detector_sino - 1)
+        
+        # Normalize grid values to [0, n_detector_sino - 1] for indexing
+        # self.grid has values in approx [-1, 1] (can be slightly outside due to image corners)
+        # We need to ensure they map correctly to the sinogram's radial dimension
+        t_indices = (self.grid + 1) / 2 * (n_detector_sino - 1)
+
+        # Interpolation (linear)
+        # We need to sample filtered_sino at (angle_idx, t_indices)
+        # angle_idx is straightforward (0 to num_angles-1)
+        # t_indices are the difficult part.
+        
+        # Create dummy angle indices for interpolation: shape (num_angles, 1, 1)
+        angle_indices_for_interp = torch.arange(num_angles, device=self.device).view(-1, 1, 1)
+        angle_indices_for_interp = angle_indices_for_interp.expand(-1, self.img_size[0], self.img_size[1])
+        
+        # filtered_sino needs to be (num_angles, n_detector_sino)
+        # t_indices needs to be (num_angles, H, W)
+        # We need to sample along the n_detector_sino dimension of filtered_sino.
+        # grid_sample expects normalized coordinates in [-1, 1].
+        # Our t_indices are currently in [0, n_detector_sino - 1].
+        # Normalize t_indices to [-1, 1] for grid_sample:
+        # norm_t_indices = (t_indices / (n_detector_sino - 1)) * 2 - 1
+        # This simplifies to self.grid if self.grid was already correctly scaled for a sinogram spanning [-1,1]
+        
+        # The `align_corners` argument in `grid_sample` is crucial.
+        # If `align_corners=True`, -1 and 1 correspond to the centers of the corner pixels.
+        # If `align_corners=False`, -1 and 1 correspond to the edges of the corner pixels.
+        # Given our `t_indices` logic: `(t_coord + 1) / 2 * (n_detector_sino - 1)`
+        # This maps -1 to 0 and 1 to `n_detector_sino - 1`, which are pixel centers. So `align_corners=True` seems appropriate.
+
+        # `grid_sample` needs the input tensor to be of shape (N, C, Din, Hin, Win) or (N, C, Din, Hin) etc.
+        # `filtered_sino` is (num_angles, n_detector_sino). Let's make it (num_angles, 1, 1, n_detector_sino)
+        # The grid for sampling should be (N, Hout, Wout, 2) for 2D sampling.
+        # Our `self.grid` (t_coords) is (num_angles, ny, nx). These are the 'x' coordinates for sampling.
+        # The 'y' coordinates for sampling are implicitly the angle dimension, which we handle by iterating or careful stacking.
+
+        # Simpler approach: iterate through angles for backprojection, as commonly done.
+        reconstructed_image = torch.zeros(self.img_size, device=self.device, dtype=torch.float32)
+        
+        # t_indices are (num_angles, ny, nx)
+        # For each angle, t_indices[angle_idx, :, :] gives the detector coordinates for that angle.
+        for i in range(num_angles):
+            # Current angle's filtered sinogram data: shape (n_detector_sino)
+            sino_line = filtered_sino[i, :]
+            # Current angle's t-coordinates for each pixel: shape (ny, nx)
+            current_t_indices = t_indices[i, :, :]
+            
+            # Interpolate sino_line at current_t_indices
+            # We need 1D interpolation. `torch.interpolat` is not available.
+            # Manual linear interpolation:
+            t_floor = torch.floor(current_t_indices).long()
+            t_ceil = torch.ceil(current_t_indices).long()
+            
+            # Clamp indices to be within bounds [0, n_detector_sino - 1]
+            t_floor = torch.clamp(t_floor, 0, n_detector_sino - 1)
+            t_ceil = torch.clamp(t_ceil, 0, n_detector_sino - 1)
+            
+            # Interpolation weights
+            dt = current_t_indices - t_floor.float()
+            
+            val_floor = sino_line[t_floor]
+            val_ceil = sino_line[t_ceil]
+            
+            interpolated_val = val_floor * (1 - dt) + val_ceil * dt
+            reconstructed_image += interpolated_val
+
+        # Normalize by number of angles (or pi/num_angles depending on convention)
+        # The factor np.pi / (2 * num_angles) is common in FBP.
+        # Or sometimes just 1/num_angles. Let's use a common one from skimage.
+        # Skimage uses scaling by `np.pi / (2 * num_projections)` if filtered.
+        # Or `1.0 / num_projections` if not filtered.
+        if self.filter is not None:
+             reconstructed_image *= (torch.pi / (2.0 * num_angles))
+        else:
+             reconstructed_image *= (1.0 / num_angles) # Or maybe no scaling if not filtered?
+                                                     # Let's assume some scaling is needed.
+
+        return reconstructed_image
+
+    def op_adj(self, img: torch.Tensor) -> torch.Tensor:
+        """
+        Performs the adjoint of filtered backprojection, which is the Radon transform (projection).
+        Args:
+            img (torch.Tensor): Image data. Shape (img_height, img_width).
+        Returns:
+            torch.Tensor: Sinogram data. Shape (num_angles, num_detector_pixels).
+        """
+        if not isinstance(img, torch.Tensor):
+            img = torch.from_numpy(img).float()
+        img = img.to(self.device)
+
+        if tuple(img.shape) != self.img_size:
+            raise ValueError(f"Input image shape {img.shape} does not match expected {self.img_size}")
+
+        num_angles = len(self.angles)
+        # Determine n_detector_sino. This should be consistent with the filter size if a filter was created.
+        # If no filter, use the estimate from image diagonal.
+        if self.filter is not None:
+            n_detector_sino = self.filter.shape[1]
+        else:
+            n_detector_sino = int(np.ceil(np.sqrt(self.img_size[0]**2 + self.img_size[1]**2)))
+            if n_detector_sino % 2 == 0:
+                n_detector_sino +=1
+
+        sinogram = torch.zeros((num_angles, n_detector_sino), device=self.device, dtype=torch.float32)
+
+        # self.grid (t_coords) has shape (num_angles, ny, nx)
+        # It contains the 't' sample locations for each pixel (x,y) and angle.
+        # These t_coords are normalized to [-1, 1].
+        # We need to map these t_coords to indices in the sinogram's detector dimension.
+        t_indices = (self.grid + 1) / 2 * (n_detector_sino - 1)
+
+        # Adjoint of interpolation (summing contributions)
+        # For each angle:
+        for i in range(num_angles):
+            current_t_indices = t_indices[i, :, :] # Shape (ny, nx)
+            
+            # Get pixel values from the image: img has shape (ny, nx)
+            # For each pixel in the image, its value `img[y,x]` contributes to `sinogram[i, t_idx]`
+            # where `t_idx` is derived from `current_t_indices[y,x]`.
+            
+            # This is essentially "splatting" the image values onto the sinogram grid.
+            # For each (y,x) pixel in the image, find its corresponding t_idx.
+            # Add img[y,x] to sinogram[i, round(t_idx)].
+            # For better accuracy, distribute energy to neighboring bins (linear interpolation adjoint).
+
+            t_floor = torch.floor(current_t_indices).long()
+            t_ceil = torch.ceil(current_t_indices).long()
+            
+            dt = current_t_indices - t_floor.float()
+
+            # Ensure indices are within bounds for accumulation
+            # We need to be careful here. If t_idx is out of [0, n_detector_sino-1], that contribution is lost.
+            valid_mask_floor = (t_floor >= 0) & (t_floor < n_detector_sino)
+            valid_mask_ceil = (t_ceil >= 0) & (t_ceil < n_detector_sino)
+
+            # Accumulate contributions (adjoint of linear interpolation)
+            # Flatten image and indices for scatter_add_
+            img_flat = img.flatten() # Shape (ny*nx)
+            
+            # For t_floor
+            indices_floor_flat = t_floor.flatten() # Shape (ny*nx)
+            weights_floor = (1 - dt).flatten() # Shape (ny*nx)
+            
+            valid_indices_floor = indices_floor_flat[valid_mask_floor.flatten()]
+            valid_img_values_floor = img_flat[valid_mask_floor.flatten()]
+            valid_weights_floor = weights_floor[valid_mask_floor.flatten()]
+            
+            # sinogram[i, valid_indices_floor] += valid_img_values_floor * valid_weights_floor
+            # Use index_add_ for this, which is like scatter_add but for a specific dimension
+            sinogram[i].index_add_(0, valid_indices_floor, valid_img_values_floor * valid_weights_floor)
+
+            # For t_ceil
+            indices_ceil_flat = t_ceil.flatten() # Shape (ny*nx)
+            weights_ceil = dt.flatten() # Shape (ny*nx)
+
+            valid_indices_ceil = indices_ceil_flat[valid_mask_ceil.flatten()]
+            valid_img_values_ceil = img_flat[valid_mask_ceil.flatten()]
+            valid_weights_ceil = weights_ceil[valid_mask_ceil.flatten()]
+            
+            sinogram[i].index_add_(0, valid_indices_ceil, valid_img_values_ceil * valid_weights_ceil)
+
+
+        # Adjoint of filtering: apply the filter again (or its conjugate transpose if complex)
+        # Since our filter is real and symmetric in magnitude, applying it again is correct for adjoint.
+        if self.filter is not None:
+            # Check for filter size mismatch as in op()
+            if self.filter.shape[1] != n_detector_sino:
+                # print(f"Warning: Filter size mismatch in op_adj. Recreating filter.")
+                original_filter_type = self.filter_type
+                temp_n_detector = n_detector_sino
+                freqs_sino = torch.fft.fftfreq(temp_n_detector, device=self.device).unsqueeze(0)
+                current_filter = torch.abs(freqs_sino)
+                if self.filter_type == "ramp": pass
+                elif self.filter_type == "shepp-logan":
+                    omega = torch.pi * freqs_sino
+                    shepp_filter = torch.where(omega == 0, torch.tensor(1.0, device=self.device), torch.sin(omega/2) / (omega/2))
+                    current_filter *= shepp_filter**2
+                elif self.filter_type == "cosine": current_filter *= torch.cos(torch.pi * freqs_sino)
+                elif self.filter_type == "hamming": current_filter *= (0.54 + 0.46 * torch.cos(2 * torch.pi * freqs_sino / (0.5*2)))
+                elif self.filter_type == "hann": current_filter *= (0.5 * (1 + torch.cos(2 * torch.pi * freqs_sino / (0.5*2))))
+                filter_to_apply = current_filter.float()
+            else:
+                filter_to_apply = self.filter
+
+            sino_fft = torch.fft.fft(sinogram, dim=1)
+            filtered_sino_fft = sino_fft * filter_to_apply # Filter is real, so same application
+            sinogram = torch.fft.ifft(filtered_sino_fft, dim=1).real
+        
+        # Adjoint of scaling factor
+        # If op used `*= C`, then op_adj should use `*= C` (if C is real)
+        # The scaling factor np.pi / (2 * num_angles) or 1/num_angles was applied in op.
+        # So, we apply it here as well.
+        if self.filter is not None:
+             sinogram *= (torch.pi / (2.0 * num_angles))
+        else:
+             sinogram *= (1.0 / num_angles)
+
+        return sinogram
+
+
+# --- PET Forward Projection Operator ---
+class PETForwardProjection(Operator):
+    """
+    Basic PET Forward Projection Operator (Radon Transform without filtering).
+    op: Image -> Sinogram (sum along lines)
+    op_adj: Sinogram -> Image (simple backprojection)
+    """
+    def __init__(self, 
+                 img_size: tuple[int, int], 
+                 angles: np.ndarray | torch.Tensor, 
+                 device: str | torch.device = 'cpu'):
+        """
+        Args:
+            img_size (tuple[int, int]): Size of the image (height, width).
+            angles (np.ndarray | torch.Tensor): Projection angles in radians.
+            device (str | torch.device): Device to perform computations on.
+        """
+        self.img_size = img_size
+        if isinstance(angles, np.ndarray):
+            angles = torch.from_numpy(angles).float()
+        self.angles = angles.to(device)
+        if isinstance(device, str):
+            self.device = torch.device(device)
+        else:
+            self.device = device
+
+        # Estimate number of detector pixels (radial bins in sinogram)
+        # Based on the diagonal of the image to capture all information.
+        self.n_detector_pixels = int(np.ceil(np.sqrt(img_size[0]**2 + img_size[1]**2)))
+        if self.n_detector_pixels % 2 == 0: # Ensure odd length for symmetry if needed, though less critical here
+            self.n_detector_pixels += 1
+            
+        self.grid = self._create_grid() # Create the geometric mapping
+
+    def _create_grid(self) -> torch.Tensor:
+        """
+        Creates the reconstruction grid, mapping image pixels to sinogram radial coordinates.
+        This is identical to IRadon._create_grid.
+        The grid t_coords are normalized to be in the range [-1, 1] for x and y.
+        """
+        nx, ny = self.img_size # Note: Traditionally nx is width, ny is height.
+                               # PyTorch typically uses (H, W), so img_size[0] is ny, img_size[1] is nx.
+                               # Let's stick to img_size[0] = H (ny), img_size[1] = W (nx) for consistency with IRadon.
+        
+        # Create pixel coordinates
+        # y_coords range from -(ny-1)/2 to (ny-1)/2
+        # x_coords range from -(nx-1)/2 to (nx-1)/2
+        y_pixel_coords = torch.arange(self.img_size[0], device=self.device, dtype=torch.float32) - (self.img_size[0] - 1) / 2
+        x_pixel_coords = torch.arange(self.img_size[1], device=self.device, dtype=torch.float32) - (self.img_size[1] - 1) / 2
+        
+        # Create meshgrid. Note: PyTorch's meshgrid defaults to 'xy' indexing if not specified.
+        # For image operations, 'ij' (matrix indexing) is often more intuitive: Y, X = meshgrid(y_coords, x_coords)
+        # Here, Y will have shape (img_size[0], img_size[1]), X will have shape (img_size[0], img_size[1])
+        Y_mesh, X_mesh = torch.meshgrid(y_pixel_coords, x_pixel_coords, indexing='ij')
+
+        # Normalize grid to roughly [-1, 1] range.
+        # The normalization factor should ensure that the extreme corners of the image project
+        # to values near -1 or 1 in the 't' (radial) coordinate of the sinogram.
+        # The diagonal of the image is sqrt(nx^2 + ny^2). Half of this is a good norm_factor.
+        # Or, use max_dim / 2 as in IRadon for consistency if sinogram spans based on max_dim.
+        # Let's use (max_dim - 1) / 2, consistent with IRadon's t-coord normalization.
+        max_img_dim = max(self.img_size[0], self.img_size[1])
+        norm_factor = (max_img_dim - 1) / 2
+        if norm_factor == 0: # Avoid division by zero for 1x1 image
+            norm_factor = 1 
+
+        X_norm = X_mesh / norm_factor
+        Y_norm = Y_mesh / norm_factor
+        
+        num_angles = len(self.angles)
+        # Expand X_norm and Y_norm for each angle
+        grid_repeated_X = X_norm.unsqueeze(0).repeat(num_angles, 1, 1) # Shape: (num_angles, H, W)
+        grid_repeated_Y = Y_norm.unsqueeze(0).repeat(num_angles, 1, 1) # Shape: (num_angles, H, W)
+
+        # Precompute cos and sin of angles
+        cos_a = torch.cos(self.angles).view(-1, 1, 1) # Shape: (num_angles, 1, 1)
+        sin_a = torch.sin(self.angles).view(-1, 1, 1) # Shape: (num_angles, 1, 1)
+
+        # Calculate t-coordinates for each pixel and angle: t = x*cos(theta) + y*sin(theta)
+        # Note on coordinate systems for t = x*cos + y*sin:
+        # If using standard Cartesian x (horizontal right) and y (vertical up),
+        # and theta is angle from positive x-axis, this is correct.
+        # Our pixel coordinates: x_pixel_coords increase to the right, y_pixel_coords increase downwards.
+        # If angles are defined relative to the positive x-axis (horizontal),
+        # then for y increasing downwards, we might use t = X*cos(a) - Y*sin(a) if Y was positive upwards.
+        # Or, if Y is positive downwards, and angles are from positive X:
+        # Standard Radon: t = x cos(theta) + y sin(theta) where y is "up".
+        # If our Y_norm is (pixel_y - center_y), which means it's negative "above" center, positive "below".
+        # If angles are measured from positive x-axis counter-clockwise:
+        # This definition of t_coords (grid_repeated_X * cos_a + grid_repeated_Y * sin_a) is standard
+        # when X and Y are Cartesian coordinates. Our X_norm and Y_norm are like this.
+        t_coords = grid_repeated_X * cos_a + grid_repeated_Y * sin_a
+        return t_coords # Shape: (num_angles, img_size[0], img_size[1])
+
+    def op(self, img: torch.Tensor) -> torch.Tensor:
+        """
+        Performs PET forward projection (Radon transform without filtering).
+        Args:
+            img (torch.Tensor): Image data. Shape (img_height, img_width).
+        Returns:
+            torch.Tensor: Sinogram data. Shape (num_angles, num_detector_pixels).
+        """
+        if not isinstance(img, torch.Tensor):
+            img = torch.from_numpy(img).float()
+        img = img.to(self.device)
+
+        if tuple(img.shape) != self.img_size:
+            raise ValueError(f"Input image shape {img.shape} does not match expected {self.img_size}")
+
+        num_angles = len(self.angles)
+        sinogram = torch.zeros((num_angles, self.n_detector_pixels), device=self.device, dtype=torch.float32)
+
+        # self.grid (t_coords) has shape (num_angles, H, W)
+        # These t_coords are normalized (approx [-1, 1]). Map to detector indices [0, n_detector_pixels-1]
+        t_indices = (self.grid + 1) / 2 * (self.n_detector_pixels - 1)
+
+        # Adjoint of linear interpolation (summing contributions into sinogram bins)
+        for i in range(num_angles):
+            current_t_indices_for_angle = t_indices[i, :, :] # Shape (H, W)
+            
+            t_floor = torch.floor(current_t_indices_for_angle).long()
+            t_ceil = torch.ceil(current_t_indices_for_angle).long()
+            
+            # Weights for linear interpolation (distance to floor and ceil)
+            dt = current_t_indices_for_angle - t_floor.float()
+
+            # Ensure indices are within bounds for accumulation into sinogram
+            valid_mask_floor = (t_floor >= 0) & (t_floor < self.n_detector_pixels)
+            valid_mask_ceil = (t_ceil >= 0) & (t_ceil < self.n_detector_pixels)
+
+            img_flat = img.flatten() # Shape (H*W)
+            
+            # Contributions to t_floor bins
+            indices_floor_flat = t_floor.flatten() # Shape (H*W)
+            weights_floor = (1 - dt).flatten()     # Shape (H*W)
+            
+            # Filter by valid_mask_floor before calling index_add_
+            active_indices_floor = indices_floor_flat[valid_mask_floor.flatten()]
+            active_img_values_floor = img_flat[valid_mask_floor.flatten()]
+            active_weights_floor = weights_floor[valid_mask_floor.flatten()]
+            
+            sinogram[i].index_add_(0, active_indices_floor, active_img_values_floor * active_weights_floor)
+
+            # Contributions to t_ceil bins
+            indices_ceil_flat = t_ceil.flatten()   # Shape (H*W)
+            weights_ceil = dt.flatten()            # Shape (H*W)
+
+            active_indices_ceil = indices_ceil_flat[valid_mask_ceil.flatten()]
+            active_img_values_ceil = img_flat[valid_mask_ceil.flatten()]
+            active_weights_ceil = weights_ceil[valid_mask_ceil.flatten()]
+
+            sinogram[i].index_add_(0, active_indices_ceil, active_img_values_ceil * active_weights_ceil)
+            
+        # No filtering and no specific scaling like in FBP's IRadon.
+        # The sum itself is the operation.
+        return sinogram
+
+    def op_adj(self, sino: torch.Tensor) -> torch.Tensor:
+        """
+        Performs adjoint of PET forward projection (simple backprojection without filtering).
+        Args:
+            sino (torch.Tensor): Sinogram data. Shape (num_angles, num_detector_pixels).
+        Returns:
+            torch.Tensor: Reconstructed image. Shape (img_height, img_width).
+        """
+        if not isinstance(sino, torch.Tensor):
+            sino = torch.from_numpy(sino).float()
+        sino = sino.to(self.device)
+
+        if sino.ndim != 2:
+            raise ValueError(f"Sinogram must be 2D (num_angles, num_detector_pixels), got {sino.shape}")
+        if sino.shape[0] != len(self.angles):
+            raise ValueError(f"Sinogram angle dimension ({sino.shape[0]}) does not match "
+                             f"number of angles provided at init ({len(self.angles)}).")
+        if sino.shape[1] != self.n_detector_pixels:
+            raise ValueError(f"Sinogram detector dimension ({sino.shape[1]}) does not match "
+                             f"expected num_detector_pixels ({self.n_detector_pixels}).")
+
+        num_angles = len(self.angles)
+        backprojected_image = torch.zeros(self.img_size, device=self.device, dtype=torch.float32)
+
+        # self.grid (t_coords) has shape (num_angles, H, W)
+        # Map these normalized t_coords to actual sinogram detector indices
+        t_indices = (self.grid + 1) / 2 * (self.n_detector_pixels - 1)
+
+        # Linear interpolation for sampling sinogram values
+        for i in range(num_angles):
+            sino_line = sino[i, :] # Current angle's sinogram data: shape (n_detector_pixels)
+            current_t_indices_for_angle = t_indices[i, :, :] # t-coords for this angle: shape (H, W)
+            
+            t_floor = torch.floor(current_t_indices_for_angle).long()
+            t_ceil = torch.ceil(current_t_indices_for_angle).long()
+            
+            # Clamp indices to be within sinogram bounds [0, n_detector_pixels - 1]
+            t_floor = torch.clamp(t_floor, 0, self.n_detector_pixels - 1)
+            t_ceil = torch.clamp(t_ceil, 0, self.n_detector_pixels - 1)
+            
+            # Interpolation weights
+            dt = current_t_indices_for_angle - t_floor.float()
+            
+            val_floor = sino_line[t_floor] # Sample from sinogram at floor indices
+            val_ceil = sino_line[t_ceil]   # Sample from sinogram at ceil indices
+            
+            # Linearly interpolated value from sinogram to be added to the image pixel
+            interpolated_sino_val = val_floor * (1 - dt) + val_ceil * dt
+            backprojected_image += interpolated_sino_val # Accumulate contributions
+
+        # No filtering and no specific scaling like in FBP's IRadon.
+        # The sum of contributions is the simple backprojection.
+        return backprojected_image
+
+
+# --- Photoacoustic Tomography (PAT) Forward Projection Operator ---
+class PATForwardProjection(Operator):
+    """
+    Basic PAT Forward Projection Operator for a 2D scenario.
+    Models the generation of sensor data from an initial pressure distribution.
+    op: InitialPressureImage -> SensorData (Time-series for each sensor)
+    op_adj: Not implemented for this task.
+    """
+    def __init__(self, 
+                 img_shape: tuple[int, int], 
+                 sensor_positions: torch.Tensor | np.ndarray, 
+                 sound_speed: float, 
+                 time_points: torch.Tensor | np.ndarray, 
+                 device: str | torch.device = 'cpu'):
+        """
+        Args:
+            img_shape (tuple[int, int]): Shape of the 2D image grid (ny, nx) i.e. (height, width).
+            sensor_positions (torch.Tensor | np.ndarray): Positions of sensors, shape (num_sensors, 2).
+                                                          Assumed to be in the same coordinate system as the image pixels.
+            sound_speed (float): Speed of sound in the medium.
+            time_points (torch.Tensor | np.ndarray): Time samples at which data is recorded, shape (num_time_samples,).
+            device (str | torch.device): Device to perform computations on.
+        """
+        self.img_shape = img_shape # (ny, nx) -> (height, width)
+        self.sound_speed = sound_speed
+        
+        if isinstance(device, str):
+            self.device = torch.device(device)
+        else:
+            self.device = device
+
+        if isinstance(sensor_positions, np.ndarray):
+            sensor_positions = torch.from_numpy(sensor_positions).float()
+        self.sensor_positions = sensor_positions.to(self.device)
+
+        if isinstance(time_points, np.ndarray):
+            time_points = torch.from_numpy(time_points).float()
+        self.time_points = time_points.to(self.device)
+
+        if self.sensor_positions.ndim != 2 or self.sensor_positions.shape[1] != 2:
+            raise ValueError(f"sensor_positions must have shape (num_sensors, 2), got {self.sensor_positions.shape}")
+        if self.time_points.ndim != 1:
+            raise ValueError(f"time_points must have shape (num_time_samples,), got {self.time_points.shape}")
+
+        # Create pixel coordinate grid
+        # Assume pixel spacing is 1.0 for simplicity.
+        # Coordinates are relative to the center of the image.
+        ny, nx = self.img_shape
+        
+        # Create 1D coordinate vectors for y and x
+        # y_coords from -(ny-1)/2 to (ny-1)/2
+        # x_coords from -(nx-1)/2 to (nx-1)/2
+        y_coords_1d = torch.arange(ny, device=self.device, dtype=torch.float32) - (ny - 1) / 2.0
+        x_coords_1d = torch.arange(nx, device=self.device, dtype=torch.float32) - (nx - 1) / 2.0
+
+        # Create 2D meshgrid
+        # self.pixel_y_coords will have shape (ny, nx)
+        # self.pixel_x_coords will have shape (ny, nx)
+        self.pixel_y_coords, self.pixel_x_coords = torch.meshgrid(y_coords_1d, x_coords_1d, indexing='ij')
+        
+        # Store pixel coordinates as (ny, nx, 2) for easier iteration if needed, or flatten
+        # For the current loop structure, separate meshgrids are fine.
+        # self.pixel_coords = torch.stack((self.pixel_x_coords, self.pixel_y_coords), dim=-1) # Shape (ny, nx, 2)
+
+        # Pixel size approximation (assuming square pixels with spacing 1.0)
+        self.pixel_size = 1.0 
+
+
+    def op(self, initial_pressure_image: torch.Tensor) -> torch.Tensor:
+        """
+        Calculates the photoacoustic sensor data for a given initial pressure distribution.
+        Args:
+            initial_pressure_image (torch.Tensor): 2D tensor of shape self.img_shape (ny, nx).
+        Returns:
+            torch.Tensor: Sensor data, shape (num_sensors, num_time_samples).
+        """
+        if not isinstance(initial_pressure_image, torch.Tensor):
+            initial_pressure_image = torch.from_numpy(initial_pressure_image).float()
+        initial_pressure_image = initial_pressure_image.to(self.device)
+
+        if initial_pressure_image.shape != self.img_shape:
+            raise ValueError(f"Input initial_pressure_image shape {initial_pressure_image.shape} "
+                             f"does not match expected {self.img_shape}")
+
+        num_sensors = self.sensor_positions.shape[0]
+        num_time_samples = self.time_points.shape[0]
+        ny, nx = self.img_shape
+
+        sensor_data = torch.zeros((num_sensors, num_time_samples), device=self.device, dtype=torch.float32)
+
+        # Tolerance for checking if a pixel is on the integration shell (approx. half pixel size)
+        # This defines the "thickness" of the spherical/circular shell for integration.
+        shell_tolerance = self.pixel_size / 2.0
+
+        for s in range(num_sensors):
+            sensor_pos_x, sensor_pos_y = self.sensor_positions[s, 0], self.sensor_positions[s, 1]
+            
+            for t_idx in range(num_time_samples):
+                current_t = self.time_points[t_idx]
+                radius_of_integration = self.sound_speed * current_t
+
+                # Calculate distances from all pixels to the current sensor
+                # dist_sq = (self.pixel_x_coords - sensor_pos_x)**2 + (self.pixel_y_coords - sensor_pos_y)**2
+                # distances = torch.sqrt(dist_sq) # Shape (ny, nx)
+                
+                # Instead of calculating all distances and then masking, 
+                # iterate pixels for clarity, as per prompt, though less efficient.
+                accumulated_pressure = 0.0
+                for y_idx in range(ny):
+                    for x_idx in range(nx):
+                        pixel_x = self.pixel_x_coords[y_idx, x_idx]
+                        pixel_y = self.pixel_y_coords[y_idx, x_idx]
+                        
+                        distance = torch.sqrt((pixel_x - sensor_pos_x)**2 + (pixel_y - sensor_pos_y)**2)
+                        
+                        if torch.abs(distance - radius_of_integration) < shell_tolerance:
+                            accumulated_pressure += initial_pressure_image[y_idx, x_idx]
+                
+                sensor_data[s, t_idx] = accumulated_pressure
+        
+        return sensor_data
+
+    def op_adj(self, sensor_data_tensor: torch.Tensor) -> torch.Tensor:
+        """
+        Adjoint of PAT Forward Projection. This performs backprojection of sensor data.
+        Args:
+            sensor_data_tensor (torch.Tensor): 2D tensor of shape (num_sensors, num_time_samples).
+        Returns:
+            torch.Tensor: Reconstructed image, shape self.img_shape (ny, nx).
+        """
+        if not isinstance(sensor_data_tensor, torch.Tensor):
+            sensor_data_tensor = torch.from_numpy(sensor_data_tensor).float()
+        sensor_data_tensor = sensor_data_tensor.to(self.device)
+
+        num_sensors_data = sensor_data_tensor.shape[0]
+        num_time_samples_data = sensor_data_tensor.shape[1]
+
+        num_sensors_op = self.sensor_positions.shape[0]
+        num_time_samples_op = self.time_points.shape[0]
+
+        if num_sensors_data != num_sensors_op or num_time_samples_data != num_time_samples_op:
+            raise ValueError(
+                f"Input sensor_data_tensor shape ({num_sensors_data}, {num_time_samples_data}) "
+                f"does not match expected operator dimensions ({num_sensors_op}, {num_time_samples_op})."
+            )
+
+        reconstructed_image = torch.zeros(self.img_shape, device=self.device, dtype=torch.float32)
+        ny, nx = self.img_shape
+
+        # Tolerance for checking if a pixel is on the integration shell (approx. half pixel size)
+        shell_tolerance = self.pixel_size / 2.0
+        epsilon = 1e-9 # To avoid computation for zero values
+
+        for s in range(num_sensors_op):
+            sensor_pos_x, sensor_pos_y = self.sensor_positions[s, 0], self.sensor_positions[s, 1]
+            
+            for t_idx in range(num_time_samples_op):
+                current_val = sensor_data_tensor[s, t_idx]
+
+                # If val is non-zero (or above a small epsilon)
+                if torch.abs(current_val) < epsilon:
+                    continue
+
+                current_t = self.time_points[t_idx]
+                radius_of_integration = self.sound_speed * current_t
+                
+                # This part can be slow due to iterating all pixels for each sensor/time point.
+                # For a more efficient implementation, one might consider a different approach,
+                # but following the provided algorithm structure.
+                for y_idx in range(ny):
+                    for x_idx in range(nx):
+                        pixel_x = self.pixel_x_coords[y_idx, x_idx]
+                        pixel_y = self.pixel_y_coords[y_idx, x_idx]
+                        
+                        distance = torch.sqrt((pixel_x - sensor_pos_x)**2 + (pixel_y - sensor_pos_y)**2)
+                        
+                        if torch.abs(distance - radius_of_integration) < shell_tolerance:
+                            reconstructed_image[y_idx, x_idx] += current_val
+                            
+        return reconstructed_image
+
+
+# --- Radio Interferometry Operator ---
+class RadioInterferometryOperator(Operator):
+    """
+    Operator for Radio Interferometry.
+
+    Models the relationship between a sky image and measured visibilities,
+    which are samples of the image's 2D Fourier transform.
+    """
+    def __init__(self, uv_coordinates: torch.Tensor, image_shape: tuple[int, int], device: str = 'cpu'):
+        """
+        Initializes the RadioInterferometryOperator.
+
+        Args:
+            uv_coordinates (torch.Tensor): Tensor of shape (num_visibilities, 2)
+                representing the (u,v) spatial frequency coordinates.
+                These coordinates are assumed to be integers and pre-scaled to directly
+                index a zero-centered, fftshift-ed 2D FFT grid of the image.
+                For an image of shape (Ny, Nx):
+                u coordinates should range from -Nx/2 to Nx/2 - 1.
+                v coordinates should range from -Ny/2 to Ny/2 - 1.
+            image_shape (tuple[int, int]): Shape of the sky image (Ny, Nx).
+            device (str): Device ('cpu' or 'cuda').
+        """
+        super().__init__() # Operator is ABC, no specific super init needed unless it becomes nn.Module
+        self.device = torch.device(device)
+        self.uv_coordinates = uv_coordinates.to(device=self.device, dtype=torch.long)
+        self.image_shape = image_shape # (Ny, Nx)
+        
+        if self.uv_coordinates.ndim != 2 or self.uv_coordinates.shape[1] != 2:
+            raise ValueError("uv_coordinates must be a 2D tensor of shape (num_visibilities, 2).")
+
+        # Basic validation for uv_coordinates ranges based on image_shape
+        Ny, Nx = self.image_shape
+        u_min, u_max = -Nx // 2, (Nx - 1) // 2 # Integer division for range
+        v_min, v_max = -Ny // 2, (Ny - 1) // 2
+        
+        if not (torch.all(self.uv_coordinates[:, 0] >= u_min) and
+                torch.all(self.uv_coordinates[:, 0] <= u_max)):
+            raise ValueError(f"U coordinates are out of range [{u_min}, {u_max}]. Found min {self.uv_coordinates[:,0].min()}, max {self.uv_coordinates[:,0].max()}")
+        
+        if not (torch.all(self.uv_coordinates[:, 1] >= v_min) and
+                torch.all(self.uv_coordinates[:, 1] <= v_max)):
+            raise ValueError(f"V coordinates are out of range [{v_min}, {v_max}]. Found min {self.uv_coordinates[:,1].min()}, max {self.uv_coordinates[:,1].max()}")
+
+
+    def op(self, sky_image_tensor: torch.Tensor) -> torch.Tensor:
+        """
+        Forward operation: Sky image to visibilities.
+        Performs 2D FFT of the image and samples at uv_coordinates.
+        """
+        if sky_image_tensor.shape != self.image_shape:
+            raise ValueError(f"Input sky_image_tensor shape {sky_image_tensor.shape} "
+                             f"does not match expected image_shape {self.image_shape}.")
+        if sky_image_tensor.device != self.device:
+            sky_image_tensor = sky_image_tensor.to(self.device)
+        if not sky_image_tensor.is_complex():
+            # FFT expects complex input, or real and will output complex.
+            # To be safe, cast to complex if it's real.
+            sky_image_tensor = sky_image_tensor.to(torch.complex64)
+
+
+        # Perform 2D FFT
+        f_image = torch.fft.fft2(sky_image_tensor, norm='ortho')
+        f_image_shifted = torch.fft.fftshift(f_image) # Zero-frequency is at the center
+
+        # uv_coordinates are (u,v) where u is horizontal (corresponds to Nx, image_shape[1])
+        # and v is vertical (corresponds to Ny, image_shape[0])
+        # FFT output f_image_shifted has shape (Ny, Nx)
+        
+        # Map zero-centered uv_coordinates to array indices
+        # u-coords (dim 1, Nx) range -Nx/2 to Nx/2-1 -> 0 to Nx-1
+        # v-coords (dim 0, Ny) range -Ny/2 to Ny/2-1 -> 0 to Ny-1
+        u_indices = self.uv_coordinates[:, 0] + self.image_shape[1] // 2
+        v_indices = self.uv_coordinates[:, 1] + self.image_shape[0] // 2
+        
+        # Ensure indices are within bounds (clamping)
+        # This is important if uv_coordinates were not perfectly within the assumed range,
+        # although the __init__ method already validates this. Clamping is a safeguard.
+        u_indices = torch.clamp(u_indices, 0, self.image_shape[1] - 1)
+        v_indices = torch.clamp(v_indices, 0, self.image_shape[0] - 1)
+
+        # Sample the Fourier plane
+        visibilities = f_image_shifted[v_indices, u_indices]
+        
+        return visibilities
+
+    def op_adj(self, visibilities_tensor: torch.Tensor) -> torch.Tensor:
+        """
+        Adjoint operation: Visibilities to sky image (dirty image).
+        Places visibilities onto a Fourier grid and performs inverse 2D FFT.
+        """
+        if visibilities_tensor.ndim != 1 or visibilities_tensor.shape[0] != self.uv_coordinates.shape[0]:
+            raise ValueError(f"Input visibilities_tensor has incorrect shape or length. "
+                             f"Expected 1D tensor of length {self.uv_coordinates.shape[0]}, "
+                             f"got shape {visibilities_tensor.shape}.")
+        if visibilities_tensor.device != self.device:
+            visibilities_tensor = visibilities_tensor.to(self.device)
+        if not visibilities_tensor.is_complex():
+            # Ensure visibilities are complex, matching typical FFT output
+            visibilities_tensor = visibilities_tensor.to(torch.complex64)
+
+        # Create an empty Fourier grid (for fftshifted data)
+        f_grid_shifted = torch.zeros(self.image_shape, dtype=torch.complex64, device=self.device)
+
+        # Map zero-centered uv_coordinates to array indices
+        u_indices = self.uv_coordinates[:, 0] + self.image_shape[1] // 2
+        v_indices = self.uv_coordinates[:, 1] + self.image_shape[0] // 2
+        
+        # Ensure indices are within bounds (clamping)
+        u_indices = torch.clamp(u_indices, 0, self.image_shape[1] - 1)
+        v_indices = torch.clamp(v_indices, 0, self.image_shape[0] - 1)
+
+        # Place visibilities onto the grid.
+        # Using index_put with accumulate=True ensures summation if multiple uv-points
+        # map to the same grid cell, which is crucial for a correct adjoint.
+        f_grid_shifted.index_put_((v_indices, u_indices), visibilities_tensor, accumulate=True)
+        
+        # Inverse FFT
+        # First, inverse shift (zero-frequency from center to corner)
+        f_grid_ifftshifted = torch.fft.ifftshift(f_grid_shifted)
+        # Then, inverse FFT
+        sky_image_estimate = torch.fft.ifft2(f_grid_ifftshifted, norm='ortho')
+        
+        return sky_image_estimate
+
+
+# --- Field Corrected NUFFT Operator ---
+class FieldCorrectedNUFFTOperator(Operator):
+    """
+    NUFFT Operator corrected for B0 field inhomogeneities using time segmentation.
+    """
+    def __init__(self, 
+                 k_trajectory: torch.Tensor, 
+                 image_shape: tuple[int, ...], 
+                 b0_map: torch.Tensor,
+                 time_per_kspace_point: torch.Tensor,
+                 num_segments: int = 8, # Default number of time segments
+                 oversamp_factor: tuple[float, ...] = (2.0, 2.0), # Example default
+                 kb_J: tuple[int, ...] = (6, 6),             # Example default
+                 kb_alpha: tuple[float, ...] = (2.34*6, 2.34*6), # Example default for J=6
+                 Ld: tuple[int, ...] = None, # For table NUFFT, e.g. image_shape * oversamp_factor
+                 device: str = 'cpu',
+                 nufft_class_for_segments = None # Allow passing NUFFT2D or NUFFT3D constructor
+                 ):
+        """
+        Initializes the FieldCorrectedNUFFTOperator.
+
+        Args:
+            k_trajectory (torch.Tensor): Shape (num_k_points, ndims). Assumed normalized to [-0.5, 0.5].
+            image_shape (tuple[int, ...]): Shape of the image (e.g., (Ny, Nx) or (Nz, Ny, Nx)).
+            b0_map (torch.Tensor): B0 field inhomogeneity map in Hz. Shape must match image_shape.
+            time_per_kspace_point (torch.Tensor): Acquisition time for each k-space point in seconds.
+                                                 Shape (num_k_points,).
+            num_segments (int): Number of time segments to divide the k-space trajectory into.
+            oversamp_factor, kb_J, kb_alpha, Ld: Standard NUFFT parameters.
+            device (str): 'cpu' or 'cuda'.
+            nufft_class_for_segments: The NUFFT implementation to use (e.g., NUFFT2D or NUFFT3D class).
+                                      If None, it will be inferred from dimensionality.
+        """
+        super().__init__() # Operator is ABC, no specific super init needed unless it becomes nn.Module
+        self.image_shape = tuple(image_shape)
+        self.device = torch.device(device)
+        
+        if not isinstance(b0_map, torch.Tensor):
+            b0_map = torch.from_numpy(b0_map).float()
+        self.b0_map_rad_s = (2 * np.pi * b0_map).to(self.device) # Convert Hz to rad/s and move to device
+
+        if self.b0_map_rad_s.shape != self.image_shape:
+            raise ValueError(f"b0_map shape {b0_map.shape} must match image_shape {self.image_shape}.")
+        
+        if not isinstance(time_per_kspace_point, torch.Tensor):
+            time_per_kspace_point = torch.from_numpy(time_per_kspace_point).float()
+        if time_per_kspace_point.shape[0] != k_trajectory.shape[0]:
+            raise ValueError("Length of time_per_kspace_point must match number of k-space points.")
+
+        if not isinstance(k_trajectory, torch.Tensor):
+            k_trajectory = torch.from_numpy(k_trajectory).float()
+        self.k_trajectory = k_trajectory.to(self.device)
+        self.time_per_kspace_point = time_per_kspace_point.to(self.device)
+        
+        if num_segments <= 0:
+            raise ValueError("num_segments must be positive.")
+        self.num_segments = num_segments
+
+        # Store NUFFT params for instantiating per-segment NUFFTs
+        self.oversamp_factor = oversamp_factor
+        self.kb_J = kb_J
+        self.kb_alpha = kb_alpha
+        self.Ld = Ld if Ld is not None else tuple(int(ims * ovs) for ims, ovs in zip(self.image_shape, self.oversamp_factor))
+
+
+        self.dimensionality = len(image_shape)
+        if nufft_class_for_segments is None:
+            if self.dimensionality == 2:
+                self._nufft_impl_class = NUFFT2D
+            elif self.dimensionality == 3:
+                self._nufft_impl_class = NUFFT3D
+            else:
+                raise ValueError(f"Unsupported dimensionality: {self.dimensionality}. Must be 2 or 3.")
+        else:
+            self._nufft_impl_class = nufft_class_for_segments
+
+
+        # Segment the trajectory
+        self._segment_indices_list = []  # List of tensors, each containing original k-space point indices for a segment
+        self.segment_avg_times_list = [] # List of average times for each segment
+        self._segment_k_trajectories_list = [] # List of k-space trajectories for each segment
+
+        # Sort k-space points by time to make segmentation straightforward
+        sorted_times, sort_indices = torch.sort(self.time_per_kspace_point)
+        
+        num_k_points = self.k_trajectory.shape[0]
+        
+        # Ensure num_segments is not greater than num_k_points to avoid empty segments leading to errors.
+        # If it is, adjust num_segments.
+        actual_num_segments = min(self.num_segments, num_k_points)
+        if actual_num_segments != self.num_segments:
+            print(f"Warning: num_segments ({self.num_segments}) > num_k_points ({num_k_points}). "
+                  f"Adjusting num_segments to {actual_num_segments}.")
+            self.num_segments = actual_num_segments # Update self.num_segments
+        
+        if self.num_segments == 0 and num_k_points > 0: # Should not happen if num_k_points > 0 due to min()
+             self.num_segments = 1 # Must have at least one segment if there are points
+
+        points_per_segment = num_k_points // self.num_segments if self.num_segments > 0 else 0
+        
+        current_point_idx_in_sorted_array = 0
+        for i in range(self.num_segments):
+            start_idx_in_sorted = current_point_idx_in_sorted_array
+            end_idx_in_sorted = current_point_idx_in_sorted_array + points_per_segment
+            if i == self.num_segments - 1: # Last segment takes all remaining points
+                end_idx_in_sorted = num_k_points
+            
+            if start_idx_in_sorted == end_idx_in_sorted and num_k_points > 0 : # Segment would be empty but there are points
+                if i > 0 : # If not the first segment, this means previous segments were too small.
+                           # This logic path should ideally not be hit if points_per_segment is calculated well
+                           # or if num_segments is <= num_k_points.
+                    continue # Skip creating an empty segment if there are no points left for it.
+                else: # If first segment is empty, but there are k-points (e.g. num_segments > num_k_points initially)
+                      # This case is less likely now due to actual_num_segments logic.
+                      # However, if num_segments was 1 and points_per_segment became 0 due to num_k_points=0, handle this.
+                      if num_k_points == 0: continue # No points, so no segments.
+                      # This implies all points should go to this single segment if num_segments = 1
+                      end_idx_in_sorted = num_k_points
+
+
+            original_indices_for_segment = sort_indices[start_idx_in_sorted:end_idx_in_sorted]
+            
+            if len(original_indices_for_segment) > 0:
+                self._segment_indices_list.append(original_indices_for_segment)
+                self.segment_avg_times_list.append(torch.mean(sorted_times[start_idx_in_sorted:end_idx_in_sorted]))
+                self._segment_k_trajectories_list.append(self.k_trajectory[original_indices_for_segment])
+            # No else needed, as empty segments are skipped or actual_num_segments handles it.
+
+            current_point_idx_in_sorted_array = end_idx_in_sorted
+        
+        # Update num_segments to reflect the actual number of non-empty segments created
+        self.num_segments = len(self._segment_indices_list)
+
+        # We don't store sort_indices as it's only used for initial segmentation.
+        # The lists _segment_indices_list, segment_avg_times_list, _segment_k_trajectories_list
+        # now define the segments based on the original k-trajectory and time_per_kspace_point.
+
+    def op(self, image_data_tensor: torch.Tensor) -> torch.Tensor:
+        """
+        Forward operation: Image to B0-corrupted k-space data using time segmentation.
+        """
+        if image_data_tensor.shape != self.image_shape:
+            raise ValueError(f"Input image_data_tensor shape {image_data_tensor.shape} "
+                             f"does not match expected image_shape {self.image_shape}.")
+        if image_data_tensor.device != self.device:
+            image_data_tensor = image_data_tensor.to(self.device)
+        if not image_data_tensor.is_complex():
+            # Ensure input is complex for phase multiplication and NUFFT
+            image_data_tensor = image_data_tensor.to(torch.complex64)
+
+        num_total_k_points = self.k_trajectory.shape[0]
+        # Initialize output_kspace based on the original, unsorted k-trajectory order
+        output_kspace = torch.zeros(num_total_k_points, dtype=torch.complex64, device=self.device)
+
+        for i in range(self.num_segments):
+            # Use self._segment_indices_list and self.segment_avg_times_list as defined in __init__
+            segment_k_indices_original_order = self._segment_indices_list[i] # These are original indices
+            
+            if len(segment_k_indices_original_order) == 0:
+                continue # Skip empty segments
+
+            # Get the k-space trajectory points corresponding to these original indices
+            # These points are already stored in self._segment_k_trajectories_list
+            segment_k_trajectory_points = self._segment_k_trajectories_list[i]
+            segment_time_avg = self.segment_avg_times_list[i]
+
+            # Apply B0 phase correction for this segment's average time
+            phase_correction = torch.exp(-1j * self.b0_map_rad_s * segment_time_avg) # b0_map_rad_s is (image_shape)
+            image_eff_segment = image_data_tensor * phase_correction # Element-wise multiplication
+
+            # Instantiate a NUFFT object for this specific segment's k-trajectory
+            segment_nufft_op = self._nufft_impl_class(
+                k_trajectory=segment_k_trajectory_points, # K-space points for this segment
+                image_shape=self.image_shape,
+                oversamp_factor=self.oversamp_factor,
+                kb_J=self.kb_J,
+                kb_alpha=self.kb_alpha,
+                Ld=self.Ld,
+                device=self.device
+            )
+            
+            # Compute k-space for this segment
+            kspace_segment_values = segment_nufft_op.forward(image_eff_segment)
+            
+            # Place the computed values into the output_kspace tensor at their original indices
+            output_kspace[segment_k_indices_original_order] = kspace_segment_values
+            
+        return output_kspace
+
+    def op_adj(self, k_space_data_tensor: torch.Tensor) -> torch.Tensor:
+        """
+        Adjoint operation: B0-corrupted k-space data to image using time segmentation.
+        """
+        if k_space_data_tensor.shape[0] != self.k_trajectory.shape[0] or k_space_data_tensor.ndim != 1:
+            raise ValueError(f"Input k_space_data_tensor has incorrect shape. "
+                             f"Expected 1D tensor of length {self.k_trajectory.shape[0]}, "
+                             f"got shape {k_space_data_tensor.shape}.")
+        if k_space_data_tensor.device != self.device:
+            k_space_data_tensor = k_space_data_tensor.to(self.device)
+        if not k_space_data_tensor.is_complex():
+            k_space_data_tensor = k_space_data_tensor.to(torch.complex64)
+
+        accumulated_image = torch.zeros(self.image_shape, dtype=torch.complex64, device=self.device)
+
+        for i in range(self.num_segments):
+            # Use self._segment_indices_list and self.segment_avg_times_list as defined in __init__
+            segment_k_indices_original_order = self._segment_indices_list[i] # Original indices for this segment
+            
+            if len(segment_k_indices_original_order) == 0:
+                continue # Skip empty segments
+
+            # Get the k-space trajectory points and data for this segment
+            # segment_k_trajectory_points = self.k_trajectory[segment_k_indices_original_order] # This is already stored
+            segment_k_trajectory_points = self._segment_k_trajectories_list[i]
+            segment_k_space_data = k_space_data_tensor[segment_k_indices_original_order]
+            segment_time_avg = self.segment_avg_times_list[i]
+
+            # Instantiate a NUFFT object for this specific segment's k-trajectory
+            segment_nufft_op = self._nufft_impl_class(
+                k_trajectory=segment_k_trajectory_points,
+                image_shape=self.image_shape,
+                oversamp_factor=self.oversamp_factor,
+                kb_J=self.kb_J,
+                kb_alpha=self.kb_alpha,
+                Ld=self.Ld,
+                device=self.device
+            )
+            
+            # Compute adjoint NUFFT for this segment
+            image_segment = segment_nufft_op.adjoint(segment_k_space_data) 
+            
+            # Apply conjugate B0 phase correction for this segment's average time
+            phase_correction_conj = torch.exp(1j * self.b0_map_rad_s * segment_time_avg)
+            image_segment_corrected = image_segment * phase_correction_conj
+            
+            # Accumulate the result
+            accumulated_image += image_segment_corrected
+            
+        return accumulated_image
+
+
+
