@@ -15,6 +15,12 @@ from .reconstructors import (Reconstructor, IterativeReconstructor,
 from .utils import calculate_density_compensation
 from .csm import estimate_csm_from_central_kspace
 
+# Exports from wavelets_scratch.py
+from .wavelets_scratch import WaveletTransform
+from .wavelets_scratch import WaveletRegularizationTerm
+from .wavelets_scratch import NUFFTWaveletRegularizedReconstructor
+
+
 # Optionally, define __all__ to specify what `from reconlib import *` imports
 __all__ = [
     'MRIData',
@@ -24,5 +30,9 @@ __all__ = [
     'Reconstructor', 'IterativeReconstructor', 'RegriddingReconstructor', 'ConstrainedReconstructor',
     'calculate_density_compensation',
     'estimate_csm_from_central_kspace',
-    '__version__'
+    '__version__',
+    # Added wavelet components
+    'WaveletTransform',
+    'WaveletRegularizationTerm',
+    'NUFFTWaveletRegularizedReconstructor',
 ]
