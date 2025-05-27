@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 # Changed from relative to direct import
-from operators import LinearOperator # Used for type hinting and base class reference
+from reconlib.operators import Operator as LinearOperator # Used for type hinting and base class reference
 
 class L2Reconstruction(nn.Module):
     def __init__(self, linear_operator: LinearOperator, num_iterations=10, learning_rate=0.1):

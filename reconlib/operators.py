@@ -3,22 +3,8 @@
 import torch
 import numpy as np
 from abc import ABC, abstractmethod
-from scipy.special import i0 # For _iternufft2d_kaiser_bessel_kernel
 from scipy.signal.windows import tukey # For SlidingWindowNUFFTOperator
-
-# Conditional imports for external NUFFT libraries
-try:
-    from pynufft import NUFFT as pynufft_NUFFT_lib
-    PYNUFFT_AVAILABLE = True
-except ImportError:
-    PYNUFFT_AVAILABLE = False
-
-try:
-    import sigpy
-    from sigpy.linop import NUFFT as sigpy_NUFFT_op 
-    SIGPY_AVAILABLE = True
-except ImportError:
-    SIGPY_AVAILABLE = False
+from reconlib.nufft import NUFFT2D, NUFFT3D
 
 
 # Operator Base Class
@@ -28,145 +14,78 @@ class Operator(ABC):
     @abstractmethod
     def op_adj(self, y): pass
 
-# --- Internal 2D NUFFT Helper Functions ---
-def _iternufft2d_kaiser_bessel_kernel(r, width, beta):
-    mask = r < (width / 2)
-    val_inside_sqrt = torch.clamp(1 - (2 * r[mask] / width)**2, min=0.0)
-    z = torch.sqrt(val_inside_sqrt)
-    kb = torch.zeros_like(r)
-    kb_numpy_values = i0(beta * z.cpu().numpy())
-    kb[mask] = torch.from_numpy(kb_numpy_values.astype(np.float32)).to(r.device) / float(i0(beta))
-    return kb
-
-def _iternufft2d_estimate_density_compensation(kx, ky):
-    radius = torch.sqrt(kx**2 + ky**2)
-    dcf = radius + 1e-3
-    dcf /= dcf.max()
-    return dcf
-
-def _iternufft2d_nufft2d2_adjoint(kx, ky, kspace_data, image_shape, oversamp=2.0, width=4, beta=13.9085):
-    device = kx.device
-    Nx, Ny = image_shape
-    Nx_oversamp, Ny_oversamp = int(Nx * oversamp), int(Ny * oversamp)
-    kx_scaled, ky_scaled = (kx + 0.5) * Nx_oversamp, (ky + 0.5) * Ny_oversamp
-    dcf = _iternufft2d_estimate_density_compensation(kx, ky).to(device)
-    kspace_data_weighted = kspace_data * dcf
-    grid = torch.zeros((Nx_oversamp, Ny_oversamp), dtype=torch.complex64, device=device)
-    weight_grid = torch.zeros((Nx_oversamp, Ny_oversamp), dtype=torch.float32, device=device)
-    half_width = width // 2
-    for dx in range(-half_width, half_width + 1):
-        for dy in range(-half_width, half_width + 1):
-            x_idx, y_idx = torch.floor(kx_scaled + dx).long(), torch.floor(ky_scaled + dy).long()
-            x_dist, y_dist = kx_scaled - x_idx.float(), ky_scaled - y_idx.float()
-            r = torch.sqrt(x_dist**2 + y_dist**2)
-            w = _iternufft2d_kaiser_bessel_kernel(r, width, beta)
-            x_idx_mod, y_idx_mod = x_idx % Nx_oversamp, y_idx % Ny_oversamp
-            for i in range(kspace_data_weighted.shape[0]):
-                grid[x_idx_mod[i], y_idx_mod[i]] += kspace_data_weighted[i] * w[i]
-                weight_grid[x_idx_mod[i], y_idx_mod[i]] += w[i]
-    weight_grid = torch.where(weight_grid == 0, torch.ones_like(weight_grid), weight_grid)
-    grid = grid / weight_grid
-    img = torch.fft.ifftshift(torch.fft.ifft2(torch.fft.fftshift(grid)))
-    start_x, start_y = (Nx_oversamp - Nx) // 2, (Ny_oversamp - Ny) // 2
-    return img[start_x:start_x + Nx, start_y:start_y + Ny]
-
-def _iternufft2d_nufft2d2_forward(kx, ky, image, oversamp=2.0, width=4, beta=13.9085):
-    device = image.device 
-    Nx, Ny = image.shape
-    Nx_oversamp, Ny_oversamp = int(Nx * oversamp), int(Ny * oversamp)
-    pad_x, pad_y = (Nx_oversamp - Nx) // 2, (Ny_oversamp - Ny) // 2
-    image_padded = torch.zeros((Nx_oversamp, Ny_oversamp), dtype=torch.complex64, device=device)
-    image_padded[pad_x:pad_x + Nx, pad_y:pad_y + Ny] = image
-    kspace_cart = torch.fft.fftshift(torch.fft.fft2(torch.fft.ifftshift(image_padded)))
-    kx_scaled, ky_scaled = (kx + 0.5) * Nx_oversamp, (ky + 0.5) * Ny_oversamp
-    half_width = width // 2
-    kspace_data = torch.zeros(kx.shape[0], dtype=torch.complex64, device=device)
-    weight_sum = torch.zeros(kx.shape[0], dtype=torch.float32, device=device) 
-    for dx in range(-half_width, half_width + 1):
-        for dy in range(-half_width, half_width + 1):
-            x_idx, y_idx = torch.floor(kx_scaled + dx).long(), torch.floor(ky_scaled + dy).long()
-            x_dist, y_dist = kx_scaled - x_idx.float(), ky_scaled - y_idx.float()
-            r = torch.sqrt(x_dist**2 + y_dist**2)
-            w = _iternufft2d_kaiser_bessel_kernel(r, width, beta)
-            x_idx_mod, y_idx_mod = x_idx % Nx_oversamp, y_idx % Ny_oversamp
-            kspace_data += kspace_cart[x_idx_mod, y_idx_mod] * w
-            weight_sum += w
-    weight_sum = torch.where(weight_sum == 0, torch.ones_like(weight_sum), weight_sum)
-    kspace_data /= weight_sum
-    return kspace_data
-
 class NUFFTOperator(Operator):
     """
-    NUFFT Operator using PyTorch for 2D (iterative gridding) or 3D (direct NDFT or external libraries).
-    For 3D NDFT (direct or external libraries), k_trajectory coordinates are assumed to be 
-    normalized in [-0.5, 0.5] for each dimension if using 'direct' backend.
-    For 'pynufft' or 'sigpy' backends, k_trajectory is scaled internally to [-pi, pi].
+    NUFFT Operator that wraps NUFFT2D or NUFFT3D table-based implementations,
+    or uses a direct NDFT for 3D.
+    k_trajectory coordinates are assumed to be normalized in [-0.5, 0.5] for each dimension.
     """
-    def __init__(self, k_trajectory, image_shape, device='cpu', 
-                 nufft_backend_2d='iternufft2d', 
-                 nufft_backend_3d='direct', 
-                 **kwargs_nufft):
-        self.image_shape = image_shape
-        self.device = torch.device(device) 
-        self.nufft_backend_2d = nufft_backend_2d
-        self.nufft_backend_3d = nufft_backend_3d
-        self.kwargs_nufft = kwargs_nufft
+    def __init__(self, 
+                 k_trajectory: torch.Tensor, 
+                 image_shape: tuple[int, ...], 
+                 oversamp_factor: tuple[float, ...], 
+                 kb_J: tuple[int, ...], 
+                 kb_alpha: tuple[float, ...], 
+                 Ld: tuple[int, ...], 
+                 kb_m: tuple[float, ...] | None = None, 
+                 Kd: tuple[int, ...] | None = None, 
+                 n_shift: tuple[float, ...] | None = None, 
+                 device: str | torch.device = 'cpu', 
+                 nufft_type_3d: str = 'table'):
+        
+        self.image_shape = tuple(image_shape)
+        if isinstance(device, str):
+            self.device = torch.device(device)
+        else:
+            self.device = device
 
         if not isinstance(k_trajectory, torch.Tensor):
             k_trajectory = torch.tensor(k_trajectory, dtype=torch.float32)
         self.k_trajectory = k_trajectory.to(self.device)
 
         self.dimensionality = len(image_shape)
-        self.pynufft_plan_3d = None
-        self.sigpy_nufft_op_3d = None
+        self.nufft_impl = None
         self.grid_flat_3d = None 
+        self.nufft_type_3d = nufft_type_3d # Store for 3D case
 
-        if self.dimensionality == 3:
+        if self.dimensionality == 2:
+            if self.k_trajectory.ndim != 2 or self.k_trajectory.shape[1] != 2:
+                raise ValueError(f"For 2D NUFFT, k_trajectory must have shape (num_k_points, 2), got {self.k_trajectory.shape}")
+            self.nufft_impl = NUFFT2D(image_shape=self.image_shape, 
+                                      k_trajectory=self.k_trajectory, 
+                                      oversamp_factor=oversamp_factor, 
+                                      kb_J=kb_J, 
+                                      kb_alpha=kb_alpha, 
+                                      kb_m=kb_m, 
+                                      Ld=Ld, 
+                                      Kd=Kd, 
+                                      device=self.device)
+        elif self.dimensionality == 3:
             if self.k_trajectory.ndim != 2 or self.k_trajectory.shape[1] != 3:
                 raise ValueError(f"For 3D, k_trajectory must have shape (num_k_points, 3), got {self.k_trajectory.shape}")
-            if self.nufft_backend_3d == 'pynufft':
-                if PYNUFFT_AVAILABLE:
-                    try:
-                        self.pynufft_plan_3d = pynufft_NUFFT_lib()
-                        Nd = tuple(self.image_shape) 
-                        oversamp_factor = self.kwargs_nufft.get('oversamp', 2.0)
-                        kernel_width = self.kwargs_nufft.get('width', 6) 
-                        Kd = tuple(int(i * oversamp_factor) for i in Nd)
-                        Jd = tuple(kernel_width for _ in Nd)
-                        k_traj_pynufft = self.k_trajectory.cpu().numpy() * (2 * np.pi)
-                        pynufft_plan_kwargs = {k: v for k, v in self.kwargs_nufft.items() if k in ['batch', 'device_id', 'fft_type']}
-                        self.pynufft_plan_3d.plan(k_traj_pynufft, Nd, Kd, Jd, **pynufft_plan_kwargs)
-                        print("INFO: Using pynufft for 3D NUFFT.")
-                    except Exception as e:
-                        print(f"WARNING: pynufft planning failed: {e}. Falling back to 'direct' NDFT for 3D.")
-                        self.nufft_backend_3d = 'direct'
-                else:
-                    print("WARNING: pynufft library not found for 3D NUFFT. Falling back to 'direct' NDFT.")
-                    self.nufft_backend_3d = 'direct'
-            elif self.nufft_backend_3d == 'sigpy':
-                if SIGPY_AVAILABLE:
-                    try:
-                        k_traj_sigpy = self.k_trajectory.cpu().numpy() * (2 * np.pi)
-                        sigpy_kwargs = self.kwargs_nufft.copy()
-                        if 'oversamp' in sigpy_kwargs and 'osf' not in sigpy_kwargs:
-                            sigpy_kwargs['osf'] = sigpy_kwargs.pop('oversamp')
-                        self.sigpy_nufft_op_3d = sigpy_NUFFT_op(oshape=self.image_shape, coord=k_traj_sigpy, **sigpy_kwargs)
-                        print("INFO: Using SigPy for 3D NUFFT.")
-                    except Exception as e:
-                        print(f"WARNING: SigPy NUFFT initialization failed: {e}. Falling back to 'direct' NDFT for 3D.")
-                        self.nufft_backend_3d = 'direct'
-                else:
-                    print("WARNING: SigPy library not found for 3D NUFFT. Falling back to 'direct' NDFT.")
-                    self.nufft_backend_3d = 'direct'
-            if self.nufft_backend_3d == 'direct': 
+            
+            if self.nufft_type_3d == 'table':
+                self.nufft_impl = NUFFT3D(image_shape=self.image_shape, 
+                                          k_trajectory=self.k_trajectory, 
+                                          oversamp_factor=oversamp_factor, 
+                                          kb_J=kb_J, 
+                                          kb_alpha=kb_alpha, 
+                                          kb_m=kb_m, 
+                                          Ld=Ld, 
+                                          Kd=Kd, 
+                                          n_shift=n_shift, 
+                                          device=self.device)
+            elif self.nufft_type_3d == 'direct':
+                self.nufft_impl = None # Signal to use direct NDFT
                 coords_z = torch.linspace(-0.5, 0.5, image_shape[0], device=self.device, dtype=torch.float32)
                 coords_y = torch.linspace(-0.5, 0.5, image_shape[1], device=self.device, dtype=torch.float32)
                 coords_x = torch.linspace(-0.5, 0.5, image_shape[2], device=self.device, dtype=torch.float32)
                 grid_z, grid_y, grid_x = torch.meshgrid(coords_z, coords_y, coords_x, indexing='ij')
                 self.grid_flat_3d = torch.stack((grid_x.flatten(), grid_y.flatten(), grid_z.flatten()), dim=1)
-        elif self.dimensionality == 2:
-             if self.k_trajectory.ndim != 2 or self.k_trajectory.shape[1] != 2:
-                raise ValueError(f"For 2D NUFFT, k_trajectory must have shape (num_k_points, 2), got {self.k_trajectory.shape}")
+                if n_shift is not None and not all(s == 0.0 for s in n_shift):
+                    print("Warning: n_shift is provided for 'direct' 3D NUFFT but currently not implemented for it. It will be ignored.")
+            else:
+                raise ValueError(f"Unknown nufft_type_3d: {self.nufft_type_3d}. Must be 'table' or 'direct'.")
         else:
             raise ValueError(f"Unsupported dimensionality: {self.dimensionality}. Must be 2 or 3.")
 
@@ -174,68 +93,50 @@ class NUFFTOperator(Operator):
         image_data_tensor = torch.as_tensor(image_data_tensor, dtype=torch.complex64, device=self.device)
         if image_data_tensor.shape != self.image_shape:
              raise ValueError(f"Input image_data_tensor shape {image_data_tensor.shape} does not match expected {self.image_shape}")
-        if self.dimensionality == 2:
-            kx, ky = self.k_trajectory[:, 0], self.k_trajectory[:, 1]
-            nufft_params_2d = {k: v for k, v in self.kwargs_nufft.items() if k in ['oversamp', 'width', 'beta']}
-            return _iternufft2d_nufft2d2_forward(kx, ky, image_data_tensor, **nufft_params_2d)
-        elif self.dimensionality == 3:
-            if self.nufft_backend_3d == 'pynufft' and self.pynufft_plan_3d:
-                img_np = image_data_tensor.detach().cpu().numpy()
-                k_space_np = self.pynufft_plan_3d.op(img_np)
-                return torch.from_numpy(k_space_np).to(self.device)
-            elif self.nufft_backend_3d == 'sigpy' and self.sigpy_nufft_op_3d:
-                img_np = image_data_tensor.detach().cpu().numpy()
-                k_space_np = self.sigpy_nufft_op_3d.forward(img_np)
-                return torch.from_numpy(k_space_np).to(self.device)
-            elif self.nufft_backend_3d == 'direct':
-                image_flat = image_data_tensor.flatten().unsqueeze(0) 
-                dot_product_matrix = torch.matmul(self.k_trajectory, self.grid_flat_3d.T)
-                exponent_matrix = -2j * torch.pi * dot_product_matrix
-                kspace_data = torch.sum(image_flat * torch.exp(exponent_matrix), dim=1)
-                return kspace_data
-            else: raise RuntimeError("3D NUFFT backend not properly initialized or fallback failed.")
-        else: raise ValueError(f"Unsupported dimensionality: {self.dimensionality}")
 
-    def op_adj(self, k_space_data_tensor, output_voxel_coords_flat=None): # Added output_voxel_coords_flat
+        if self.nufft_impl is not None: # Covers 2D and 3D 'table'
+            return self.nufft_impl.forward(image_data_tensor)
+        elif self.dimensionality == 3 and self.nufft_type_3d == 'direct':
+            if self.grid_flat_3d is None:
+                 raise RuntimeError("grid_flat_3d not initialized for direct 3D NUFFT.")
+            image_flat = image_data_tensor.flatten().unsqueeze(0) 
+            dot_product_matrix = torch.matmul(self.k_trajectory, self.grid_flat_3d.T)
+            exponent_matrix = -2j * torch.pi * dot_product_matrix
+            kspace_data = torch.sum(image_flat * torch.exp(exponent_matrix), dim=1)
+            return kspace_data
+        else: 
+            raise RuntimeError(f"NUFFT operation not supported for dimensionality {self.dimensionality} and type {self.nufft_type_3d}")
+
+    def op_adj(self, k_space_data_tensor, output_voxel_coords_flat=None):
         k_space_data_tensor = torch.as_tensor(k_space_data_tensor, dtype=torch.complex64, device=self.device)
-        if self.dimensionality == 2:
-            kx, ky = self.k_trajectory[:, 0], self.k_trajectory[:, 1]
-            nufft_params_2d = {k: v for k, v in self.kwargs_nufft.items() if k in ['oversamp', 'width', 'beta']}
-            return _iternufft2d_nufft2d2_adjoint(kx, ky, k_space_data_tensor, self.image_shape, **nufft_params_2d)
-        elif self.dimensionality == 3:
-            if self.nufft_backend_3d == 'pynufft' and self.pynufft_plan_3d:
-                if output_voxel_coords_flat is not None:
-                    print("Warning: NUFFTOperator.op_adj with pynufft backend does not support output_voxel_coords_flat. Ignoring.")
-                k_space_np = k_space_data_tensor.detach().cpu().numpy()
-                img_np = self.pynufft_plan_3d.adj(k_space_np)
-                return torch.from_numpy(img_np).to(self.device)
-            elif self.nufft_backend_3d == 'sigpy' and self.sigpy_nufft_op_3d:
-                if output_voxel_coords_flat is not None:
-                    print("Warning: NUFFTOperator.op_adj with sigpy backend does not support output_voxel_coords_flat. Ignoring.")
-                k_space_np = k_space_data_tensor.detach().cpu().numpy()
-                img_np = self.sigpy_nufft_op_3d.adjoint(k_space_np)
-                return torch.from_numpy(img_np).to(self.device)
-            elif self.nufft_backend_3d == 'direct':
-                k_space_data_expanded = k_space_data_tensor.unsqueeze(1)  
-                
-                grid_to_use = self.grid_flat_3d
-                reshape_output = True
-                if output_voxel_coords_flat is not None:
-                    if not isinstance(output_voxel_coords_flat, torch.Tensor) or output_voxel_coords_flat.ndim != 2 or output_voxel_coords_flat.shape[1] != 3:
-                         raise ValueError("output_voxel_coords_flat must be a 2D tensor of shape (num_voxels, 3).")
-                    grid_to_use = output_voxel_coords_flat.to(device=self.device, dtype=torch.float32)
-                    reshape_output = False # Output will be flat vector matching output_voxel_coords_flat
+        
+        if self.nufft_impl is not None: # Covers 2D and 3D 'table'
+            if output_voxel_coords_flat is not None:
+                print("Warning: NUFFTOperator.op_adj with table-based NUFFT implementation does not support output_voxel_coords_flat. It will be ignored.")
+            return self.nufft_impl.adjoint(k_space_data_tensor)
+        elif self.dimensionality == 3 and self.nufft_type_3d == 'direct':
+            if self.grid_flat_3d is None:
+                 raise RuntimeError("grid_flat_3d not initialized for direct 3D NUFFT adjoint.")
+            k_space_data_expanded = k_space_data_tensor.unsqueeze(1)  
+            
+            grid_to_use = self.grid_flat_3d
+            reshape_output = True
+            if output_voxel_coords_flat is not None:
+                if not isinstance(output_voxel_coords_flat, torch.Tensor) or output_voxel_coords_flat.ndim != 2 or output_voxel_coords_flat.shape[1] != 3:
+                        raise ValueError("output_voxel_coords_flat must be a 2D tensor of shape (num_voxels, 3).")
+                grid_to_use = output_voxel_coords_flat.to(device=self.device, dtype=torch.float32)
+                reshape_output = False # Output will be flat vector matching output_voxel_coords_flat
 
-                dot_product_matrix = torch.matmul(self.k_trajectory, grid_to_use.T) 
-                exponent_matrix = 2j * torch.pi * dot_product_matrix 
-                image_flat = torch.sum(k_space_data_expanded * torch.exp(exponent_matrix), dim=0) 
-                
-                if reshape_output:
-                    return image_flat.reshape(self.image_shape)
-                else:
-                    return image_flat # Return flat vector as per new functionality
-            else: raise RuntimeError("3D NUFFT backend not properly initialized or fallback failed for adjoint.")
-        else: raise ValueError(f"Unsupported dimensionality: {self.dimensionality}")
+            dot_product_matrix = torch.matmul(self.k_trajectory, grid_to_use.T) 
+            exponent_matrix = 2j * torch.pi * dot_product_matrix 
+            image_flat = torch.sum(k_space_data_expanded * torch.exp(exponent_matrix), dim=0) 
+            
+            if reshape_output:
+                return image_flat.reshape(self.image_shape)
+            else:
+                return image_flat # Return flat vector
+        else:
+            raise RuntimeError(f"NUFFT adjoint operation not supported for dimensionality {self.dimensionality} and type {self.nufft_type_3d}")
 
 class CoilSensitivityOperator(Operator):
     def __init__(self, coil_sensitivities_tensor):
@@ -282,11 +183,6 @@ class MRIForwardOperator(Operator):
                 raise ValueError(f"Mismatch between k_space_data_coils_tensor.shape[0] ({num_coils_from_data}) and num_coils_if_no_sens ({self.num_coils_if_no_sens})")
             accumulated_image = torch.zeros(self.image_shape, dtype=k_space_data_coils_tensor.dtype, device=self.device)
             for c in range(num_coils_from_data): 
-                # Call op_adj of base NUFFT for each coil. If output_voxel_coords_flat is relevant, 
-                # this base call might need to pass it, but MRIForwardOperator doesn't know about it.
-                # This implies SlidingWindowNUFFTOperator should wrap the MRIForwardOperator,
-                # or NUFFTOperator's op_adj needs to be context-aware if it's part of MRIForwardOperator.
-                # For now, assuming standard op_adj call.
                 accumulated_image += self.nufft_operator.op_adj(k_space_data_coils_tensor[c])
             return accumulated_image
         else:
@@ -315,11 +211,12 @@ class SlidingWindowNUFFTOperator(Operator):
         
         if self.dimensionality != 3:
             print("Warning: SlidingWindowNUFFTOperator is primarily designed for 3D. May not offer benefits for 2D.")
-            # For 2D, or non-direct 3D, op_adj will just call base_nufft_operator.op_adj
         
-        if self.base_nufft_operator.nufft_backend_3d != 'direct' and self.dimensionality == 3:
+        # Updated condition to check nufft_type_3d of the base_nufft_operator
+        if self.dimensionality == 3 and hasattr(self.base_nufft_operator, 'nufft_type_3d') and \
+           self.base_nufft_operator.nufft_type_3d != 'direct':
             print("Warning: SlidingWindowNUFFTOperator op_adj is optimized for 'direct' 3D NDFT backend. "
-                  "Using other backends will call the base operator's op_adj directly.")
+                  "The provided base_nufft_operator is not using 'direct' type. op_adj will call base operator's op_adj directly.")
 
         self.block_size = block_size
         if len(self.block_size) != self.dimensionality:
@@ -339,10 +236,6 @@ class SlidingWindowNUFFTOperator(Operator):
         
         individual_windows = []
         for dim_size in block_shape_tuple:
-            # scipy.signal.windows.tukey: alpha is ratio of taper to constant section
-            # For PyTorch, we might need to implement it or use available if any.
-            # Simple implementation for now, or use scipy if available.
-            # Using scipy.signal.windows.tukey for robustness.
             win_1d = torch.from_numpy(tukey(dim_size, alpha=alpha, sym=True).astype(np.float32))
             individual_windows.append(win_1d)
         
@@ -351,16 +244,6 @@ class SlidingWindowNUFFTOperator(Operator):
         elif len(block_shape_tuple) == 2:
             return torch.outer(individual_windows[0], individual_windows[1])
         elif len(block_shape_tuple) == 3:
-            # (H,W,D) -> W varies fastest. If block_shape is (D,H,W) -> tukey for D, H, W
-            # Dims for outer product: (D) outer (H) -> (D,H). Then (D,H).flatten outer (W) -> (D*H, W) -> reshape(D,H,W)
-            # Or, more generally:
-            window_nd = individual_windows[0]
-            for i in range(1, len(individual_windows)):
-                window_nd = torch.outer(window_nd.flatten(), individual_windows[i]).reshape(*window_nd.shape, individual_windows[i].shape[0])
-            # Final shape should match block_shape_tuple. This needs careful reshaping.
-            # Example: (D,H,W). win_d (D), win_h (H), win_w (W)
-            # window = win_d[:, None, None] * win_h[None, :, None] * win_w[None, None, :]
-            # This is element-wise broadcast multiplication.
             current_window = torch.ones(block_shape_tuple, dtype=torch.float32)
             for d_idx, win_1d in enumerate(individual_windows):
                 view_shape = [1] * len(block_shape_tuple)
@@ -372,14 +255,20 @@ class SlidingWindowNUFFTOperator(Operator):
 
 
     def op(self, image_data_tensor):
-        # print("SlidingWindowNUFFTOperator.op currently calls base operator directly.")
         return self.base_nufft_operator.op(image_data_tensor)
 
     def op_adj(self, k_space_data_tensor):
-        if self.dimensionality != 3 or self.base_nufft_operator.nufft_backend_3d != 'direct':
+        # Check if base operator is suitable for sliding window (3D direct)
+        is_3d_direct_nufft = (
+            self.dimensionality == 3 and
+            hasattr(self.base_nufft_operator, 'nufft_type_3d') and
+            self.base_nufft_operator.nufft_type_3d == 'direct'
+        )
+
+        if not is_3d_direct_nufft:
             # print("Warning: SlidingWindowNUFFTOperator.op_adj is optimized for 3D 'direct' NDFT. "
             #       "Calling base operator's op_adj for current configuration.")
-            return self.base_nufft_operator.op_adj(k_space_data_tensor) # No custom args
+            return self.base_nufft_operator.op_adj(k_space_data_tensor) # No custom args for non-direct
 
         k_space_data_tensor = torch.as_tensor(k_space_data_tensor, dtype=torch.complex64, device=self.device)
         final_image = torch.zeros(self.full_image_shape, dtype=torch.complex64, device=self.device)
