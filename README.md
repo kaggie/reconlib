@@ -139,3 +139,15 @@ plot(k_coords.cpu()) # Ensure plotting function can handle the trajectory format
 ### 6. Comprehensive Pipeline Examples
 
 For detailed examples of 2D and 3D reconstruction pipelines, including data generation, NUFFT setup, iterative reconstruction (CG), and L1/L2 regularized reconstruction, please see the Jupyter Notebook: `examples/recon_pipeline_demo.ipynb`.
+
+---
+## Deep Learning based Reconstruction (Experimental)
+
+ReconLib now includes experimental support for deep learning based reconstruction, starting with an implementation of a Model-based Deep Learning (MoDL) unrolled network.
+This network leverages the `NUFFTOperator` for data consistency and a learned CNN (e.g., ResNet-based) for regularization.
+Key components can be found in the `reconlib.deeplearning` module.
+
+### MoDL Example
+
+An example demonstrating the setup and use of the MoDL network for 2D image reconstruction from simulated data can be found in the Jupyter Notebook: `examples/modl_recon_demo.ipynb`.
+Training and evaluation scripts (`examples/unrolled_dl_train.py`, `examples/unrolled_dl_evaluate.py`) are also provided as starting points.
