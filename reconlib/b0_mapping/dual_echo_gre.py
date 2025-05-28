@@ -2,32 +2,45 @@
 """Dual-echo (and multi-echo) Gradient Echo B0 mapping using PyTorch."""
 
 import torch
-import numpy as np # Retained for np.pi if torch.pi is not available, and potential fallback for polyfit
+import numpy as np # Retained for np.pi if torch.pi is not available
+from typing import Callable
 
 def calculate_b0_map_dual_echo(
-    phase_images: torch.Tensor, 
-    echo_times: torch.Tensor, 
-    mask: torch.Tensor = None
+    phase_images: torch.Tensor,
+    echo_times: torch.Tensor,
+    mask: torch.Tensor = None,
+    unwrap_method_fn: Callable[[torch.Tensor], torch.Tensor] = None
 ) -> torch.Tensor:
     """
     Calculates B0 map using the phase difference method for two echoes using PyTorch.
 
-    The B0 map is calculated as: B0 = (phase_echo2 - phase_echo1) / (2 * pi * (TE2 - TE1)).
-    The phase difference is wrapped to [-pi, pi) before calculation.
+    The B0 map is calculated as: B0_map = phase_difference / (2 * pi * delta_TE).
+    The `phase_difference` (phase_echo2 - phase_echo1) can be optionally unwrapped
+    using a user-provided function via `unwrap_method_fn`.
 
     Args:
         phase_images (torch.Tensor): PyTorch tensor of phase images.
-                                     Shape: (num_echoes, ...), where num_echoes must be at least 2.
-                                     Phase values are expected in radians.
+                                     Shape: (num_echoes, ...), where `...` can be (D, H, W) or (H, W).
+                                     `num_echoes` must be at least 2. Phase values are expected in radians.
         echo_times (torch.Tensor): PyTorch tensor of echo times in seconds.
                                    Shape: (num_echoes,).
         mask (torch.Tensor, optional): Boolean PyTorch tensor of the same spatial dimensions
-                                       as phase_images (e.g., (D, H, W) or (H, W)).
+                                       as a single phase image (e.g., (D, H, W) or (H, W)).
                                        Voxels where mask is False are set to 0 in the output B0 map.
                                        Defaults to None (no masking).
+        unwrap_method_fn (typing.Callable, optional): A function to unwrap the calculated
+                                                      phase difference map (phase_echo2 - phase_echo1).
+                                                      The function should accept a PyTorch tensor
+                                                      (the phase difference map) and return an unwrapped
+                                                      PyTorch tensor of the same shape.
+                                                      Example: `from reconlib.phase_unwrapping import unwrap_phase_3d_quality_guided`.
+                                                      If None (default), the raw (potentially wrapped)
+                                                      phase difference is used, which may lead to B0 aliasing
+                                                      if the true phase difference exceeds pi radians.
+                                                      Defaults to None.
 
     Returns:
-        torch.Tensor: Calculated B0 map in Hz, with the same spatial dimensions as input phase images
+        torch.Tensor: Calculated B0 map in Hz, with the same spatial dimensions as a single input phase image
                       and on the same device.
     """
     if not isinstance(phase_images, torch.Tensor):
@@ -36,6 +49,8 @@ def calculate_b0_map_dual_echo(
         raise TypeError("echo_times must be a PyTorch tensor.")
     if mask is not None and not isinstance(mask, torch.Tensor):
         raise TypeError("mask must be a PyTorch tensor if provided.")
+    if unwrap_method_fn is not None and not callable(unwrap_method_fn):
+        raise TypeError("unwrap_method_fn must be a callable function or None.")
 
     device = phase_images.device
     echo_times = echo_times.to(device) # Ensure echo_times is on the same device
@@ -51,15 +66,31 @@ def calculate_b0_map_dual_echo(
     if delta_te == 0:
         raise ValueError("Echo times for the first two echoes must be different.")
 
-    # Phase difference
-    phase_diff = phase_images[1,...] - phase_images[0,...]
+    pi_val = getattr(torch, 'pi', np.pi) # Keep for pi constant
 
-    # Basic phase unwrapping: wrap to [-pi, pi)
-    # Using torch.pi if available (PyTorch 1.7+), else fallback to np.pi
-    pi_val = getattr(torch, 'pi', np.pi) 
-    phase_diff = (phase_diff + pi_val) % (2 * pi_val) - pi_val
+    # Calculate raw phase difference (phase_TE2 - phase_TE1)
+    phase_diff = phase_images[1, ...] - phase_images[0, ...]
 
-    b0_map = phase_diff / (2 * pi_val * delta_te) # B0 in Hz
+    # Conditionally unwrap the phase difference
+    if unwrap_method_fn is not None:
+        # Assuming unwrap_method_fn handles the input shape as is (e.g. D,H,W or H,W)
+        phase_to_use_for_b0 = unwrap_method_fn(phase_diff)
+    else:
+        # If no unwrapping function is provided, use the raw (potentially wrapped) phase difference.
+        # Note: This might lead to B0 aliasing if abs(true phase difference) > pi.
+        # For direct use without unwrapping, the phase difference should be within [-pi, pi).
+        # If it's known to be outside this range and no unwrap_method_fn is given,
+        # the user might expect this function to handle it.
+        # However, the original logic was a simple re-wrap.
+        # The new logic is: use unwrapper if given, else use raw difference.
+        # If the raw difference is used, it should be the true difference,
+        # which might exceed [-pi, pi]. If it needs to be in [-pi, pi] for some reason
+        # without a full unwrap, that would be a simple wrap:
+        # phase_to_use_for_b0 = (phase_diff + pi_val) % (2 * pi_val) - pi_val
+        # But the instruction is to REMOVE the re-wrapping line and use phase_diff directly.
+        phase_to_use_for_b0 = phase_diff
+
+    b0_map = phase_to_use_for_b0 / (2 * pi_val * delta_te) # B0 in Hz
 
     if mask is not None:
         # Ensure mask has compatible dimensions
