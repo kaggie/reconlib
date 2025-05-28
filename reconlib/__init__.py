@@ -30,6 +30,14 @@ from .reconstructors import ProximalGradientReconstructor, POCSENSEreconstructor
 from .utils import calculate_density_compensation
 from .csm import estimate_csm_from_central_kspace
 
+from .coil_combination import (
+    coil_combination_with_phase,
+    estimate_phase_maps,
+    estimate_sensitivity_maps,
+    reconstruct_coil_images,
+    compute_density_compensation
+)
+
 # Exports from wavelets_scratch.py
 from .wavelets_scratch import WaveletTransform
 from .wavelets_scratch import WaveletRegularizationTerm
@@ -74,6 +82,11 @@ __all__ = [
     'generate_nlinv_data_stubs',
     'plotting',
     'preprocess_multi_coil_multi_echo_data',
+    "coil_combination_with_phase",
+    "estimate_phase_maps",
+    "estimate_sensitivity_maps",
+    "reconstruct_coil_images",
+    "compute_density_compensation",
 ]
 
 # Note: The original __init__.py had imports like:
