@@ -44,6 +44,8 @@ from .deeplearning import SimpleWaveletDenoiser, LearnedRegularizationIteration
 # Exports from simulation module (toy_datasets functions)
 from .simulation.toy_datasets import generate_dynamic_phantom_data, generate_nlinv_data_stubs
 
+from . import plotting
+
 
 # Optionally, define __all__ to specify what `from reconlib import *` imports
 __all__ = [
@@ -69,6 +71,7 @@ __all__ = [
     # Added simulation functions
     'generate_dynamic_phantom_data',
     'generate_nlinv_data_stubs',
+    'plotting',
 ]
 
 # Note: The original __init__.py had imports like:

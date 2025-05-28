@@ -2,6 +2,86 @@
 
 import numpy as np
 import torch
+from .data import MRIData # For type hinting and usage in get_echo_data
+
+
+def extract_phase(complex_data: np.ndarray) -> np.ndarray:
+    """
+    Extracts the phase from complex-valued data.
+
+    Args:
+        complex_data (np.ndarray): Input complex data.
+
+    Returns:
+        np.ndarray: Phase of the complex data in radians.
+    """
+    return np.angle(complex_data)
+
+
+def extract_magnitude(complex_data: np.ndarray) -> np.ndarray:
+    """
+    Extracts the magnitude from complex-valued data.
+
+    Args:
+        complex_data (np.ndarray): Input complex data.
+
+    Returns:
+        np.ndarray: Magnitude of the complex data.
+    """
+    return np.abs(complex_data)
+
+
+def get_echo_data(mri_data: MRIData, echo_index: int) -> np.ndarray:
+    """
+    Extracts k-space data for a specific echo from an MRIData object.
+
+    Assumes that if multi-echo data is present, the first dimension of 
+    mri_data.k_space_data is the echo dimension.
+
+    Args:
+        mri_data (MRIData): The MRIData object containing k-space data.
+        echo_index (int): The index of the echo to extract.
+
+    Returns:
+        np.ndarray: The k-space data for the specified echo.
+
+    Raises:
+        ValueError: If the echo_index is out of bounds or if the data
+                    does not appear to be multi-echo.
+    """
+    k_data = mri_data.k_space_data
+    
+    # Check if data appears to be multi-echo. 
+    # A simple check is if it has more dimensions than typical for single-echo (e.g., > 3 for coils, kx, ky)
+    # Or more robustly, by checking the length of the first dimension.
+    # For this implementation, we'll assume if echo_times is present and has length > 1,
+    # then the first dimension of k_space_data is echoes.
+    # Or, if k_space_data has at least 2 dimensions (echoes, coils/data_points).
+    
+    is_multi_echo_shape = k_data.ndim > 2 # (echoes, coils, samples) or (echoes, samples_x, samples_y)
+    
+    if not is_multi_echo_shape and echo_index == 0:
+        # If it doesn't look like multi-echo data but echo_index is 0, assume it's single echo.
+        # Or, if k_data.shape[0] is not consistent with num_echoes if mri_data.echo_times exists.
+        # For simplicity, let's be strict: if echo_index > 0, it must look multi-echo.
+        pass # Allow if echo_index is 0 and not clearly multi-echo
+    elif not is_multi_echo_shape and echo_index > 0:
+         raise ValueError(
+            f"k_space_data does not appear to be multi-echo (shape {k_data.shape}), "
+            f"but echo_index {echo_index} was requested."
+        )
+
+    if echo_index < 0:
+        raise ValueError("echo_index must be a non-negative integer.")
+
+    if k_data.shape[0] <= echo_index:
+        raise ValueError(
+            f"echo_index {echo_index} is out of bounds for k_space_data with "
+            f"{k_data.shape[0]} echoes (first dimension)."
+        )
+        
+    return k_data[echo_index, ...]
+
 
 def calculate_density_compensation(k_trajectory, image_shape, method='radial_simple', device='cpu', **kwargs):
     """
