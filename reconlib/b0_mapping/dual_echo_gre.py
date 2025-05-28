@@ -105,7 +105,8 @@ def calculate_b0_map_dual_echo(
 def calculate_b0_map_multi_echo_linear_fit(
     phase_images: torch.Tensor, 
     echo_times: torch.Tensor, 
-    mask: torch.Tensor = None
+    mask: torch.Tensor = None,
+    spatial_unwrap_fn: Callable[[torch.Tensor], torch.Tensor] = None
 ) -> torch.Tensor:
     """
     Calculates B0 map by linear fitting of phase vs. echo times for multiple echoes using PyTorch.
@@ -113,8 +114,8 @@ def calculate_b0_map_multi_echo_linear_fit(
     This function performs a voxel-wise linear regression of phase = slope * TE + intercept.
     The B0 map is then calculated as: B0 = slope / (2 * pi).
     The implementation uses `torch.linalg.lstsq` for efficient vectorized computation.
-    It is recommended that input `phase_images` are unwrapped for accurate fitting,
-    though the function will proceed with any input phase data.
+    Optionally, each echo's phase image can be spatially unwrapped before fitting
+    using the `spatial_unwrap_fn`.
 
     Args:
         phase_images (torch.Tensor): PyTorch tensor of phase images.
@@ -126,6 +127,14 @@ def calculate_b0_map_multi_echo_linear_fit(
                                        Shape should match spatial dimensions of `phase_images`.
                                        Voxels where mask is False are set to 0 in the output B0 map.
                                        Defaults to None.
+        spatial_unwrap_fn (typing.Callable, optional): A function to spatially unwrap each
+                                                       individual echo's phase image before fitting.
+                                                       The function should accept a spatial phase tensor
+                                                       (e.g., (D, H, W) or (H, W)) and return an unwrapped
+                                                       tensor of the same shape.
+                                                       Example: `from reconlib.phase_unwrapping import unwrap_phase_3d_quality_guided`.
+                                                       If None (default), the original phase images are used.
+                                                       Defaults to None.
 
     Returns:
         torch.Tensor: Calculated B0 map in Hz, with the same spatial dimensions as input phase images
@@ -138,6 +147,8 @@ def calculate_b0_map_multi_echo_linear_fit(
         raise TypeError("echo_times must be a PyTorch tensor.")
     if mask is not None and not isinstance(mask, torch.Tensor):
         raise TypeError("mask must be a PyTorch tensor if provided.")
+    if spatial_unwrap_fn is not None and not callable(spatial_unwrap_fn):
+        raise TypeError("spatial_unwrap_fn must be a callable function or None.")
 
     device = phase_images.device
     dtype = phase_images.dtype
@@ -150,10 +161,27 @@ def calculate_b0_map_multi_echo_linear_fit(
         raise ValueError("Number of echo times must match the number of phase images.")
 
     spatial_dims_shape = phase_images.shape[1:]
-    num_spatial_locations = int(torch.prod(torch.tensor(spatial_dims_shape)).item())
+    # num_spatial_locations = int(torch.prod(torch.tensor(spatial_dims_shape)).item()) # Not directly needed
 
-    # Reshape phase_images for vectorized processing: (num_echoes, N_spatial_locations)
-    phase_data_reshaped = phase_images.reshape(num_echoes, -1) # (num_echoes, N)
+    # Optionally unwrap each echo spatially
+    if spatial_unwrap_fn is not None:
+        unwrapped_echo_list = []
+        for i in range(num_echoes):
+            # Assuming spatial_unwrap_fn handles the spatial dimensions of phase_images[i, ...]
+            # e.g., if phase_images[i,...] is (D,H,W), unwrapper should handle 3D.
+            # If phase_images[i,...] is (H,W), unwrapper should handle 2D, or a wrapper is needed.
+            phase_echo_unwrapped = spatial_unwrap_fn(phase_images[i, ...])
+            unwrapped_echo_list.append(phase_echo_unwrapped)
+        
+        if unwrapped_echo_list: # Should always be true if num_echoes > 0
+            processed_phase_images = torch.stack(unwrapped_echo_list, dim=0)
+        else: # Should be caught by num_echoes check, but as a fallback:
+            processed_phase_images = phase_images 
+    else:
+        processed_phase_images = phase_images
+
+    # Reshape processed_phase_images for vectorized processing: (num_echoes, N_spatial_locations)
+    phase_data_reshaped = processed_phase_images.reshape(num_echoes, -1) # (num_echoes, N)
     
     # Prepare design matrix A for linear regression (y = A * [slope; intercept])
     # A = [TEs, 1s]

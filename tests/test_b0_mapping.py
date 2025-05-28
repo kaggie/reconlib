@@ -14,7 +14,28 @@ def _wrap_phase_torch(phase_tensor: torch.Tensor) -> torch.Tensor:
     pi = getattr(torch, 'pi', np.pi)
     return (phase_tensor + pi) % (2 * pi) - pi
 
-def _generate_synthetic_b0_data(shape=(8, 16, 16), tes_list=[0.002, 0.004, 0.006], max_b0_hz=30.0, device='cpu', apply_mask_to_b0=True):
+def _create_spatial_wrap_pattern(shape_spatial, device, max_val_factor=1.5):
+    """
+    Creates a 3D spatial pattern that can induce phase wrapping.
+    The pattern is a sum of linear ramps along each spatial dimension.
+    max_val_factor determines how many times pi the ramp reaches.
+    """
+    pi = getattr(torch, 'pi', np.pi)
+    max_val = max_val_factor * pi
+    
+    dim_ramps = []
+    for i, dim_size in enumerate(shape_spatial):
+        ramp_1d = torch.linspace(0, max_val, dim_size, device=device)
+        view_shape = [1] * len(shape_spatial)
+        view_shape[i] = dim_size
+        dim_ramps.append(ramp_1d.view(view_shape))
+    
+    pattern = torch.zeros(shape_spatial, device=device)
+    for r in dim_ramps:
+        pattern += r # Summing ramps from each dimension
+    return pattern
+
+def _generate_synthetic_b0_data(shape=(8, 16, 16), tes_list=[0.002, 0.004, 0.006], max_b0_hz=30.0, device='cpu', apply_mask_to_b0=True, add_spatial_wraps_to_echoes=False, spatial_wrap_factor=1.5):
     """
     Generates synthetic 3D multi-echo phase data and the true B0 map.
     """
@@ -44,11 +65,24 @@ def _generate_synthetic_b0_data(shape=(8, 16, 16), tes_list=[0.002, 0.004, 0.006
     phase_images_torch = torch.zeros((num_echoes,) + shape, dtype=torch.float32, device=device)
     pi = getattr(torch, 'pi', np.pi)
     
+    spatial_wrapping_field = None
+    if add_spatial_wraps_to_echoes:
+        spatial_wrapping_field = _create_spatial_wrap_pattern(shape, device, max_val_factor=spatial_wrap_factor)
+
     for i in range(num_echoes):
-        phase_images_torch[i, ...] = 2 * pi * b0_map_true * echo_times_torch[i]
-        # Phase images are directly calculated, so they are "intrinsically unwrapped" 
-        # relative to the B0*TE product. Wrapping occurs if this product itself is large.
-        
+        base_phase = 2 * pi * b0_map_true * echo_times_torch[i]
+        if add_spatial_wraps_to_echoes and spatial_wrapping_field is not None:
+            # Add spatial wraps and then re-wrap the result
+            phase_images_torch[i, ...] = _wrap_phase_torch(base_phase + spatial_wrapping_field)
+        else:
+            # Store the base phase (which might be > pi or < -pi due to B0*TE)
+            # The dual_echo function's unwrap_method_fn handles the *difference* map.
+            # The multi_echo's spatial_unwrap_fn handles each echo.
+            # If no unwrapper, multi-echo expects "smooth" phase, dual-echo difference is used raw.
+            # For simplicity, we store the raw calculated phase, which might implicitly wrap if B0*TE is large enough.
+            # Let's ensure input to functions is explicitly wrapped to test unwrappers.
+            phase_images_torch[i, ...] = _wrap_phase_torch(base_phase) 
+            
     return phase_images_torch, echo_times_torch, b0_map_true
 
 class TestB0MappingPyTorch(unittest.TestCase):
@@ -59,24 +93,29 @@ class TestB0MappingPyTorch(unittest.TestCase):
         self.tes_dual_echo = [0.0025, 0.0050] # For dual-echo, delta_TE = 0.0025s
         self.tes_multi_echo = [0.0020, 0.0040, 0.0060, 0.0080] # For multi-echo
         
-        self.low_b0_max_hz = 40.0  # delta_TE * B0_max = 0.0025 * 40 = 0.1. Phase diff = 2*pi*0.1 (no wrap)
-        self.high_b0_max_hz = 220.0 # delta_TE * B0_max = 0.0025 * 220 = 0.55. Phase diff = 2*pi*0.55 (wraps)
+        self.low_b0_max_hz = 40.0  # delta_TE * B0_max = 0.0025 * 40 = 0.1. Phase diff = 2*pi*0.1 (no wrap for diff)
+        self.high_b0_max_hz = 220.0 # delta_TE * B0_max = 0.0025 * 220 = 0.55. Phase diff = 2*pi*0.55 (wraps for diff)
 
         # Data for low B0 (no wrapping in phase_diff for dual echo)
         self.phases_low_b0, self.tes_low_b0, self.b0_true_low_b0 = _generate_synthetic_b0_data(
-            shape=self.test_shape_3d, tes_list=self.tes_dual_echo, max_b0_hz=self.low_b0_max_hz, device=self.device
+            shape=self.test_shape_3d, tes_list=self.tes_dual_echo, max_b0_hz=self.low_b0_max_hz, device=self.device, add_spatial_wraps_to_echoes=False
         )
         
         # Data for high B0 (wrapping in phase_diff for dual echo)
         self.phases_high_b0, self.tes_high_b0, self.b0_true_high_b0 = _generate_synthetic_b0_data(
-            shape=self.test_shape_3d, tes_list=self.tes_dual_echo, max_b0_hz=self.high_b0_max_hz, device=self.device
+            shape=self.test_shape_3d, tes_list=self.tes_dual_echo, max_b0_hz=self.high_b0_max_hz, device=self.device, add_spatial_wraps_to_echoes=False
         )
 
-        # Data for multi-echo fit (can use low or high B0, let's use low for simplicity)
-        self.phases_multi, self.tes_multi, self.b0_true_multi = _generate_synthetic_b0_data(
-            shape=self.test_shape_3d, tes_list=self.tes_multi_echo, max_b0_hz=self.low_b0_max_hz, device=self.device
+        # Data for multi-echo fit (spatially smooth echoes, low B0 for true field)
+        self.phases_multi_smooth, self.tes_multi_smooth, self.b0_true_multi_smooth = _generate_synthetic_b0_data(
+            shape=self.test_shape_3d, tes_list=self.tes_multi_echo, max_b0_hz=self.low_b0_max_hz, device=self.device, add_spatial_wraps_to_echoes=False
         )
         
+        # Data for multi-echo fit with SPATIALLY WRAPPED individual echoes (low B0 for true field)
+        self.phases_spatially_wrapped, self.tes_spatially_wrapped, self.b0_true_spatially_wrapped = _generate_synthetic_b0_data(
+            shape=self.test_shape_3d, tes_list=self.tes_multi_echo, max_b0_hz=self.low_b0_max_hz, device=self.device, add_spatial_wraps_to_echoes=True, spatial_wrap_factor=2.0 # Ensure >1pi wraps
+        )
+
         # Generic mask (all true for these tests, assuming B0 is non-zero everywhere in test data after helper)
         self.mask_all_true = torch.ones(self.test_shape_3d, dtype=torch.bool, device=self.device)
 
