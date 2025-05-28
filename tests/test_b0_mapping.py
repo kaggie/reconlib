@@ -2,122 +2,90 @@ import torch
 import numpy as np
 import unittest
 
-from reconlib.b0_mapping import (
+# Updated import path
+from reconlib.b0_mapping.phase_based_b0_field_maps import (
     calculate_b0_map_dual_echo,
     calculate_b0_map_multi_echo_linear_fit
 )
-from reconlib.phase_unwrapping import unwrap_phase_3d_quality_guided
+# unwrap_phase_3d_quality_guided is used to prepare ideal inputs
+from reconlib.phase_unwrapping import unwrap_phase_3d_quality_guided 
 
-# Helper to wrap phase consistently for test assertions if needed
-def _wrap_phase_torch(phase_tensor: torch.Tensor) -> torch.Tensor:
-    """Wraps phase values to the interval [-pi, pi) using PyTorch operations."""
-    pi = getattr(torch, 'pi', np.pi)
-    return (phase_tensor + pi) % (2 * pi) - pi
 
-def _create_spatial_wrap_pattern(shape_spatial, device, max_val_factor=1.5):
-    """
-    Creates a 3D spatial pattern that can induce phase wrapping.
-    The pattern is a sum of linear ramps along each spatial dimension.
-    max_val_factor determines how many times pi the ramp reaches.
-    """
-    pi = getattr(torch, 'pi', np.pi)
-    max_val = max_val_factor * pi
-    
-    dim_ramps = []
-    for i, dim_size in enumerate(shape_spatial):
-        ramp_1d = torch.linspace(0, max_val, dim_size, device=device)
-        view_shape = [1] * len(shape_spatial)
-        view_shape[i] = dim_size
-        dim_ramps.append(ramp_1d.view(view_shape))
-    
-    pattern = torch.zeros(shape_spatial, device=device)
-    for r in dim_ramps:
-        pattern += r # Summing ramps from each dimension
-    return pattern
-
-def _generate_synthetic_b0_data(shape=(8, 16, 16), tes_list=[0.002, 0.004, 0.006], max_b0_hz=30.0, device='cpu', apply_mask_to_b0=True, add_spatial_wraps_to_echoes=False, spatial_wrap_factor=1.5):
+def _generate_synthetic_b0_data_for_refactored_tests(
+    shape=(8, 16, 16), 
+    tes_list=[0.002, 0.004, 0.006], 
+    max_b0_hz=30.0, 
+    device='cpu', 
+    apply_b0_mask=True
+):
     """
     Generates synthetic 3D multi-echo phase data and the true B0 map.
+    The output phase images are "ideal" processed phases (phase-only, spatially unwrapped per echo).
     """
     d, h, w = shape
+    pi = getattr(torch, 'pi', np.pi)
     
-    # Create a simple 3D B0 map: linear gradient along x, scaled by z
     b0_map_true = torch.zeros(shape, dtype=torch.float32, device=device)
     x_ramp = torch.linspace(-max_b0_hz, max_b0_hz, w, device=device)
     for z_idx in range(d):
-        z_scale = (z_idx + 1) / d # Scale gradient by z slice
+        z_scale = (z_idx + 1) / d 
         b0_map_true[z_idx, :, :] = x_ramp.view(1, -1) * z_scale
         
-    if apply_mask_to_b0:
-        # Create a simple cylindrical mask to make it more realistic (B0 only exists within object)
-        magnitude_mask = torch.zeros(shape, dtype=torch.bool, device=device)
+    mask_for_b0 = torch.ones(shape, dtype=torch.bool, device=device)
+    if apply_b0_mask:
         center_y, center_x = h // 2, w // 2
         radius = min(h, w) // 3
         y_coords, x_coords = torch.meshgrid(torch.arange(h, device=device), torch.arange(w, device=device), indexing='ij')
         cylinder_mask_2d = ((y_coords - center_y)**2 + (x_coords - center_x)**2 <= radius**2)
         for z_idx in range(d):
-            magnitude_mask[z_idx, :, :] = cylinder_mask_2d
-        b0_map_true[~magnitude_mask] = 0.0 # Apply B0 only within the object
+            mask_for_b0[z_idx, :, :] = cylinder_mask_2d
+        b0_map_true[~mask_for_b0] = 0.0
     
     echo_times_torch = torch.tensor(tes_list, dtype=torch.float32, device=device)
     num_echoes = len(tes_list)
     
-    phase_images_torch = torch.zeros((num_echoes,) + shape, dtype=torch.float32, device=device)
-    pi = getattr(torch, 'pi', np.pi)
-    
-    spatial_wrapping_field = None
-    if add_spatial_wraps_to_echoes:
-        spatial_wrapping_field = _create_spatial_wrap_pattern(shape, device, max_val_factor=spatial_wrap_factor)
-
+    # Generate true continuous phase for each echo
+    true_continuous_phases_torch = torch.zeros((num_echoes,) + shape, dtype=torch.float32, device=device)
     for i in range(num_echoes):
-        base_phase = 2 * pi * b0_map_true * echo_times_torch[i]
-        if add_spatial_wraps_to_echoes and spatial_wrapping_field is not None:
-            # Add spatial wraps and then re-wrap the result
-            phase_images_torch[i, ...] = _wrap_phase_torch(base_phase + spatial_wrapping_field)
-        else:
-            # Store the base phase (which might be > pi or < -pi due to B0*TE)
-            # The dual_echo function's unwrap_method_fn handles the *difference* map.
-            # The multi_echo's spatial_unwrap_fn handles each echo.
-            # If no unwrapper, multi-echo expects "smooth" phase, dual-echo difference is used raw.
-            # For simplicity, we store the raw calculated phase, which might implicitly wrap if B0*TE is large enough.
-            # Let's ensure input to functions is explicitly wrapped to test unwrappers.
-            phase_images_torch[i, ...] = _wrap_phase_torch(base_phase) 
+        true_continuous_phases_torch[i, ...] = 2 * pi * b0_map_true * echo_times_torch[i]
+        
+    # Simulate "processed_phase_images": these are the true continuous phases.
+    # If the original data had spatial wraps, they would have been unwrapped to this state.
+    processed_phase_images_torch = true_continuous_phases_torch 
             
-    return phase_images_torch, echo_times_torch, b0_map_true
+    return processed_phase_images_torch, echo_times_torch, b0_map_true, mask_for_b0
 
-class TestB0MappingPyTorch(unittest.TestCase):
+class TestB0MappingRefactored(unittest.TestCase):
 
     def setUp(self):
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.test_shape_3d = (4, 8, 10) # Smaller 3D shape for faster tests: D, H, W
-        self.tes_dual_echo = [0.0025, 0.0050] # For dual-echo, delta_TE = 0.0025s
-        self.tes_multi_echo = [0.0020, 0.0040, 0.0060, 0.0080] # For multi-echo
+        self.test_shape_3d = (4, 8, 10) # D, H, W
+        self.tes_dual_echo = [0.0025, 0.0050] # delta_TE = 0.0025s
+        self.tes_multi_echo = [0.0020, 0.0040, 0.0060, 0.0080]
         
-        self.low_b0_max_hz = 40.0  # delta_TE * B0_max = 0.0025 * 40 = 0.1. Phase diff = 2*pi*0.1 (no wrap for diff)
-        self.high_b0_max_hz = 220.0 # delta_TE * B0_max = 0.0025 * 220 = 0.55. Phase diff = 2*pi*0.55 (wraps for diff)
+        self.low_b0_max_hz = 40.0  # True phase diff for dual echo will be 2*pi*40*0.0025 = 0.2*pi (no wrap)
+        self.high_b0_max_hz = 220.0 # True phase diff for dual echo will be 2*pi*220*0.0025 = 1.1*pi (would wrap if not pre-unwrapped)
 
-        # Data for low B0 (no wrapping in phase_diff for dual echo)
-        self.phases_low_b0, self.tes_low_b0, self.b0_true_low_b0 = _generate_synthetic_b0_data(
-            shape=self.test_shape_3d, tes_list=self.tes_dual_echo, max_b0_hz=self.low_b0_max_hz, device=self.device, add_spatial_wraps_to_echoes=False
-        )
+        # Data for low B0 (dual echo)
+        self.processed_phases_low_b0, self.tes_low_b0, self.b0_true_low_b0, self.mask_low_b0 = \
+            _generate_synthetic_b0_data_for_refactored_tests(
+                shape=self.test_shape_3d, tes_list=self.tes_dual_echo, 
+                max_b0_hz=self.low_b0_max_hz, device=self.device
+            )
         
-        # Data for high B0 (wrapping in phase_diff for dual echo)
-        self.phases_high_b0, self.tes_high_b0, self.b0_true_high_b0 = _generate_synthetic_b0_data(
-            shape=self.test_shape_3d, tes_list=self.tes_dual_echo, max_b0_hz=self.high_b0_max_hz, device=self.device, add_spatial_wraps_to_echoes=False
-        )
+        # Data for high B0 (dual echo)
+        self.processed_phases_high_b0, self.tes_high_b0, self.b0_true_high_b0, self.mask_high_b0 = \
+            _generate_synthetic_b0_data_for_refactored_tests(
+                shape=self.test_shape_3d, tes_list=self.tes_dual_echo, 
+                max_b0_hz=self.high_b0_max_hz, device=self.device
+            )
 
-        # Data for multi-echo fit (spatially smooth echoes, low B0 for true field)
-        self.phases_multi_smooth, self.tes_multi_smooth, self.b0_true_multi_smooth = _generate_synthetic_b0_data(
-            shape=self.test_shape_3d, tes_list=self.tes_multi_echo, max_b0_hz=self.low_b0_max_hz, device=self.device, add_spatial_wraps_to_echoes=False
-        )
-        
-        # Data for multi-echo fit with SPATIALLY WRAPPED individual echoes (low B0 for true field)
-        self.phases_spatially_wrapped, self.tes_spatially_wrapped, self.b0_true_spatially_wrapped = _generate_synthetic_b0_data(
-            shape=self.test_shape_3d, tes_list=self.tes_multi_echo, max_b0_hz=self.low_b0_max_hz, device=self.device, add_spatial_wraps_to_echoes=True, spatial_wrap_factor=2.0 # Ensure >1pi wraps
-        )
-
-        # Generic mask (all true for these tests, assuming B0 is non-zero everywhere in test data after helper)
-        self.mask_all_true = torch.ones(self.test_shape_3d, dtype=torch.bool, device=self.device)
+        # Data for multi-echo fit
+        self.processed_phases_multi, self.tes_multi, self.b0_true_multi, self.mask_multi = \
+            _generate_synthetic_b0_data_for_refactored_tests(
+                shape=self.test_shape_3d, tes_list=self.tes_multi_echo, 
+                max_b0_hz=self.low_b0_max_hz, device=self.device # Using low B0 for simplicity
+            )
 
     def _assert_b0_map_correctness(self, b0_calculated, b0_true, mask, tolerance_hz=0.5, msg_prefix=""):
         self.assertEqual(b0_calculated.shape, b0_true.shape, f"{msg_prefix}Shape mismatch.")
