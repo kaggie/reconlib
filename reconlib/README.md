@@ -14,18 +14,25 @@ Provides tools for estimating B0 field inhomogeneities from multi-echo MRI data.
 
 ### Phase Unwrapping (`reconlib.phase_unwrapping`)
 Offers algorithms for resolving 3D phase ambiguities.
--   `quality_guided_unwrap.py`: Implements a 3D quality-guided phase unwrapping algorithm (PyTorch-based).
--   `least_squares_unwrap.py`: Implements a 3D least-squares phase unwrapping algorithm via an FFT-based Poisson solver (PyTorch-based).
--   `goldstein_unwrap.py`: Implements a 3D Goldstein-style phase unwrapping algorithm using k-space spectral filtering (PyTorch-based).
+-   `quality_guided_unwrap.py`: Implements a 3D quality-guided spatial phase unwrapping algorithm (PyTorch-based).
+-   `least_squares_unwrap.py`: Implements a 3D least-squares spatial phase unwrapping algorithm via an FFT-based Poisson solver (PyTorch-based).
+-   `goldstein_unwrap.py`: Implements a 3D Goldstein-style spatial phase unwrapping algorithm using k-space spectral filtering (PyTorch-based).
+-   `reference_echo_unwrap.py`: Implements `unwrap_multi_echo_masked_reference` for multi-echo phase unwrapping using a reference echo strategy. This function expects coil-combined input phase and magnitude for each echo and utilizes a user-provided spatial unwrapper. For a full pipeline from multi-coil data, see `preprocess_multi_coil_multi_echo_data` in `reconlib.pipeline_utils`.
 -   `puror.py`: Placeholder for the PUROR algorithm (not yet implemented).
 -   `romeo.py`: Placeholder for the ROMEO algorithm (not yet implemented).
 -   `deep_learning_unwrap.py`: Placeholder for U-Net based phase unwrapping (not yet implemented).
 -   `utils.py`: Utilities for phase unwrapping, including mask generation.
 
-### Data Handling and I/O (`reconlib.data`, `reconlib.utils`, `reconlib.io`)
--   The `MRIData` class in `reconlib.data` has been enhanced to support `echo_times`.
--   `reconlib.utils` now includes `extract_phase`, `extract_magnitude`, and `get_echo_data`.
--   `reconlib.io` contains placeholder functions for ISMRMRD and NIfTI data formats.
+### Data Handling and Preprocessing (`reconlib.data`, `reconlib.utils`, `reconlib.io`, `reconlib.pipeline_utils`)
+-   **Data Representation (`reconlib.data`):**
+    -   The `MRIData` class has been enhanced to support `echo_times`.
+-   **Basic Utilities (`reconlib.utils`):**
+    -   Includes `extract_phase`, `extract_magnitude`, `get_echo_data`.
+    -   `combine_coils_complex_sum`: Combines multi-coil complex data for a single echo via complex sum, returning the combined phase and magnitude. This is a building block for more complex pipelines.
+-   **I/O (`reconlib.io`):**
+    -   Contains placeholder functions for ISMRMRD and NIfTI data formats.
+-   **Pipeline Utilities (`reconlib.pipeline_utils`):**
+    -   `preprocess_multi_coil_multi_echo_data`: A higher-level utility that processes raw multi-coil, multi-echo complex images. It orchestrates coil combination (using `combine_coils_complex_sum`) and advanced multi-echo phase unwrapping (using `unwrap_multi_echo_masked_reference` with a user-provided spatial unwrapper) to produce masked, coil-combined, and unwrapped phase images for each echo.
 
 ### Plotting (`reconlib.plotting`)
 A new module for visualizing MRI data, including:
@@ -44,4 +51,7 @@ A new module for visualizing MRI data, including:
 -   **Reconstructors**: Proximal Gradient based iterative solvers (`reconlib.reconstructors`).
 
 ## Examples
-Example scripts and Jupyter Notebooks demonstrating the use of these modules can be found in the main `examples/` directory of the repository. New Jupyter Notebook examples for 3D phase unwrapping and PyTorch-based B0 mapping are now available.
+Example scripts and Jupyter Notebooks demonstrating the use of these modules can be found in the main `examples/` directory of the repository. New Jupyter Notebook examples include:
+- Demonstrations for 3D spatial phase unwrapping algorithms (`quality_guided_unwrap_3d_example.ipynb`, `least_squares_unwrap_3d_example.ipynb`, `goldstein_unwrap_3d_example.ipynb`).
+- PyTorch-based B0 mapping, including use of unwrapping functions (`b0_mapping_pytorch_example.ipynb`).
+- A comprehensive pipeline for multi-coil, multi-echo data processing (`multi_coil_multi_echo_unwrapping_pipeline_example.ipynb`).

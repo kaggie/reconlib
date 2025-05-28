@@ -45,6 +45,7 @@ from .deeplearning import SimpleWaveletDenoiser, LearnedRegularizationIteration
 from .simulation.toy_datasets import generate_dynamic_phantom_data, generate_nlinv_data_stubs
 
 from . import plotting
+from .pipeline_utils import preprocess_multi_coil_multi_echo_data
 
 
 # Optionally, define __all__ to specify what `from reconlib import *` imports
@@ -72,6 +73,7 @@ __all__ = [
     'generate_dynamic_phantom_data',
     'generate_nlinv_data_stubs',
     'plotting',
+    'preprocess_multi_coil_multi_echo_data',
 ]
 
 # Note: The original __init__.py had imports like:
