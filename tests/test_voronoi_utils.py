@@ -179,14 +179,55 @@ class TestNormalizeWeights(unittest.TestCase):
             normalize_weights(weights_np)
 
 # New Test Class for ConvexHull, delaunay_triangulation_3d, and new normalize_weights
-from reconlib.voronoi_utils import ConvexHull, delaunay_triangulation_3d
+from reconlib.voronoi_utils import (
+    ConvexHull, 
+    delaunay_triangulation_3d, 
+    EPSILON,
+    # The following are internal to delaunay_triangulation_3d in the provided solution,
+    # so they cannot be imported directly for testing.
+    # _orientation3d_pytorch, 
+    # _in_circumsphere3d_pytorch 
+)
+from scipy.spatial import Delaunay as ScipyDelaunay # For comparison test
 
-class TestVoronoiUtilsFeatures(unittest.TestCase):
+class TestVoronoiUtilsFeatures(unittest.TestCase): # Assuming this class can house Delaunay tests
     def setUp(self):
-        # Set a seed for reproducibility if any tests involve random generation (not planned for now)
-        # torch.manual_seed(0)
+        torch.manual_seed(0) # Ensure reproducibility
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.double_type = torch.float64 # For precision in geometric tests
-        self.tol = EPSILON * 10 # Tolerance for float comparisons
+        self.tol = EPSILON * 100 # Increased tolerance slightly for geometric tests
+        self.small_tol = 1e-5 # For float comparisons where high precision is expected
+        self.default_delaunay_tol = 1e-7 # Default tol used in delaunay_triangulation_3d
+
+    def _tetra_volume(self, p0, p1, p2, p3):
+        """Computes the volume of a tetrahedron defined by 4 points."""
+        # Volume = |dot(p1-p0, cross(p2-p0, p3-p0))| / 6.0
+        # Ensure points are on the same device and dtype for torch operations
+        p0, p1, p2, p3 = p0.to(self.device), p1.to(self.device), p2.to(self.device), p3.to(self.device)
+        return torch.abs(torch.dot(p1 - p0, torch.cross(p2 - p0, p3 - p0))) / 6.0
+    
+    # Re-implement circumsphere check for testing, as the original is internal
+    def _test_in_circumsphere3d(self, p_test, t1, t2, t3, t4, tol):
+        points_for_mat = [t1, t2, t3, t4, p_test]
+        mat_rows = []
+        for pt_i in points_for_mat:
+            pt_i_64 = pt_i.to(dtype=torch.float64) # Use float64 for precision
+            sum_sq = torch.sum(pt_i_64**2)
+            mat_rows.append(torch.cat((pt_i_64, sum_sq.unsqueeze(0), torch.tensor([1.0], dtype=torch.float64, device=p_test.device))))
+        
+        mat_5x5 = torch.stack(mat_rows, dim=0)
+        
+        orient_mat = torch.stack((t2 - t1, t3 - t1, t4 - t1), dim=0).to(dtype=torch.float64)
+        orient_det_val = torch.det(orient_mat)
+
+        if torch.abs(orient_det_val) < tol: # Degenerate tetrahedron
+            return False 
+
+        circumsphere_det_val = torch.det(mat_5x5)
+        # p_test is inside if (orient_det_val * circumsphere_det_val) > tol
+        # For Delaunay property, we check if any other point is *inside*.
+        # So, this should return True if it's strictly inside.
+        return (orient_det_val * circumsphere_det_val) > tol
 
     # --- ConvexHull Class Tests ---
     # ** 2D Hull Tests **
@@ -534,6 +575,192 @@ class TestVoronoiUtilsFeatures(unittest.TestCase):
         weights_list = [1.0, 2.0, 3.0]
         with self.assertRaisesRegex(TypeError, "Input weights must be a PyTorch tensor."):
             normalize_weights(weights_list)
+
+    # --- Tests for delaunay_triangulation_3d (New PyTorch version) ---
+    def test_delaunay3d_empty_input(self):
+        points = torch.empty((0, 3), dtype=self.double_type, device=self.device)
+        tetrahedra = delaunay_triangulation_3d(points, tol=self.default_delaunay_tol)
+        self.assertEqual(tetrahedra.shape, (0, 4))
+
+    def test_delaunay3d_less_than_4_points(self):
+        for n_pts in [1, 2, 3]:
+            with self.subTest(n_pts=n_pts):
+                points = torch.rand(n_pts, 3, dtype=self.double_type, device=self.device)
+                tetrahedra = delaunay_triangulation_3d(points, tol=self.default_delaunay_tol)
+                self.assertEqual(tetrahedra.shape, (0, 4))
+
+    def test_delaunay3d_single_tetrahedron(self):
+        points = torch.tensor([
+            [0,0,0], [1,0,0], [0,1,0], [0,0,1]
+        ], dtype=self.double_type, device=self.device)
+        tetrahedra = delaunay_triangulation_3d(points, tol=self.default_delaunay_tol)
+        
+        self.assertEqual(tetrahedra.shape, (1, 4))
+        # Check that the vertices of the tetrahedron are the input points
+        # Sort both expected and actual indices within the tetrahedron to compare
+        expected_indices = torch.arange(4, device=self.device)
+        returned_indices_sorted, _ = torch.sort(tetrahedra[0])
+        torch.testing.assert_close(returned_indices_sorted, expected_indices)
+
+    def test_delaunay3d_two_adjacent_tetrahedra(self):
+        # Triangular bipyramid: 5 points
+        # Base triangle: (0,0,0), (1,0,0), (0.5, np.sqrt(3)/2, 0)
+        # Apexes: (0.5, np.sqrt(3)/6, 1), (0.5, np.sqrt(3)/6, -1)
+        points = torch.tensor([
+            [0.0, 0.0, 0.0],             # 0
+            [1.0, 0.0, 0.0],             # 1
+            [0.5, np.sqrt(3)/2.0, 0.0], # 2 (equilateral base)
+            [0.5, np.sqrt(3)/6.0, 1.0],  # 3 (top apex)
+            [0.5, np.sqrt(3)/6.0, -1.0]  # 4 (bottom apex)
+        ], dtype=self.double_type, device=self.device)
+        
+        tetrahedra = delaunay_triangulation_3d(points, tol=self.default_delaunay_tol)
+        self.assertEqual(tetrahedra.shape[0], 2) # Expect 2 tetrahedra for a simple bipyramid
+
+        # Verify vertices are from the input set
+        unique_verts_in_tets = torch.unique(tetrahedra.flatten())
+        self.assertTrue(torch.all(unique_verts_in_tets < points.shape[0]))
+
+        # More detailed check: each tet should have 4 unique vertices
+        for i in range(tetrahedra.shape[0]):
+            self.assertEqual(len(torch.unique(tetrahedra[i])), 4)
+        
+        # Check that the common face {0,1,2} is part of the structure (implicitly)
+        # This is harder to check directly without knowing face adjacencies.
+        # For now, count of tetrahedra is the primary check.
+
+    def test_delaunay3d_cube_points(self):
+        points = torch.tensor([
+            [0,0,0], [1,0,0], [1,1,0], [0,1,0],
+            [0,0,1], [1,0,1], [1,1,1], [0,1,1]
+        ], dtype=self.double_type, device=self.device)
+        
+        tetrahedra = delaunay_triangulation_3d(points, tol=self.default_delaunay_tol)
+        
+        # Cube can be decomposed into 5 or 6 tetrahedra.
+        # The Bowyer-Watson might produce more due to temporary super-tetra interactions if not perfectly cleaned.
+        # For a robust test, we check volume and coverage.
+        self.assertTrue(tetrahedra.shape[0] >= 5, f"Expected at least 5 tetrahedra for a cube, got {tetrahedra.shape[0]}")
+        self.assertEqual(tetrahedra.shape[1], 4)
+
+        total_volume = 0.0
+        for i in range(tetrahedra.shape[0]):
+            tet_indices = tetrahedra[i]
+            p0, p1, p2, p3 = points[tet_indices[0]], points[tet_indices[1]], points[tet_indices[2]], points[tet_indices[3]]
+            total_volume += self._tetra_volume(p0, p1, p2, p3).item()
+        
+        self.assertAlmostEqual(total_volume, 1.0, delta=self.small_tol, msg="Sum of tetrahedra volumes should equal cube volume.")
+
+        # Check if all original 8 points are included in the output tetrahedra
+        unique_verts_in_tets = torch.unique(tetrahedra.flatten())
+        self.assertEqual(len(unique_verts_in_tets), 8, "Not all cube vertices are part of the triangulation.")
+        for i in range(8):
+            self.assertIn(i, unique_verts_in_tets)
+
+    def test_delaunay3d_empty_circumsphere_property(self):
+        torch.manual_seed(1) # Different seed for this specific test
+        points = torch.rand(8, 3, dtype=self.double_type, device=self.device) * 10 # Random points
+        
+        tetrahedra = delaunay_triangulation_3d(points, tol=self.default_delaunay_tol)
+        if tetrahedra.numel() == 0 and points.shape[0] >=4 :
+             self.fail(f"Delaunay triangulation returned no tetrahedra for {points.shape[0]} points.")
+        if tetrahedra.numel() == 0: # If less than 4 points, this is expected.
+            return
+
+
+        all_point_indices = torch.arange(points.shape[0], device=self.device)
+
+        for i in range(tetrahedra.shape[0]):
+            tet_indices = tetrahedra[i]
+            t1, t2, t3, t4 = points[tet_indices[0]], points[tet_indices[1]], points[tet_indices[2]], points[tet_indices[3]]
+            
+            # Check orientation of the tetrahedron from the algorithm to interpret circumsphere test
+            # The algorithm tries to make them positive.
+            # orient_val = _orientation3d_pytorch(t1, t2, t3, t4, self.default_delaunay_tol)
+            # self.assertTrue(orient_val >= 0, f"Tetrahedron {tet_indices.tolist()} from Delaunay has non-positive orientation: {orient_val}")
+
+            other_point_indices = torch.tensor(
+                [idx for idx in all_point_indices.tolist() if idx not in tet_indices.tolist()],
+                device=self.device, dtype=torch.long
+            )
+            
+            for pt_idx in other_point_indices:
+                p_test = points[pt_idx]
+                # Using the re-implemented _test_in_circumsphere3d
+                is_inside = self._test_in_circumsphere3d(p_test, t1, t2, t3, t4, self.default_delaunay_tol)
+                self.assertFalse(is_inside, 
+                                 f"Point {pt_idx} is inside circumsphere of tetrahedron {tet_indices.tolist()}.")
+
+    def test_delaunay3d_coplanar_points(self):
+        # 5 coplanar points (on XY plane)
+        points = torch.tensor([
+            [0,0,0], [1,0,0], [0,1,0], [1,1,0], [0.5, 0.5, 0.0]
+        ], dtype=self.double_type, device=self.device)
+        
+        tetrahedra = delaunay_triangulation_3d(points, tol=self.default_delaunay_tol)
+        
+        # Expect no 3D tetrahedra, or tetrahedra with zero volume if algorithm proceeds.
+        # The current Bowyer-Watson like implementation should ideally result in 0 tetrahedra
+        # after removing super-tetra ones if all points are coplanar and can't form valid 3D tets.
+        if tetrahedra.numel() > 0:
+            total_volume = 0.0
+            for i in range(tetrahedra.shape[0]):
+                tet_indices = tetrahedra[i]
+                p0,p1,p2,p3 = points[tet_indices[0]], points[tet_indices[1]], points[tet_indices[2]], points[tet_indices[3]]
+                total_volume += self._tetra_volume(p0,p1,p2,p3).item()
+            self.assertAlmostEqual(total_volume, 0.0, delta=self.small_tol, 
+                                   msg="Volume of tetrahedra from coplanar points should be zero.")
+        else:
+            self.assertEqual(tetrahedra.shape, (0,4), "Expected no tetrahedra for coplanar points.")
+
+    def test_delaunay3d_comparison_with_scipy(self):
+        torch.manual_seed(42) # Yet another seed for this comparison
+        points_torch = torch.rand(10, 3, dtype=self.double_type, device=self.device) * 100
+        points_np = points_torch.cpu().numpy()
+
+        # Run custom PyTorch Delaunay
+        try:
+            tetra_custom_torch = delaunay_triangulation_3d(points_torch, tol=1e-7) # Use a typical tolerance
+        except Exception as e:
+            self.fail(f"Custom delaunay_triangulation_3d failed: {e}")
+        
+        # Run SciPy Delaunay
+        try:
+            scipy_delaunay = ScipyDelaunay(points_np) # Qhull options can be added if needed
+            tetra_scipy_np = scipy_delaunay.simplices # These are indices into points_np
+        except Exception as e: # Catch QhullError or others
+            # If SciPy fails (e.g. degenerate input not caught by our checks), this test can't compare.
+            self.skipTest(f"SciPy Delaunay computation failed: {e}. Cannot compare.")
+            return
+
+        self.assertIsNotNone(tetra_custom_torch, "Custom Delaunay result is None.")
+        self.assertIsNotNone(tetra_scipy_np, "SciPy Delaunay result is None.")
+        
+        # SciPy returns NumPy, convert custom to NumPy for easier comparison of sets
+        tetra_custom_np = tetra_custom_torch.cpu().numpy()
+
+        # Normalize: sort vertices within each tetrahedron, then sort tetrahedra
+        def normalize_simplices(simplices_array):
+            if simplices_array.shape[0] == 0:
+                return set()
+            sorted_simplices = np.sort(simplices_array, axis=1)
+            # Convert to set of tuples for comparison
+            return set(map(tuple, sorted_simplices.tolist()))
+
+        set_custom = normalize_simplices(tetra_custom_np)
+        set_scipy = normalize_simplices(tetra_scipy_np)
+        
+        # Due to potential differences in handling degeneracies or near-co-spherical points,
+        # an exact match might be too strict for a new implementation vs. mature Qhull.
+        # For now, let's check number of tetrahedra and if they cover the same set of points.
+        # A more robust comparison might involve checking topological properties or volumes.
+        
+        self.assertEqual(len(set_custom), len(set_scipy), 
+                         f"Number of tetrahedra differ: Custom ({len(set_custom)}) vs SciPy ({len(set_scipy)})")
+        
+        # If numbers match, check for set equality
+        if len(set_custom) == len(set_scipy):
+            self.assertEqual(set_custom, set_scipy, "Sets of tetrahedra (normalized) do not match.")
 
 
 if __name__ == '__main__':

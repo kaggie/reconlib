@@ -627,181 +627,311 @@ class ConvexHull:
             return torch.tensor(0.0, device=self.device, dtype=self.dtype)
 
 
-# Delaunay triangulation function provided in the issue description
-def delaunay_triangulation_3d(points: torch.Tensor, tol: float = 1e-7):
+# --- Delaunay Triangulation 3D: PyTorch Implementation ---
+
+def _orientation3d_pytorch(p1: torch.Tensor, p2: torch.Tensor, p3: torch.Tensor, p4: torch.Tensor, tol: float) -> int:
     """
-    Computes the 3D Delaunay triangulation of a set of points.
-    This function is a placeholder and would typically wrap a robust library
-    or implement a complex algorithm (e.g., Bowyer-Watson or incremental insertion).
-    For the purpose of this integration, it simulates the interface.
+    Determines the orientation of point p4 relative to the plane defined by p1, p2, p3.
+    Uses PyTorch for matrix determinant calculation.
+    Args:
+        p1, p2, p3, p4: 3D points (torch.Tensor of shape (3,)).
+        tol: Tolerance for floating point comparisons.
+    Returns:
+        +1 if p4 is on one side (e.g., "above" if p1,p2,p3 is CCW from above).
+        -1 if p4 is on the other side.
+         0 if p4 is coplanar (within tolerance).
+    """
+    # Ensure points are on the same device and dtype (preferably float64 for precision)
+    # The matrix M is:
+    # | p1x p1y p1z 1 |
+    # | p2x p2y p2z 1 |
+    # | p3x p3y p3z 1 |
+    # | p4x p4y p4z 1 |
+    # The sign of det(M) gives orientation.
+    # Alternatively, det([p2-p1, p3-p1, p4-p1])
+    # We use the latter for simplicity and direct geometric interpretation.
+    
+    mat = torch.stack((p2 - p1, p3 - p1, p4 - p1), dim=0) # Forms a 3x3 matrix
+    # Use float64 for determinant calculation to minimize precision errors
+    det_val = torch.det(mat.to(dtype=torch.float64))
+
+    if torch.abs(det_val) < tol:
+        return 0  # Coplanar
+    elif det_val > 0:
+        return 1   # Positive orientation
+    else:
+        return -1  # Negative orientation
+
+def _in_circumsphere3d_pytorch(p: torch.Tensor, t1: torch.Tensor, t2: torch.Tensor, t3: torch.Tensor, t4: torch.Tensor, tol: float) -> bool:
+    """
+    Checks if point p is inside the circumsphere of the tetrahedron defined by t1, t2, t3, t4.
+    Uses PyTorch for matrix determinant calculation.
+    Args:
+        p: The point to test (torch.Tensor of shape (3,)).
+        t1, t2, t3, t4: Vertices of the tetrahedron (torch.Tensor of shape (3,)).
+        tol: Tolerance for floating point comparisons.
+    Returns:
+        True if p is strictly inside the circumsphere, False otherwise (on or outside).
+    """
+    # Matrix for circumsphere test (using float64 for precision):
+    # | t1x  t1y  t1z  t1x^2+t1y^2+t1z^2  1 |
+    # | t2x  t2y  t2z  t2x^2+t2y^2+t2z^2  1 |
+    # | t3x  t3y  t3z  t3x^2+t3y^2+t3z^2  1 |
+    # | t4x  t4y  t4z  t4x^2+t4y^2+t4z^2  1 |
+    # | px   py   pz   px^2+py^2+pz^2    1 |
+    # Point p is inside if det > 0, assuming t1,t2,t3,t4 has positive orientation (t4 is "above" plane t1,t2,t3).
+    # If orientation is negative, the sign for "inside" flips.
+    # We need a consistent orientation for the tetrahedron vertices t1,t2,t3,t4 when forming this matrix.
+    # Let's assume that the orientation of (t1,t2,t3,t4) (e.g. t4 vs plane t1,t2,t3) is positive.
+    # This means _orientation3d_pytorch(t1,t2,t3,t4) would be +1.
+    
+    # Use float64 for precision
+    points_for_mat = [t1, t2, t3, t4, p]
+    mat_rows = []
+    for pt_i in points_for_mat:
+        pt_i_64 = pt_i.to(dtype=torch.float64)
+        sum_sq = torch.sum(pt_i_64**2)
+        mat_rows.append(torch.cat((pt_i_64, sum_sq.unsqueeze(0), torch.tensor([1.0], dtype=torch.float64, device=p.device))))
+    
+    mat_5x5 = torch.stack(mat_rows, dim=0)
+    
+    # The sign of the determinant needs to be interpreted relative to the orientation of the tetrahedron.
+    # A common way: if orientation(t1,t2,t3,t4) is positive, then det(mat_5x5) > 0 means p is inside.
+    # If orientation(t1,t2,t3,t4) is negative, then det(mat_5x5) < 0 means p is inside.
+    # So, result = sign(orientation_det) * sign(circumsphere_det)
+    
+    # Calculate orientation determinant for the tetrahedron t1,t2,t3,t4
+    # This is det([t2-t1, t3-t1, t4-t1])
+    orient_mat = torch.stack((t2 - t1, t3 - t1, t4 - t1), dim=0).to(dtype=torch.float64)
+    orient_det_val = torch.det(orient_mat)
+
+    # If the base tetrahedron is degenerate (coplanar), the circumsphere is ill-defined or infinite.
+    if torch.abs(orient_det_val) < tol: # Consider this degenerate
+        return False # Or handle as an error / special case. For Delaunay, typically means point is not "strictly" inside.
+
+    circumsphere_det_val = torch.det(mat_5x5)
+
+    # Product of determinants: orient_det_val * circumsphere_det_val
+    # If product > tol, point is inside.
+    # If product < -tol, point is outside.
+    # If abs(product) <= tol, point is on the sphere.
+    # Delaunay requires points to be strictly outside or on (for empty circumsphere criterion).
+    # So, for "bad tetrahedra", we need points *inside*.
+    # The standard test sign depends on the ordering of points in the matrix.
+    # If t1,t2,t3,t4 are oriented positively (t4 above plane t1,t2,t3), then det(M) > 0 means p is inside.
+    # This is equivalent to checking: sign(det(orient_mat)) * det(circumsphere_mat_M_with_p_last) > 0
+    # Let's use the convention from common literature, e.g., Guibas & Stolfi, where the matrix is
+    # constructed with rows [x, y, z, x^2+y^2+z^2, 1].
+    # If the vertices a,b,c,d of the tet are oriented such that det(b-a, c-a, d-a) > 0,
+    # then point p is inside the circumsphere if det(M_abcde) > 0, where M_abcde is the 5x5 matrix with rows for a,b,c,d,e (e=p).
+    # The test should be: orient_det_val * circumsphere_det_val > tol (for strictly inside)
+    
+    # The sign of circumsphere_det_val itself (when point p is the last row)
+    # determines "insideness" if the first 4 points t1,t2,t3,t4 are positively oriented.
+    # So, if orient_det_val > 0, then circumsphere_det_val > tol means p is inside.
+    # If orient_det_val < 0, then circumsphere_det_val < -tol means p is inside (sign flip).
+    # This is equivalent to checking (orient_det_val * circumsphere_det_val) > tol.
+    
+    # For Bowyer-Watson, a tetrahedron is "bad" if the new point is IN its circumsphere.
+    # We want this to return True if p is strictly INSIDE.
+    # If orient_det_val is positive, circumsphere_det_val > tol means inside.
+    # If orient_det_val is negative, circumsphere_det_val < -tol means inside.
+    # This is the same as: (orient_det_val * circumsphere_det_val) > some_epsilon_squared_or_product_tol
+    # However, it's often simplified: fix the orientation of tetrahedra (e.g., always positive),
+    # then the sign of the circumsphere determinant is fixed.
+    
+    # Let's assume tetrahedra are consistently oriented (e.g. orientation(t1,t2,t3,t4) > 0).
+    # Then, p is inside if circumsphere_det_val > tol.
+    # This is a strong assumption for a robust implementation.
+    # For now, let's make it based on the orientation of the tet passed.
+    # If test point is on the same side as origin w.r.t circumcircle (for 2D)
+    # For 3D, standard is: if det(M_rows_abcdp) * det(M_rows_abcd_orient) > 0, then p is inside.
+    # For simplicity, let's assume positive orientation of t1,t2,t3,t4.
+    # The crucial aspect is that all tetrahedra in the list must have THE SAME orientation.
+    # If orient_det_val is used to construct matrix M, its sign is fixed.
+    
+    # Using the convention that a point p is inside the circumsphere of a positively oriented
+    # tetrahedron (a, b, c, d) if the determinant of the matrix with rows (a,b,c,d,p) is positive.
+    # The orientation check for (a,b,c,d) ensures that `d` is on the positive side of plane `abc`.
+    # If we ensure all tetrahedra in our list are positively oriented, then circumsphere_det_val > tol means "inside".
+    return (orient_det_val * circumsphere_det_val) > tol
+
+
+def delaunay_triangulation_3d(points: torch.Tensor, tol: float = 1e-7) -> torch.Tensor:
+    """
+    Computes the 3D Delaunay triangulation of a set of points using a PyTorch-based
+    Bowyer-Watson like incremental algorithm.
 
     Args:
         points (torch.Tensor): Tensor of shape (N, 3) representing N points in 3D.
-        tol (float): Tolerance for geometric computations.
+                               Assumed to be on a consistent device. Dtype should be float.
+        tol (float): Tolerance for geometric computations (e.g., coplanarity, cosphericality).
 
     Returns:
-        torch.Tensor: Tensor of shape (M, 4) where M is the number of tetrahedra (simplices)
-                      in the triangulation. Each row contains the indices of the 4 points
-                      forming a tetrahedron. Returns empty tensor if triangulation fails or
-                      not enough points.
+        torch.Tensor: Tensor of shape (M, 4) where M is the number of tetrahedra.
+                      Each row contains the indices of the 4 points forming a tetrahedron.
+                      Returns empty tensor if triangulation fails or not enough points.
     """
-    n, dim = points.shape
+    n_input_points, dim = points.shape
     device = points.device
-    dtype = points.dtype # Original points dtype, though indices are long
+    original_dtype = points.dtype # Usually float32 or float64
 
     if dim != 3:
         raise ValueError("Input points must be 3-dimensional.")
-    if n < 4:
-        # Not enough points to form a tetrahedron.
-        # SciPy's Delaunay would raise QHullError here.
+    if n_input_points < 4: # Need at least 4 points for any tetrahedron
         return torch.empty((0, 4), dtype=torch.long, device=device)
 
-    # --- Placeholder for actual Delaunay triangulation logic ---
-    # A true PyTorch implementation of 3D Delaunay is highly complex.
-    # Algorithms like Bowyer-Watson involve:
-    # 1. Creating a super-tetrahedron that encloses all points.
-    # 2. Incrementally inserting points:
-    #    a. Find all tetrahedra whose circumspheres contain the new point (bad tetrahedra).
-    #    b. Remove the bad tetrahedra, leaving a star-shaped cavity.
-    #    c. Form new tetrahedra by connecting the new point to the triangular faces of the cavity.
-    # 3. Removing tetrahedra connected to the initial super-tetrahedron.
-    # 4. Handling degeneracies (e.g., cospherical points).
+    # For robustness in geometric predicates, convert points to float64 if not already
+    # This is done internally in predicates if needed, but good to be aware.
+    # points_calc = points.to(dtype=torch.float64) if points.dtype != torch.float64 else points
+    points_calc = points # Predicates will handle internal casting if they choose to.
 
-    # This placeholder will not compute a correct Delaunay triangulation.
-    # It will simulate returning some tetrahedra based on the ConvexHull,
-    # which is NOT the same as Delaunay, but provides a structurally similar output.
-    # For actual Delaunay, a dedicated library (like SciPy's, or a PyTorch-ported one) is needed.
+    # 1. Create Super-Tetrahedron
+    # Find min/max bounds of input points to define super-tetrahedron
+    min_coords = torch.min(points_calc, dim=0).values
+    max_coords = torch.max(points_calc, dim=0).values
+    center = (min_coords + max_coords) / 2.0
+    # Scale factor for super-tetrahedron size, ensure it's large enough
+    # Make it much larger than the bounding box of points
+    diag_len = torch.norm(max_coords - min_coords)
+    if diag_len < tol : diag_len = 1.0 # Handle case of all points being very close / coincident
+    
+    # Define 4 vertices for the super-tetrahedron, far from the point cloud
+    # These are indexed from n_input_points onwards
+    sp_idx_start = n_input_points 
+    # A simple large tetrahedron: one point far in -Y, three points forming a large triangle in +Y
+    # This construction needs to be robust to ensure all points are inside.
+    # A common way is to make a very large tetrahedron.
+    # Let's use a method that ensures points are inside based on their bounding box.
+    # Size of super-tetrahedron should be ~3-5 times the max extent of points.
+    scale_factor_super = max(5.0 * diag_len, 10.0) # Ensure it's reasonably large
 
-    # Using ConvexHull to get some faces, then forming tetrahedra with a central point (highly inaccurate)
-    # This is just to produce output of the correct *shape* and *type*.
-    # DO NOT use this as a real Delaunay triangulation.
-    try:
-        # ConvexHull class is defined in this file.
-        # It uses `monotone_chain_convex_hull_3d` which is also in this file.
-        hull = ConvexHull(points, tol=tol)
-        
-        if hull.simplices is None or hull.simplices.numel() == 0 or hull.vertices.numel() < 4:
-            # print("Warning: Could not form a basic hull for pseudo-Delaunay, returning empty.", file=sys.stderr)
-            return torch.empty((0, 4), dtype=torch.long, device=device)
+    # Super-tetrahedron vertices (example, may need adjustment for robustness)
+    # Using simple large tetrahedron for now. These points are added to the list of points.
+    # Their indices will be n_input_points, n_input_points+1, n_input_points+2, n_input_points+3
+    sp_v0 = center + torch.tensor([-scale_factor_super, -scale_factor_super/2, -scale_factor_super/2], device=device, dtype=original_dtype)
+    sp_v1 = center + torch.tensor([ scale_factor_super, -scale_factor_super/2, -scale_factor_super/2], device=device, dtype=original_dtype)
+    sp_v2 = center + torch.tensor([ 0.0,  scale_factor_super, -scale_factor_super/2], device=device, dtype=original_dtype)
+    sp_v3 = center + torch.tensor([ 0.0,  0.0,  scale_factor_super], device=device, dtype=original_dtype)
+    
+    super_tetra_vertices = torch.stack([sp_v0, sp_v1, sp_v2, sp_v3], dim=0)
+    
+    # Combine original points with super-tetrahedron vertices
+    # All calculations will use indices into this combined list
+    all_points = torch.cat([points_calc, super_tetra_vertices], dim=0)
 
-        # Simplistic approach: form tetrahedra from hull faces and hull centroid
-        # This is NOT a Delaunay triangulation.
-        # It's a trick to get some 4-simplex output.
-        
-        # Calculate a pseudo-centroid of the hull vertices
-        hull_points = points[hull.vertices]
-        if hull_points.numel() == 0:
-             return torch.empty((0, 4), dtype=torch.long, device=device)
-        
-        # Ensure hull_points is not empty before trying to calculate centroid
-        centroid = torch.mean(hull_points.float(), dim=0) 
-        
-        # Add this centroid as a new point, get its index
-        # This is problematic as it modifies the input point set concept
-        # A better mock would be to pick an existing point as the apex.
-        # Let's pick the first vertex of the hull as a common apex for all face-based tetra.
-        
-        if hull.simplices.shape[0] == 0:
-             return torch.empty((0, 4), dtype=torch.long, device=device)
+    # Initial triangulation: one super-tetrahedron. Ensure positive orientation.
+    # Check orientation: _orientation3d_pytorch(sp_v0, sp_v1, sp_v2, sp_v3, tol)
+    # If negative, swap two vertices to make it positive, e.g., sp_v1 and sp_v2.
+    # Indices for this first tet: (n_input_points, n_input_points+1, n_input_points+2, n_input_points+3)
+    st_indices = torch.tensor([sp_idx_start, sp_idx_start + 1, sp_idx_start + 2, sp_idx_start + 3], dtype=torch.long, device=device)
+    
+    # Ensure super-tetrahedron has positive orientation (e.g. p3 is "above" plane p0,p1,p2)
+    # This is crucial for consistent circumsphere tests.
+    p0_st, p1_st, p2_st, p3_st = all_points[st_indices[0]], all_points[st_indices[1]], all_points[st_indices[2]], all_points[st_indices[3]]
+    if _orientation3d_pytorch(p0_st, p1_st, p2_st, p3_st, tol) < 0:
+        st_indices[[1, 2]] = st_indices[[2, 1]] # Swap p1 and p2 to flip orientation
 
-        # Use the first vertex of the *entire hull* as a common apex.
-        # This is still not Delaunay, but avoids adding points.
-        # The `hull.vertices` should be indices of points on the hull.
-        if hull.vertices.numel() == 0: # No hull vertices found
-            return torch.empty((0, 4), dtype=torch.long, device=device)
+    triangulation = [st_indices.tolist()] # List of lists for tetrahedra indices, convert to tensor at end
+
+    # 2. Incremental Point Insertion
+    # Shuffle points for robustness (helps avoid issues with ordered input)
+    # Process original points (indices 0 to n_input_points-1)
+    # Using fixed order for now for predictability in simple tests.
+    # permutation = torch.randperm(n_input_points, device=device)
+    permutation = torch.arange(n_input_points, device=device)
+
+
+    for i_point_orig_idx in range(n_input_points):
+        current_point_idx = permutation[i_point_orig_idx].item() # Actual index in `all_points`
+        current_point_coords = all_points[current_point_idx]
+        
+        bad_tetrahedra_indices = [] # Indices in `triangulation` list
+        
+        # Find bad tetrahedra (those whose circumspheres contain the current_point)
+        for tet_idx, tet_vertex_indices_list in enumerate(triangulation):
+            tet_vertex_indices = torch.tensor(tet_vertex_indices_list, dtype=torch.long, device=device)
+            v1, v2, v3, v4 = all_points[tet_vertex_indices[0]], all_points[tet_vertex_indices[1]], \
+                             all_points[tet_vertex_indices[2]], all_points[tet_vertex_indices[3]]
             
-        # Ensure hull.vertices are valid indices for `points`
-        # `monotone_chain_convex_hull_3d` should return valid indices.
+            # Ensure tetrahedron (v1,v2,v3,v4) has positive orientation for circumsphere test consistency
+            # This should be guaranteed if new tetrahedra are added correctly.
+            # If not, the _in_circumsphere3d_pytorch needs to handle arbitrary orientation (it does via product of dets).
+            if _in_circumsphere3d_pytorch(current_point_coords, v1, v2, v3, v4, tol):
+                bad_tetrahedra_indices.append(tet_idx)
         
-        # Pick an arbitrary point from the hull as a common apex for all tetrahedra.
-        # For example, points[hull.vertices[0]]
-        # This is still not Delaunay, but a simple way to form tetrahedra.
-        # The issue with this is that all tetrahedra would share one point, which is not general.
-        
-        # The provided code for `monotone_chain_convex_hull_3d` (which ConvexHull uses)
-        # returns `final_hull_vertex_indices, final_faces`.
-        # `hull.simplices` are these `final_faces` (M, 3).
-        # `hull.vertices` are `final_hull_vertex_indices`.
-        
-        # A true Delaunay triangulation finds tetrahedra that fill the convex hull of the points.
-        # The number of points N must be at least dim + 1 = 4.
-        # The number of tetrahedra M can be large.
-        
-        # The provided example in the issue for `delaunay_triangulation_3d` implies
-        # it might be based on `scipy.spatial.Delaunay`.
-        # Since we cannot use SciPy directly here for the core logic,
-        # and a PyTorch Delaunay is too complex to write from scratch,
-        # this function remains a structural placeholder.
-        
-        # Let's return a structure that implies some tetrahedra were found,
-        # using the convex hull faces and connecting them to an arbitrary *additional* point
-        # (conceptually, as we only return indices).
-        # This is still not Delaunay.
-        # A robust solution would require a proper algorithm.
-        
-        # For a placeholder, if we have N points, and K hull faces (triangles),
-        # we could try to form K tetrahedra by picking a 4th point for each face.
-        # This is highly non-trivial to do correctly to satisfy Delaunay criteria.
+        if not bad_tetrahedra_indices: # Point is likely duplicate or outside all circumspheres (should not happen with super-tetra)
+            continue
 
-        # Given the constraints, the most reasonable placeholder is to acknowledge
-        # that a full Delaunay implementation is not provided, and return empty or a minimal structure.
-        # The original `ConvexHull`'s `_convex_hull_3d` used SciPy and could return `hull_scipy.simplices`
-        # which are faces. Delaunay needs tetrahedra.
+        # Remove bad tetrahedra and find boundary faces of the cavity
+        # Boundary faces are those faces of bad tetrahedra that are not shared by another bad tetrahedron.
+        boundary_faces = [] # List of faces (each face is a list of 3 vertex indices)
+        face_counts = {} # To count occurrences of faces
+
+        for tet_idx in bad_tetrahedra_indices:
+            tet = triangulation[tet_idx] # List of 4 vertex indices
+            # Faces of this tetrahedron (local indices for tet, then map to global `all_points` indices)
+            faces_of_tet = [
+                sorted([tet[0], tet[1], tet[2]]), # Sort indices within face for unique key
+                sorted([tet[0], tet[1], tet[3]]),
+                sorted([tet[0], tet[2], tet[3]]),
+                sorted([tet[1], tet[2], tet[3]])
+            ]
+            for face_nodes_sorted_list in faces_of_tet:
+                face_tuple = tuple(face_nodes_sorted_list)
+                face_counts[face_tuple] = face_counts.get(face_tuple, 0) + 1
         
-        # If the goal is to just have a function that *runs* and returns the right shape:
-        # We can try to make a few dummy tetrahedra if enough unique points.
-        # Example: if n >= 4, take the first 4 points as one tetrahedron.
-        if n >= 4:
-            # Try to find 4 unique points among the first few points to form a single tetrahedron.
-            # This is a very minimal placeholder.
-            unique_initial_indices = torch.unique(points[:min(n, 10)], dim=0, return_inverse=False) # Look among first 10 points
+        for face_tuple, count in face_counts.items():
+            if count == 1: # This face is on the boundary of the cavity
+                boundary_faces.append(list(face_tuple)) # Keep as list of vertex indices
+
+        # Remove bad tetrahedra (iterate backwards to preserve indices)
+        for tet_idx in sorted(bad_tetrahedra_indices, reverse=True):
+            triangulation.pop(tet_idx)
             
-            # Find indices of these unique points in the original 'points' tensor
-            # This is tricky. Let's assume the first 4 points are sufficiently distinct for a placeholder.
-            # Or, use the vertices from ConvexHull if available and form one tetrahedron.
+        # Create new tetrahedra by connecting current_point to boundary_faces
+        for face_nodes_list in boundary_faces: # face_nodes_list has 3 vertex indices from all_points
+            new_tet_nodes = face_nodes_list + [current_point_idx]
             
-            if hull.vertices.numel() >= 4:
-                # Form one tetrahedron from the first 4 hull vertices.
-                # These are indices into the original `points` tensor.
-                tetra = hull.vertices[:4].reshape(1, 4) # Take first 4, ensure unique if possible
-                # Ensure they are indeed unique indices
-                if len(torch.unique(tetra[0])) == 4:
-                     return tetra.to(dtype=torch.long) # Ensure long type for indices
-                else: # Fallback if first 4 hull vertices are not unique (degenerate hull)
-                    # Try to pick first 4 unique points from input if possible
-                    if n >=4: # Redundant check, but for clarity
-                        # Create a list of the first 4 indices [0,1,2,3]
-                        # This assumes points[0]...points[3] are non-degenerate enough
-                        # to form a valid tetrahedron for placeholder purposes.
-                        # A robust check for non-coplanarity would be needed for a real algorithm.
-                        first_four_indices = torch.arange(4, device=device, dtype=torch.long).reshape(1,4)
-                        # Basic check: ensure points are not all identical
-                        if len(torch.unique(points[first_four_indices[0]], dim=0)) == 4 :
-                            return first_four_indices
-                        else: # If even the first 4 points are degenerate
-                             return torch.empty((0, 4), dtype=torch.long, device=device)
-
-
-            elif n >= 4: # Not enough hull vertices, but enough input points
-                # Fallback: take first 4 input points indices [0,1,2,3]
-                # This is a very weak placeholder.
-                # Check for point degeneracy for these first 4 points
-                if len(torch.unique(points[torch.arange(4, device=device)], dim=0)) < 4:
-                    # print("Warning: First 4 input points are degenerate, cannot form placeholder tetrahedron.", file=sys.stderr)
-                    return torch.empty((0, 4), dtype=torch.long, device=device)
+            # Ensure new tetrahedron is correctly oriented (e.g., new point is "above" the face)
+            # The face_nodes_list defines a triangle. We need its orientation relative to the cavity.
+            # A robust way: orient new_tet so that current_point_idx is on the positive side of the plane of face_nodes_list,
+            # assuming face_nodes_list was oriented "outward" from the cavity.
+            # More simply, check orientation(p1,p2,p3, current_point_idx). If negative, swap two vertices in face.
+            p1_face, p2_face, p3_face = all_points[face_nodes_list[0]], all_points[face_nodes_list[1]], all_points[face_nodes_list[2]]
+            
+            # Check orientation of new_tet = (p1_face, p2_face, p3_face, current_point_coords)
+            # If orientation is not positive, adjust one face edge to flip it.
+            # E.g., use (face_nodes_list[0], face_nodes_list[1], face_nodes_list[2], current_point_idx)
+            # If orientation(p1f,p2f,p3f, current_pt) < 0, then use (p1f,p3f,p2f, current_pt)
+            # This means new_tet_nodes would be [face_nodes_list[0], face_nodes_list[2], face_nodes_list[1], current_point_idx]
+            
+            current_orientation = _orientation3d_pytorch(p1_face, p2_face, p3_face, current_point_coords, tol)
+            if current_orientation == 0: # Degenerate tetrahedron (point coplanar with face)
+                continue # Skip this degenerate tetrahedron
+            
+            if current_orientation < 0: # Flip two vertices in the base face to ensure positive orientation
+                new_tet_final_nodes = [face_nodes_list[0], face_nodes_list[2], face_nodes_list[1], current_point_idx]
+            else:
+                new_tet_final_nodes = new_tet_nodes
                 
-                return torch.arange(4, device=device, dtype=torch.long).reshape(1, 4)
-            else: # Not enough points (n < 4), already handled, but as a safeguard here
-                return torch.empty((0, 4), dtype=torch.long, device=device)
+            triangulation.append(new_tet_final_nodes)
 
-        # If hull computation itself failed to produce simplices (should be rare if n>=4)
-        # print("Warning: Hull computation for pseudo-Delaunay did not yield simplices.", file=sys.stderr)
+    # 3. Finalization: Remove tetrahedra connected to super-tetrahedron vertices
+    final_triangulation = []
+    for tet_nodes_list in triangulation:
+        is_super_tet = False
+        for node_idx in tet_nodes_list:
+            if node_idx >= n_input_points: # This vertex is part of the super-tetrahedron
+                is_super_tet = True
+                break
+        if not is_super_tet:
+            final_triangulation.append(tet_nodes_list)
+            
+    if not final_triangulation: # If all tetrahedra involved super-vertices (e.g. very few input points)
         return torch.empty((0, 4), dtype=torch.long, device=device)
-
-    except Exception as e:
-        # Catch any error during the placeholder logic (e.g. from ConvexHull if points are very degenerate)
-        # print(f"Error in placeholder Delaunay triangulation: {e}", file=sys.stderr)
-        return torch.empty((0, 4), dtype=torch.long, device=device)
+        
+    return torch.tensor(final_triangulation, dtype=torch.long, device=device)
 
 
 def compute_polygon_area(points: torch.Tensor) -> float:

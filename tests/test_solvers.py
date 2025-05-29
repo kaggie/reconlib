@@ -2,11 +2,33 @@ import unittest
 import torch
 import numpy as np # For phantom creation if needed simply
 
-from reconlib.solvers import iterative_reconstruction
+from reconlib.solvers import (
+    iterative_reconstruction, 
+    conjugate_gradient_reconstruction,
+    fista_reconstruction,
+    admm_reconstruction
+)
 from reconlib.nufft import NUFFT2D # Using NUFFT2D for testing
 from reconlib.utils import calculate_density_compensation # For generating Voronoi weights
 
-class TestIterativeReconstruction(unittest.TestCase):
+# Simple L1 Regularizer for testing FISTA and ADMM
+class SimpleL1Regularizer:
+    def __init__(self):
+        pass # No state needed for basic L1
+
+    def proximal_operator(self, data: torch.Tensor, step_size: float) -> torch.Tensor:
+        # Soft-thresholding for complex data
+        # Threshold is step_size (which incorporates lambda_reg)
+        # S_t(x) = sign(x) * max(|x| - t, 0)
+        # For complex: x / |x| * max(|x| - t, 0) = x * max(1 - t/|x|, 0)
+        
+        abs_data = torch.abs(data)
+        # Avoid division by zero for |x| if data is zero
+        # Add 1e-9 to abs_data in denominator to prevent division by zero if abs_data is exactly zero.
+        scale = torch.clamp(1.0 - step_size / (abs_data + 1e-9), min=0.0)
+        return data * scale
+
+class TestSolvers(unittest.TestCase): # Renamed class for broader scope
 
     def setUp(self):
         torch.manual_seed(0)
@@ -172,6 +194,166 @@ class TestIterativeReconstruction(unittest.TestCase):
         )
         self.assertEqual(recon_loose_tol.shape, self.image_shape_2d)
         self.assertFalse(torch.isnan(recon_loose_tol).any())
+
+    # --- Tests for conjugate_gradient_reconstruction ---
+    def test_cg_recon_2d_basic(self):
+        reconstructed_image = conjugate_gradient_reconstruction(
+            kspace_data=self.kspace_data,
+            sampling_points=self.sampling_points,
+            image_shape=self.image_shape_2d,
+            nufft_operator_class=NUFFT2D,
+            nufft_kwargs=self.nufft_kwargs,
+            use_voronoi=False,
+            max_iters=5 # Few iterations for speed
+        )
+        self.assertEqual(reconstructed_image.shape, self.image_shape_2d)
+        self.assertEqual(reconstructed_image.dtype, self.dtype_complex)
+        self.assertTrue(torch.sum(torch.abs(reconstructed_image)) > 1e-6, "CG basic reconstruction is all zeros.")
+        self.assertFalse(torch.isnan(reconstructed_image).any(), "CG basic reconstruction contains NaNs.")
+
+    def test_cg_recon_2d_voronoi(self):
+        bounds_min = self.sampling_points.min(dim=0).values - 0.1
+        bounds_max = self.sampling_points.max(dim=0).values + 0.1
+        bounds = torch.stack([bounds_min, bounds_max]).to(self.device, dtype=self.dtype_real)
+
+        voronoi_weights = calculate_density_compensation(
+            k_trajectory=self.sampling_points,
+            image_shape=self.image_shape_2d,
+            method='voronoi',
+            device=self.device,
+            bounds=bounds
+        )
+        reconstructed_image = conjugate_gradient_reconstruction(
+            kspace_data=self.kspace_data,
+            sampling_points=self.sampling_points,
+            image_shape=self.image_shape_2d,
+            nufft_operator_class=NUFFT2D,
+            nufft_kwargs=self.nufft_kwargs,
+            use_voronoi=True,
+            voronoi_weights=voronoi_weights,
+            max_iters=5
+        )
+        self.assertEqual(reconstructed_image.shape, self.image_shape_2d)
+        self.assertEqual(reconstructed_image.dtype, self.dtype_complex)
+        self.assertTrue(torch.sum(torch.abs(reconstructed_image)) > 1e-6, "CG Voronoi reconstruction is all zeros.")
+        self.assertFalse(torch.isnan(reconstructed_image).any(), "CG Voronoi reconstruction contains NaNs.")
+
+    # --- Tests for fista_reconstruction ---
+    def test_fista_recon_2d_l1(self):
+        regularizer = SimpleL1Regularizer()
+        lambda_reg = 0.001 # Small regularization
+        line_search_params = {'beta': 2.0, 'max_ls_iter': 10, 'initial_L': 1.0}
+
+        reconstructed_image = fista_reconstruction(
+            kspace_data=self.kspace_data,
+            sampling_points=self.sampling_points,
+            image_shape=self.image_shape_2d,
+            nufft_operator_class=NUFFT2D,
+            nufft_kwargs=self.nufft_kwargs,
+            regularizer=regularizer,
+            lambda_reg=lambda_reg,
+            use_voronoi=False,
+            max_iters=5, # Few iterations for speed
+            line_search_params=line_search_params
+        )
+        self.assertEqual(reconstructed_image.shape, self.image_shape_2d)
+        self.assertEqual(reconstructed_image.dtype, self.dtype_complex)
+        self.assertTrue(torch.sum(torch.abs(reconstructed_image)) > 1e-6, "FISTA L1 reconstruction is all zeros.")
+        self.assertFalse(torch.isnan(reconstructed_image).any(), "FISTA L1 reconstruction contains NaNs.")
+
+    def test_fista_recon_2d_l1_voronoi(self):
+        regularizer = SimpleL1Regularizer()
+        lambda_reg = 0.001
+        line_search_params = {'beta': 2.0, 'max_ls_iter': 10, 'initial_L': 1.0}
+        
+        bounds_min = self.sampling_points.min(dim=0).values - 0.1
+        bounds_max = self.sampling_points.max(dim=0).values + 0.1
+        bounds = torch.stack([bounds_min, bounds_max]).to(self.device, dtype=self.dtype_real)
+        
+        voronoi_weights = calculate_density_compensation(
+            k_trajectory=self.sampling_points,
+            image_shape=self.image_shape_2d,
+            method='voronoi',
+            device=self.device,
+            bounds=bounds
+        )
+        reconstructed_image = fista_reconstruction(
+            kspace_data=self.kspace_data,
+            sampling_points=self.sampling_points,
+            image_shape=self.image_shape_2d,
+            nufft_operator_class=NUFFT2D,
+            nufft_kwargs=self.nufft_kwargs,
+            regularizer=regularizer,
+            lambda_reg=lambda_reg,
+            use_voronoi=True,
+            voronoi_weights=voronoi_weights,
+            max_iters=5,
+            line_search_params=line_search_params
+        )
+        self.assertEqual(reconstructed_image.shape, self.image_shape_2d)
+        self.assertEqual(reconstructed_image.dtype, self.dtype_complex)
+        self.assertTrue(torch.sum(torch.abs(reconstructed_image)) > 1e-6, "FISTA L1 Voronoi reconstruction is all zeros.")
+        self.assertFalse(torch.isnan(reconstructed_image).any(), "FISTA L1 Voronoi reconstruction contains NaNs.")
+
+    # --- Tests for admm_reconstruction ---
+    def test_admm_recon_2d_l1(self):
+        regularizer = SimpleL1Regularizer()
+        lambda_reg = 0.001
+        rho = 0.5 # ADMM penalty parameter
+
+        reconstructed_image = admm_reconstruction(
+            kspace_data=self.kspace_data,
+            sampling_points=self.sampling_points,
+            image_shape=self.image_shape_2d,
+            nufft_operator_class=NUFFT2D,
+            nufft_kwargs=self.nufft_kwargs,
+            regularizer=regularizer,
+            lambda_reg=lambda_reg,
+            rho=rho,
+            use_voronoi=False,
+            max_iters=5, # Few iterations for speed
+            cg_max_iters_x_update=3 # Keep CG iterations low for speed
+        )
+        self.assertEqual(reconstructed_image.shape, self.image_shape_2d)
+        self.assertEqual(reconstructed_image.dtype, self.dtype_complex)
+        self.assertTrue(torch.sum(torch.abs(reconstructed_image)) > 1e-6, "ADMM L1 reconstruction is all zeros.")
+        self.assertFalse(torch.isnan(reconstructed_image).any(), "ADMM L1 reconstruction contains NaNs.")
+
+    def test_admm_recon_2d_l1_voronoi(self):
+        regularizer = SimpleL1Regularizer()
+        lambda_reg = 0.001
+        rho = 0.5
+
+        bounds_min = self.sampling_points.min(dim=0).values - 0.1
+        bounds_max = self.sampling_points.max(dim=0).values + 0.1
+        bounds = torch.stack([bounds_min, bounds_max]).to(self.device, dtype=self.dtype_real)
+
+        voronoi_weights = calculate_density_compensation(
+            k_trajectory=self.sampling_points,
+            image_shape=self.image_shape_2d,
+            method='voronoi',
+            device=self.device,
+            bounds=bounds
+        )
+        reconstructed_image = admm_reconstruction(
+            kspace_data=self.kspace_data,
+            sampling_points=self.sampling_points,
+            image_shape=self.image_shape_2d,
+            nufft_operator_class=NUFFT2D,
+            nufft_kwargs=self.nufft_kwargs,
+            regularizer=regularizer,
+            lambda_reg=lambda_reg,
+            rho=rho,
+            use_voronoi=True,
+            voronoi_weights=voronoi_weights,
+            max_iters=5,
+            cg_max_iters_x_update=3
+        )
+        self.assertEqual(reconstructed_image.shape, self.image_shape_2d)
+        self.assertEqual(reconstructed_image.dtype, self.dtype_complex)
+        self.assertTrue(torch.sum(torch.abs(reconstructed_image)) > 1e-6, "ADMM L1 Voronoi reconstruction is all zeros.")
+        self.assertFalse(torch.isnan(reconstructed_image).any(), "ADMM L1 Voronoi reconstruction contains NaNs.")
+
 
 if __name__ == '__main__':
     unittest.main()
