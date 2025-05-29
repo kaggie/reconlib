@@ -11,13 +11,13 @@ from .operators import (Operator, NUFFTOperator, CoilSensitivityOperator,
 #                            SparsityTransform, TVRegularizer, GradientMatchingRegularizer)
 # Updated import for regularizers to reflect their new structure
 from .regularizers.base import Regularizer
-from .regularizers.common import L1Regularizer, L2Regularizer, TVRegularizer
+from .regularizers.common import L1Regularizer, L2Regularizer, TVRegularizer, NonnegativityConstraint, HuberRegularizer, CharbonnierRegularizer
 from .regularizers.functional import SparsityTransform # Assuming functional.py holds this
 # GradientMatchingRegularizer might be in common or its own file, adjust as needed.
 # For now, assuming it might be in common or needs specific import if elsewhere.
 # If GradientMatchingRegularizer is in common.py, L1Regularizer etc. are there too.
 
-from .optimizers import Optimizer, FISTA, ADMM
+from .optimizers import Optimizer, FISTA, ADMM, OrderedSubsetsExpectationMaximization, PenalizedLikelihoodReconstruction
 # from .reconstructors import (Reconstructor, IterativeReconstructor, 
 #                              RegriddingReconstructor, ConstrainedReconstructor)
 # Updated import for reconstructors from the new submodule
@@ -29,6 +29,16 @@ from .reconstructors import ProximalGradientReconstructor, POCSENSEreconstructor
 
 from .utils import calculate_density_compensation
 from .csm import estimate_csm_from_central_kspace
+from .io import DICOMIO # Added DICOMIO
+
+# New PET/CT specific modules
+from .geometry import ScannerGeometry, SystemMatrix
+from .projectors import ForwardProjector, BackwardProjector
+from .physics import AttenuationCorrection, ScatterCorrection, DetectorResponseModel
+from .pet_ct_preprocessing import normalize_counts, randoms_correction, normalize_projection_data
+from .pet_ct_pipeline import ReconstructionPipeline, convergence_monitor, metrics_calculator
+from .pet_ct_simulation import PhantomGenerator, simulate_projection_data
+
 
 from .coil_combination import (
     coil_combination_with_phase,
@@ -60,7 +70,9 @@ from .plotting import (
     plot_voronoi_diagram_2d,
     plot_density_weights_2d,
     plot_voronoi_diagram_3d_slice,
-    plot_density_weights_3d_slice
+    plot_density_weights_3d_slice,
+    plot_projection_data,       # Added
+    visualize_reconstruction    # Added
 )
 from .pipeline_utils import preprocess_multi_coil_multi_echo_data
 
@@ -72,10 +84,10 @@ from .voronoi_utils import normalize_weights
 
 # Optionally, define __all__ to specify what `from reconlib import *` imports
 __all__ = [
-    'MRIData',
+    'MRIData', 'DICOMIO', # Added DICOMIO
     'Operator', 'NUFFTOperator', 'CoilSensitivityOperator', 'MRIForwardOperator', 'SlidingWindowNUFFTOperator',
-    'Regularizer', 'L1Regularizer', 'L2Regularizer', 'SparsityTransform', 'TVRegularizer', # 'GradientMatchingRegularizer',
-    'Optimizer', 'FISTA', 'ADMM',
+    'Regularizer', 'L1Regularizer', 'L2Regularizer', 'SparsityTransform', 'TVRegularizer', 'NonnegativityConstraint', 'HuberRegularizer', 'CharbonnierRegularizer', # Added NonnegativityConstraint etc.
+    'Optimizer', 'FISTA', 'ADMM', 'OrderedSubsetsExpectationMaximization', 'PenalizedLikelihoodReconstruction', # Added OSEM, PLR
     # 'Reconstructor', 'IterativeReconstructor', 'RegriddingReconstructor', 'ConstrainedReconstructor', # Old reconstructors
     'ProximalGradientReconstructor', # New reconstructor
     'POCSENSEreconstructor',         # New reconstructor
@@ -113,5 +125,15 @@ __all__ = [
     "plot_density_weights_2d",
     "plot_voronoi_diagram_3d_slice",
     "plot_density_weights_3d_slice",
+    "plot_projection_data",       # Added
+    "visualize_reconstruction",   # Added
+
+    # PET/CT specific additions
+    'ScannerGeometry', 'SystemMatrix',
+    'ForwardProjector', 'BackwardProjector',
+    'AttenuationCorrection', 'ScatterCorrection', 'DetectorResponseModel',
+    'normalize_counts', 'randoms_correction', 'normalize_projection_data',
+    'ReconstructionPipeline', 'convergence_monitor', 'metrics_calculator',
+    'PhantomGenerator', 'simulate_projection_data',
 ]
 
