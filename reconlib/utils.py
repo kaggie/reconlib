@@ -3,6 +3,7 @@
 import numpy as np
 import torch
 from .data import MRIData # For type hinting and usage in get_echo_data
+from .voronoi_utils import compute_voronoi_density_weights
 
 
 def extract_phase(complex_data: np.ndarray) -> np.ndarray:
@@ -121,9 +122,18 @@ def calculate_density_compensation(k_trajectory, image_shape, method='radial_sim
         return dcf.to(device)
         
     elif method == 'voronoi':
-        print("Warning: Voronoi DCF (method='voronoi') not yet implemented. "
-              "Returning uniform weights (ones).")
-        return torch.ones(k_trajectory.shape[0], device=device, dtype=torch.float32)
+        # New logic:
+        # Extract 'bounds' from kwargs if present
+        bounds = kwargs.get('bounds', None) 
+        if bounds is not None:
+            # Ensure bounds is a tensor on the same device and dtype as k_trajectory for consistency,
+            # although compute_voronoi_density_weights will handle CPU conversion for SciPy.
+            bounds = torch.as_tensor(bounds, device=k_trajectory.device, dtype=k_trajectory.dtype)
+
+        # compute_voronoi_density_weights handles device of k_trajectory (points)
+        # and returns weights on the original device of its input 'points'.
+        # k_trajectory is already on the 'device' specified at the start of calculate_density_compensation.
+        return compute_voronoi_density_weights(points=k_trajectory, bounds=bounds)
         
     else:
         raise NotImplementedError(f"Density compensation method '{method}' is not implemented.")

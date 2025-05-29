@@ -209,4 +209,3 @@ if __name__ == '__main__':
 
     print("\nAll MultiCoilNUFFTOperator tests passed successfully.")
 
-```

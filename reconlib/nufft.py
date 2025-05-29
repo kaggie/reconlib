@@ -14,6 +14,7 @@ class NUFFT(abc.ABC):
                  Ld: tuple[int, ...],
                  kb_m: tuple[float, ...] | None = None,
                  Kd: tuple[int, ...] | None = None,
+                 density_comp_weights: torch.Tensor = None, # New parameter
                  device: str | torch.device = 'cpu'):
         """
         Initialize the NUFFT operator with MIRT-style parameters.
@@ -29,6 +30,9 @@ class NUFFT(abc.ABC):
                   Defaults to (0.0,) * len(kb_J) if None.
             Kd: Oversampled grid dimensions (e.g., (512, 512)). 
                   If None, calculated as tuple(int(N * os) for N, os in zip(image_shape, oversamp_factor)).
+            density_comp_weights (torch.Tensor, optional): Precomputed density compensation weights.
+                                                           Shape should match the number of k-space points.
+                                                           Defaults to None.
             device: Computation device ('cpu' or 'cuda').
         """
         super().__init__()
@@ -57,6 +61,33 @@ class NUFFT(abc.ABC):
             self.k_trajectory = torch.tensor(k_trajectory, dtype=torch.float32, device=self.device)
         else:
             self.k_trajectory = k_trajectory.to(self.device)
+
+        if density_comp_weights is not None:
+            if not isinstance(density_comp_weights, torch.Tensor):
+                raise TypeError("density_comp_weights must be a PyTorch Tensor.")
+            
+            # Determine the number of k-space points from k_trajectory for validation
+            # k_trajectory is expected to be (num_total_k_points, num_dims) after potential reshaping by user
+            num_k_points_in_traj = self.k_trajectory.shape[0]
+            if self.k_trajectory.ndim > 2 : # e.g. (shots, samples_per_shot, D)
+                # If k_trajectory is multi-dimensional beyond (N,D), this check assumes
+                # density_comp_weights matches the first dimension, or it needs to be flattened
+                # by the caller to match a flattened k_trajectory.
+                # The iterative_reconstruction passes sampling_points as (N,d) and weights as (N,).
+                # So, this condition is less likely with current iterative_reconstruction.
+                pass
+
+            if density_comp_weights.ndim == 0 or density_comp_weights.shape[0] != num_k_points_in_traj:
+                 # Basic check for 1D and matching first dimension.
+                 # Does not cover all k_trajectory shape possibilities (e.g. if k_trajectory is not yet flattened)
+                raise ValueError(
+                    f"density_comp_weights must be a 1D tensor with length matching the number of "
+                    f"k-space points ({num_k_points_in_traj}), got shape {density_comp_weights.shape}."
+                )
+            # Store as float32, as DCWs are typically real-valued scaling factors.
+            self.density_comp_weights = density_comp_weights.to(device=self.device, dtype=torch.float32)
+        else:
+            self.density_comp_weights = None
 
         # Validations for tuple lengths
         num_dims = len(self.image_shape)
@@ -119,6 +150,7 @@ class NUFFT2D(NUFFT):
                  Ld: tuple[int, int],
                  kb_m: tuple[float, float] | None = None,
                  Kd: tuple[int, int] | None = None,
+                 density_comp_weights: torch.Tensor = None, # New parameter
                  device: str | torch.device = 'cpu'):
         
         super().__init__(image_shape=image_shape, 
@@ -128,7 +160,8 @@ class NUFFT2D(NUFFT):
                          kb_alpha=kb_alpha, 
                          kb_m=kb_m, 
                          Ld=Ld, 
-                         Kd=Kd, 
+                         Kd=Kd,
+                         density_comp_weights=density_comp_weights, # Pass to parent
                          device=device)
 
         if len(self.image_shape) != 2: # This check is also in parent, but good for explicitness
@@ -204,11 +237,17 @@ class NUFFT2D(NUFFT):
     def adjoint(self, kspace_data: torch.Tensor) -> torch.Tensor:
         """
         Apply the adjoint NUFFT operation (k-space to image) for 2D.
+        If `density_comp_weights` were provided at initialization, they are used.
+        Otherwise, a simple radial density compensation is estimated and applied.
         """
         if kspace_data.ndim != 1: # Assuming k_trajectory is (num_k_points, 2)
             raise ValueError(f"Expected kspace_data to be 1D (num_k_points,), got shape {kspace_data.shape}")
         
         kspace_data = kspace_data.to(self.device) # Ensure data is on correct device
+        # Ensure kspace_data is complex, as it should be for NUFFT input
+        if not kspace_data.is_complex(): # This should ideally be handled by caller or checked more strictly
+            kspace_data = kspace_data.to(torch.complex64)
+            
         kx, ky = self.k_trajectory[:, 0], self.k_trajectory[:, 1]
         
         Nx, Ny = self.image_shape
@@ -220,8 +259,12 @@ class NUFFT2D(NUFFT):
         kx_scaled = (kx + 0.5) * Nx_oversamp 
         ky_scaled = (ky + 0.5) * Ny_oversamp
 
-        dcf = self._estimate_density_compensation(kx, ky).to(self.device)
-        kspace_data_weighted = kspace_data * dcf # Element-wise multiplication
+        if self.density_comp_weights is not None:
+            # self.density_comp_weights is already on self.device and float32
+            kspace_data_weighted = kspace_data * self.density_comp_weights 
+        else:
+            dcf = self._estimate_density_compensation(kx, ky).to(self.device)
+            kspace_data_weighted = kspace_data * dcf # Element-wise multiplication
         
         grid = torch.zeros((Nx_oversamp, Ny_oversamp), dtype=torch.complex64, device=self.device)
         weight_grid = torch.zeros((Nx_oversamp, Ny_oversamp), dtype=torch.float32, device=self.device)
@@ -343,6 +386,7 @@ class NUFFT3D(NUFFT):
                  Kd: tuple[int, int, int] | None = None,
                  n_shift: tuple[float, float, float] | None = None,
                  interpolation_order: int = 1,
+                 density_comp_weights: torch.Tensor = None, # New parameter
                  device: str | torch.device = 'cpu'):
         
         super().__init__(image_shape=image_shape, 
@@ -352,7 +396,8 @@ class NUFFT3D(NUFFT):
                          kb_alpha=kb_alpha, 
                          kb_m=kb_m, 
                          Ld=Ld, 
-                         Kd=Kd, 
+                         Kd=Kd,
+                         density_comp_weights=density_comp_weights, # Pass to parent
                          device=device)
 
         if len(self.image_shape) != 3:
@@ -747,10 +792,9 @@ class NUFFT3D(NUFFT):
         """
         Apply the adjoint NUFFT operation (k-space to image) for 3D using table-based gridding.
 
-        Note on Density Compensation (DCF): This method, similar to MIRT's nufft_adj,
-        does NOT internally apply density compensation. If DCF is required, the input
-        `kspace_data` should be pre-multiplied by the DCF weights by the user.
-        E.g., `dcf_kspace_data = kspace_data * dcf_weights; output_image = nufft_op.adjoint(dcf_kspace_data)`.
+        If `density_comp_weights` were provided during initialization, they are applied to
+        `kspace_data` at the beginning of this method. Otherwise, no density compensation
+        is applied by this method.
         """
         # 1. Input Validation
         if kspace_data.ndim != 1:
@@ -759,16 +803,21 @@ class NUFFT3D(NUFFT):
             raise ValueError(f"Input kspace_data shape {kspace_data.shape[0]} must match k_trajectory points {self.k_trajectory.shape[0]}")
         if kspace_data.device != self.device:
             kspace_data = kspace_data.to(self.device)
-        if not kspace_data.is_complex():
+        if not kspace_data.is_complex(): # Ensure input is complex
             kspace_data = kspace_data.to(torch.complex64)
 
-        # 2. Density Compensation (User responsibility - see docstring)
+        # 2. Apply Density Compensation (if provided)
+        if self.density_comp_weights is not None:
+            # self.density_comp_weights is already on self.device and float32
+            kspace_data_processed = kspace_data * self.density_comp_weights
+        else:
+            kspace_data_processed = kspace_data # No DCF applied if not provided
         
         # 3. Apply Adjoint Phase Shift
         if self.phase_shifts is not None:
-            phase_adjusted_kspace_data = kspace_data * self.phase_shifts.conj()
+            phase_adjusted_kspace_data = kspace_data_processed * self.phase_shifts.conj()
         else:
-            phase_adjusted_kspace_data = kspace_data
+            phase_adjusted_kspace_data = kspace_data_processed
 
         # 4. Prepare for Gridding
         dd = len(self.image_shape) # Should be 3

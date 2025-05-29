@@ -1,10 +1,19 @@
 # reconlib/plotting.py
 """Module for visualization tasks in MRI reconstruction."""
+""" Note that there are also PET CT plotting functions here"""
+""" All Voronoi functions should be eventually fully replaced with custom functions in this library"""
 
 import numpy as np
 import matplotlib.pyplot as plt
-from scipy.spatial import Voronoi, voronoi_plot_2d
+
+
 from typing import Union, List, Optional, Dict, Any # Added for new functions
+
+import torch 
+from mpl_toolkits.mplot3d import Axes3D 
+# Voronoi is already imported by plot_voronoi_diagram_2d - scipy functions should eventually be replaced by this library function
+from .voronoi_utils import ConvexHull # Added for plot_3d_voronoi_with_hull
+from scipy.spatial import Voronoi, voronoi_plot_2d
 
 def plot_phase_image(phase_image: np.ndarray, title: str = "Phase Image", cmap: str = "twilight", vmin: float = -np.pi, vmax: float = np.pi, filename: str = None):
     """
@@ -31,6 +40,7 @@ def plot_phase_image(phase_image: np.ndarray, title: str = "Phase Image", cmap: 
         plt.close() # Close the figure to free memory when saving
     else:
         plt.show()
+
 
 
 def plot_projection_data(projection_data: np.ndarray, title: str = "Projection Data",
@@ -249,6 +259,392 @@ def visualize_reconstruction(image: np.ndarray,
         plt.close()
     else:
         plt.show()
+
+        
+def plot_3d_delaunay(points: torch.Tensor, 
+                     tetrahedra: torch.Tensor, 
+                     convex_hull: ConvexHull = None, # Accepts a precomputed ConvexHull object
+                     show_points=True, show_tetrahedra=True, show_hull=True, 
+                     alpha_tetra: float = 0.1, alpha_hull: float = 0.2):
+    """ 
+    Plots the 3D Delaunay triangulation, points, and optionally the convex hull.
+
+    Args:
+        points (torch.Tensor): Tensor of shape (N, 3) containing 3D points.
+        tetrahedra (torch.Tensor): Tensor of shape (M, 4) with tetrahedra indices
+                                   (indices into the `points` tensor).
+        convex_hull (ConvexHull, optional): Precomputed ConvexHull object for the `points`.
+                                            If None, it will be computed internally if `show_hull` is True.
+        show_points (bool): Whether to plot input points.
+        show_tetrahedra (bool): Whether to plot tetrahedra.
+        show_hull (bool): Whether to plot the convex hull.
+        alpha_tetra (float): Transparency for tetrahedra.
+        alpha_hull (float): Transparency for hull faces.
+    """
+    assert points.dim() == 2 and points.shape[1] == 3, "Points must be (N, 3) tensor"
+
+    fig = plt.figure(figsize=(12, 9))
+    ax = fig.add_subplot(111, projection='3d')
+
+    points_cpu = points.cpu() # Ensure points are on CPU for plotting and hull computation if needed
+
+    # Plot points
+    if show_points:
+        points_np = points_cpu.numpy()
+        ax.scatter(points_np[:, 0], points_np[:, 1], points_np[:, 2], c='red', s=50, label='Points', depthshade=True)
+
+    # Plot tetrahedra
+    # Each tetrahedron is plotted as a collection of 4 triangular faces
+    # To make them slightly transparent, we plot each face.
+    plotted_tetra_label = False
+    if show_tetrahedra and tetrahedra.numel() > 0:
+        # Add a single label for all tetrahedra faces
+        ax.plot_trisurf([], [], [], color='blue', alpha=alpha_tetra, edgecolor='darkblue', label='Delaunay Tetrahedra (Faces)')
+        plotted_tetra_label = True # Set to true as we've added the label
+
+        for tetra_indices in tetrahedra: # tetra_indices is [p0_idx, p1_idx, p2_idx, p3_idx]
+            verts_tetra = points_cpu[tetra_indices] # Get the 4 vertices of the tetrahedron
+            
+            # Define faces of a tetrahedron: (0,1,2), (0,1,3), (0,2,3), (1,2,3) using local indices
+            local_faces_indices = [
+                [0, 1, 2], [0, 1, 3], [0, 2, 3], [1, 2, 3]
+            ]
+            
+            for face_idx_list in local_faces_indices:
+                face_verts_tensor = verts_tetra[face_idx_list]
+                face_np = face_verts_tensor.numpy()
+                ax.plot_trisurf(face_np[:, 0], face_np[:, 1], face_np[:, 2],
+                                color='blue', alpha=alpha_tetra, edgecolor='darkblue', linewidth=0.3, 
+                                shade=True)
+    
+    # Plot convex hull
+    if show_hull:
+        if convex_hull is None:
+            # Compute hull if not provided, using the reconlib.voronoi_utils.ConvexHull
+            # This ConvexHull is PyTorch-native.
+            try:
+                # ConvexHull expects points on the device it will run on.
+                # If points were originally on GPU, pass them as is.
+                # The ConvexHull class itself handles points.cpu() if its internal methods need it (e.g. SciPy fallback)
+                # but the PyTorch native parts should work on the original device.
+                # For plotting, we use points_cpu anyway.
+                convex_hull = ConvexHull(points) 
+            except Exception: # Removed "as e" to avoid unused variable if print is commented out
+                # print(f"Could not compute convex hull for plotting: {e}")
+                convex_hull = None # Ensure it's None if computation fails
+        
+        if convex_hull is not None and convex_hull.simplices is not None and convex_hull.simplices.numel() > 0:
+            # points_cpu is already defined
+            # Add a single label for the hull if it was shown
+            ax.plot_trisurf([], [], [], color='lightgreen', alpha=alpha_hull, edgecolor='green', label='Convex Hull (Faces)')
+            for simplex_face in convex_hull.simplices: # simplices are indices into original points
+                tri_verts_np = points_cpu[simplex_face].numpy()
+                ax.plot_trisurf(tri_verts_np[:, 0], tri_verts_np[:, 1], tri_verts_np[:, 2],
+                                color='lightgreen', alpha=alpha_hull, edgecolor='green', linewidth=0.5, 
+                                shade=True)
+
+
+    ax.set_xlabel('X')
+    ax.set_ylabel('Y')
+    ax.set_zlabel('Z')
+    ax.set_title('3D Delaunay Triangulation and Convex Hull')
+
+    # Consolidate legend
+    handles, labels = ax.get_legend_handles_labels()
+    by_label = dict(zip(labels, handles)) # Remove duplicate labels
+    if by_label:
+        ax.legend(by_label.values(), by_label.keys(), loc='upper left', bbox_to_anchor=(1.05, 1))
+
+    plt.tight_layout(rect=[0, 0, 0.85, 1]) # Adjust layout
+    plt.show()
+
+def plot_voronoi_kspace(kspace_points: torch.Tensor, 
+                        weights: torch.Tensor = None, 
+                        bounds: torch.Tensor = None, 
+                        ax: plt.Axes = None, # Allow passing an existing Axes object
+                        title: str = 'K-space Voronoi Diagram',
+                        show_points: bool = True,
+                        point_size: float = 10,
+                        point_color_map: str = 'viridis', # For when points are colored by weights
+                        line_color: str = 'gray',
+                        line_width: float = 0.8,
+                        show_legend: bool = True):
+    """
+    Plots Voronoi cells for k-space samples, optionally colored by weights and bounded.
+    Currently supports 2D k-space points.
+
+    Args:
+        kspace_points (torch.Tensor): Shape (N, 2) for N k-space points in 2D.
+        weights (torch.Tensor, optional): Shape (N,). If provided, k-space points
+                                          can be colored by these weights.
+        bounds (torch.Tensor, optional): Shape (2, 2) [[min_x, min_y], [max_x, max_y]]
+                                         for bounding the Voronoi diagram.
+        ax (plt.Axes, optional): Matplotlib axes to plot on. If None, new figure/axes created.
+        title (str, optional): Plot title.
+        show_points (bool, optional): Whether to draw the k-space sample points.
+        point_size (float, optional): Size of the k-space sample points.
+        point_color_map (str, optional): Colormap for points if colored by weights.
+        line_color (str, optional): Color of Voronoi cell edges.
+        line_width (float, optional): Width of Voronoi cell edges.
+        show_legend (bool, optional): Whether to show legend (e.g., for color bar if weights are used).
+    """
+    if not isinstance(kspace_points, torch.Tensor):
+        raise TypeError("kspace_points must be a PyTorch tensor.")
+    
+    dim = kspace_points.shape[1]
+    if dim != 2:
+        raise NotImplementedError(f"Plotting is currently implemented for 2D k-space points only. Got {dim}D.")
+
+    kspace_points_np = kspace_points.cpu().numpy()
+    
+    weights_np = None
+    if weights is not None:
+        if not isinstance(weights, torch.Tensor):
+            raise TypeError("weights must be a PyTorch tensor if provided.")
+        if weights.shape[0] != kspace_points.shape[0]:
+            raise ValueError("weights must have the same number of elements as kspace_points.")
+        weights_np = weights.cpu().numpy()
+
+    bounds_np = None
+    if bounds is not None:
+        if not isinstance(bounds, torch.Tensor):
+            raise TypeError("bounds must be a PyTorch tensor if provided.")
+        if bounds.shape != (2, 2):
+            raise ValueError("bounds must have shape (2, 2) for 2D: [[min_x, min_y], [max_x, max_y]].")
+        bounds_np = bounds.cpu().numpy()
+
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(8, 8)) # Create a new figure and axes
+    
+    # Compute Voronoi diagram
+    try:
+        vor = Voronoi(kspace_points_np, qhull_options='Qbb Qc Qz')
+    except Exception as e: # Catches scipy.spatial.qhull.QhullError
+        ax.text(0.5, 0.5, f"Voronoi computation failed:\n{e}", 
+                horizontalalignment='center', verticalalignment='center', 
+                transform=ax.transAxes, color='red')
+        if show_points: # Still plot points if Voronoi fails
+            ax.scatter(kspace_points_np[:, 0], kspace_points_np[:, 1], s=point_size, color='blue', zorder=3, 
+                       label='K-space Points (Voronoi Failed)' if show_legend else None)
+        ax.set_title(title + " (Voronoi Failed)")
+        ax.set_xlabel("kx")
+        ax.set_ylabel("ky")
+        if show_legend and ax.get_legend_handles_labels()[0]: # Check if there are any labels
+             ax.legend()
+        ax.set_aspect('equal', adjustable='box')
+        return ax # Return ax even on failure
+
+    # Plot Voronoi cell edges (finite ridges)
+    voronoi_plot_2d(vor, ax=ax, show_vertices=False, show_points=False, 
+                    line_colors=line_color, linewidth=line_width)
+
+    # Plot K-space Points
+    if show_points:
+        if weights_np is not None:
+            scatter = ax.scatter(kspace_points_np[:, 0], kspace_points_np[:, 1], 
+                                 s=point_size, c=weights_np, cmap=point_color_map, zorder=3)
+            if show_legend:
+                plt.colorbar(scatter, ax=ax, label='Weights')
+        else:
+            ax.scatter(kspace_points_np[:, 0], kspace_points_np[:, 1], 
+                       s=point_size, color='blue', zorder=3, 
+                       label='K-space Points' if show_legend else None)
+
+    # Draw Bounding Box
+    legend_elements_exist = bool(ax.get_legend_handles_labels()[0]) # Check before adding more labels
+
+    if bounds_np is not None:
+        min_x, min_y = bounds_np[0, 0], bounds_np[0, 1]
+        max_x, max_y = bounds_np[1, 0], bounds_np[1, 1]
+        # Plot rectangle lines
+        ax.plot([min_x, max_x, max_x, min_x, min_x], 
+                [min_y, min_y, max_y, max_y, min_y], 
+                color='red', linestyle='--', linewidth=1.5, 
+                label='Bounds' if show_legend else None)
+        
+        # Adjust plot limits slightly outside the bounds
+        padding_x = (max_x - min_x) * 0.05 
+        padding_y = (max_y - min_y) * 0.05
+        ax.set_xlim(min_x - padding_x, max_x + padding_x)
+        ax.set_ylim(min_y - padding_y, max_y + padding_y)
+    else:
+        # Autoscale if no bounds, may already be handled by voronoi_plot_2d, but can be explicit
+        ax.autoscale_view()
+
+
+    # Styling
+    ax.set_title(title)
+    ax.set_xlabel("kx")
+    ax.set_ylabel("ky")
+    
+    # Update legend_elements_exist after potentially adding bounds label
+    if not legend_elements_exist and (bounds_np is not None or (show_points and weights_np is None)):
+        legend_elements_exist = bool(ax.get_legend_handles_labels()[0])
+
+    if show_legend and legend_elements_exist:
+        # Consolidate legend if multiple labels were added (e.g. 'K-space Points' and 'Bounds')
+        handles, labels = ax.get_legend_handles_labels()
+        by_label = dict(zip(labels, handles))
+        ax.legend(by_label.values(), by_label.keys())
+        
+    ax.set_aspect('equal', adjustable='box')
+    
+    return ax # Return the axes object for further modification or display by caller
+
+def plot_3d_voronoi_with_hull(points: torch.Tensor, 
+                              # vertices: torch.Tensor, # This was in the issue's signature, but seems unused if simplices are for the main hull
+                              simplices: torch.Tensor, # Simplices for the main convex hull of 'points'
+                              show_points=True, show_voronoi=True, 
+                              show_hull=True, alpha=0.3, voronoi_alpha=0.1):
+    """
+    Plots 3D points, their overall convex hull, and their Voronoi cells (bounded by individual convex hulls).
+
+    Args:
+        points (torch.Tensor): Tensor of shape (N, 3) containing input points.
+        simplices (torch.Tensor): Indices of triangular faces for the convex hull of ALL `points`.
+                                  Shape (K, 3), indices into `points`.
+        show_points (bool): Whether to plot input points.
+        show_voronoi (bool): Whether to plot Voronoi cells.
+        show_hull (bool): Whether to plot the overall convex hull of `points`.
+        alpha (float): Transparency for the main convex hull faces.
+        voronoi_alpha (float): Transparency for individual Voronoi cell hull faces.
+    """
+    points_np = points.cpu().numpy() # For SciPy Voronoi and Matplotlib
+    
+    fig = plt.figure(figsize=(12, 9)) # Slightly larger figure
+    ax = fig.add_subplot(111, projection='3d')
+
+    # Plot input points
+    if show_points:
+        ax.scatter(points_np[:, 0], points_np[:, 1], points_np[:, 2], c='red', s=50, label='Input Points', depthshade=True)
+
+    # Plot Voronoi cells
+    if show_voronoi:
+        vor = Voronoi(points_np) # Compute Voronoi diagram from original points
+        vor_vertices_torch = torch.tensor(vor.vertices, dtype=points.dtype, device=points.device)
+
+        plotted_voronoi_label = False
+        for i, region_indices in enumerate(vor.regions):
+            if not region_indices or -1 in region_indices: # Skip empty or open regions
+                continue
+            
+            # Vertices of the current Voronoi cell
+            current_voronoi_cell_verts_torch = vor_vertices_torch[region_indices]
+
+            if current_voronoi_cell_verts_torch.shape[0] < 4: # Need at least 4 points for 3D hull
+                # print(f"Skipping Voronoi region {i} for point {vor.point_region[i]}: not enough unique vertices for 3D hull ({current_voronoi_cell_verts_torch.shape[0]})")
+                continue
+            
+            try:
+                # Use the reconlib.voronoi_utils.ConvexHull for each Voronoi cell
+                # This ConvexHull is now PyTorch-native.
+                region_hull = ConvexHull(current_voronoi_cell_verts_torch)
+                
+                # Ensure region_hull.simplices is not empty and is a tensor
+                if region_hull.simplices is not None and region_hull.simplices.numel() > 0:
+                    # Get points for these simplices from current_voronoi_cell_verts_torch
+                    cell_points_for_plot = current_voronoi_cell_verts_torch.cpu()
+                    for simplex_face in region_hull.simplices: # simplex_face is [idx1, idx2, idx3] into current_voronoi_cell_verts_torch
+                        tri_verts_np = cell_points_for_plot[simplex_face].numpy()
+                        
+                        label_to_use = None
+                        if not plotted_voronoi_label:
+                            label_to_use = 'Voronoi Cells (Hulls)' # This label will be set on the last iteration due to loop structure
+                            # This approach for single label is not ideal. Better to plot one dummy element for label.
+                        
+                        ax.plot_trisurf(tri_verts_np[:, 0], tri_verts_np[:, 1], tri_verts_np[:, 2],
+                                        color='cyan', alpha=voronoi_alpha, edgecolor='blue', linewidth=0.5, 
+                                        shade=True) 
+                if not plotted_voronoi_label and region_hull.simplices is not None and region_hull.simplices.numel() > 0 : # Add label after first successful plot
+                    ax.plot_trisurf([], [], [], color='cyan', alpha=voronoi_alpha, edgecolor='blue', label='Voronoi Cells (Hulls)')
+                    plotted_voronoi_label = True
+
+            except Exception: # Removed "as e" to avoid unused variable warning if print is commented out
+                # print(f"Could not compute or plot hull for Voronoi region {i} (point {vor.point_region.get(i, 'N/A')}): {e}")
+                pass # Continue if a single Voronoi cell hull fails
+
+    # Plot overall convex hull of the input points
+    if show_hull and simplices is not None and simplices.numel() > 0:
+        points_cpu = points.cpu() # Ensure points are on CPU for indexing
+        # Plot one dummy element for the label
+        ax.plot_trisurf([], [], [], color='lightgreen', alpha=alpha, edgecolor='green', label='Overall Convex Hull (Faces)')
+        for simplex_face in simplices: # These are indices into the original 'points' tensor
+            tri_verts_np = points_cpu[simplex_face].numpy()
+            ax.plot_trisurf(tri_verts_np[:, 0], tri_verts_np[:, 1], tri_verts_np[:, 2],
+                            color='lightgreen', alpha=alpha, edgecolor='green', linewidth=0.5, 
+                            shade=True)
+
+
+    ax.set_xlabel('X')
+    ax.set_ylabel('Y')
+    ax.set_zlabel('Z')
+    ax.set_title('3D Voronoi Diagram with Convex Hulls')
+
+    # Consolidate legend
+    handles, labels = ax.get_legend_handles_labels()
+    by_label = dict(zip(labels, handles)) # Remove duplicate labels
+    if by_label:
+        ax.legend(by_label.values(), by_label.keys(), loc='upper left', bbox_to_anchor=(1.05, 1))
+    
+    plt.tight_layout(rect=[0, 0, 0.85, 1]) # Adjust layout to make space for legend outside
+    plt.show()
+
+def plot_3d_hull(points: torch.Tensor, vertices: torch.Tensor, simplices: torch.Tensor, 
+                 show_points=True, show_hull=True, alpha=0.3):
+    """ Plots the 3D convex hull and input points.
+
+    Args:
+        points (torch.Tensor): Tensor of shape (N, 3) containing input points.
+        vertices (torch.Tensor): Indices of points on the convex hull.
+                                 (Note: this arg is not directly used in the provided plot_3d_hull
+                                  if simplices already contain all necessary vertex info from points tensor,
+                                  but kept for signature consistency with example.)
+        simplices (torch.Tensor): Indices of triangular faces, shape (K, 3).
+                                  Each row contains indices into the `points` tensor.
+        show_points (bool): Whether to plot input points.
+        show_hull (bool): Whether to plot the convex hull.
+        alpha (float): Transparency for hull faces.
+    """
+    fig = plt.figure(figsize=(10, 8))
+    ax = fig.add_subplot(111, projection='3d')
+
+    # Plot points
+    if show_points:
+        # Ensure points are on CPU and NumPy for Matplotlib
+        points_np = points.cpu().numpy()
+        ax.scatter(points_np[:, 0], points_np[:, 1], points_np[:, 2], c='red', s=50, label='Points')
+
+    # Plot convex hull
+    if show_hull and simplices.numel() > 0: # Check if simplices is not empty
+        # Ensure points are on CPU for indexing and plotting
+        points_cpu = points.cpu()
+        for simplex in simplices: # simplex is a row [idx1, idx2, idx3]
+            # Collect the 3 vertices for this face from the points tensor
+            tri_vertices = points_cpu[simplex] 
+            tri_np = tri_vertices.numpy() # Convert to NumPy for plot_trisurf
+
+            ax.plot_trisurf(
+                tri_np[:, 0], tri_np[:, 1], tri_np[:, 2],
+                color='green', alpha=alpha, edgecolor='k' # Removed label='Convex Hull' from here to avoid multiple legend entries
+            )
+    
+    # Add a single label for the hull if it was shown
+    if show_hull and simplices.numel() > 0:
+        ax.plot_trisurf([], [], [], color='green', alpha=alpha, edgecolor='k', label='Convex Hull (Faces)')
+
+
+    ax.set_xlabel('X')
+    ax.set_ylabel('Y')
+    ax.set_zlabel('Z')
+    
+    # Consolidate legend
+    handles, labels = ax.get_legend_handles_labels()
+    by_label = dict(zip(labels, handles)) # Remove duplicate labels
+    if by_label: # Only show legend if there's something to show
+        ax.legend(by_label.values(), by_label.keys())
+    
+    plt.show()
+
 
 def plot_voronoi_diagram_2d(points: np.ndarray, ax: plt.Axes = None, 
                             show_points: bool = True, line_colors='k', 
