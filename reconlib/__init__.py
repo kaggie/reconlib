@@ -52,8 +52,22 @@ from .deeplearning import SimpleWaveletDenoiser, LearnedRegularizationIteration
 # Exports from simulation module (toy_datasets functions)
 from .simulation.toy_datasets import generate_dynamic_phantom_data, generate_nlinv_data_stubs
 
-from . import plotting
+# Import specific plotting functions
+from .plotting import (
+    plot_phase_image, 
+    plot_unwrapped_phase_map, 
+    plot_b0_field_map,
+    plot_voronoi_diagram_2d,
+    plot_density_weights_2d,
+    plot_voronoi_diagram_3d_slice,
+    plot_density_weights_3d_slice
+)
 from .pipeline_utils import preprocess_multi_coil_multi_echo_data
+
+# Exports from voronoi_utils.py
+from .voronoi_utils import compute_polygon_area
+from .voronoi_utils import compute_convex_hull_volume
+from .voronoi_utils import normalize_weights
 
 
 # Optionally, define __all__ to specify what `from reconlib import *` imports
@@ -80,12 +94,24 @@ __all__ = [
     # Added simulation functions
     'generate_dynamic_phantom_data',
     'generate_nlinv_data_stubs',
-    'plotting',
+    # 'plotting', # Replaced with individual function exports
     'preprocess_multi_coil_multi_echo_data',
     "coil_combination_with_phase",
     "estimate_phase_maps",
     "estimate_sensitivity_maps",
     "reconstruct_coil_images",
     "compute_density_compensation",
+    # Added Voronoi utils functions
+    "compute_polygon_area",
+    "compute_convex_hull_volume",
+    "normalize_weights",
+    # Added plotting functions
+    "plot_phase_image",
+    "plot_unwrapped_phase_map",
+    "plot_b0_field_map",
+    "plot_voronoi_diagram_2d",
+    "plot_density_weights_2d",
+    "plot_voronoi_diagram_3d_slice",
+    "plot_density_weights_3d_slice",
 ]
 
