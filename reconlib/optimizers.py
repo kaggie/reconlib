@@ -4,6 +4,9 @@ import torch
 from abc import ABC, abstractmethod
 # Import GradientMatchingRegularizer for type hinting if needed, though not strictly necessary for runtime
 # from reconlib.regularizers import GradientMatchingRegularizer # Example for clarity
+from reconlib.geometry import SystemMatrix
+from reconlib.operators import Operator
+from reconlib.regularizers.base import Regularizer # Added for PenalizedLikelihoodReconstruction
 
 class Optimizer(ABC):
     """
@@ -281,3 +284,188 @@ class ADMM(Optimizer):
                 print(f"ADMM reached max_iter ({self.max_iter}) without converging.")
                 
         return x_k
+
+
+class OrderedSubsetsExpectationMaximization(Optimizer):
+    """
+    Ordered Subsets Expectation Maximization (OSEM) algorithm for PET reconstruction.
+    """
+    def __init__(self, system_matrix: SystemMatrix, num_subsets: int, num_iterations: int, device: str = 'cpu'):
+        """
+        Initializes the OSEM optimizer.
+
+        Args:
+            system_matrix (SystemMatrix): The system matrix modeling the PET scanner physics.
+            num_subsets (int): The number of ordered subsets to divide the projection data into.
+            num_iterations (int): The total number of iterations to perform.
+            device (str): The computational device ('cpu' or 'cuda').
+        """
+        self.system_matrix = system_matrix
+        self.num_subsets = num_subsets
+        self.num_iterations = num_iterations
+        self.device = device
+        self.epsilon = 1e-9 # Small epsilon for numerical stability in division
+
+        if hasattr(self.system_matrix, 'to') and callable(getattr(self.system_matrix, 'to')):
+            self.system_matrix.to(self.device)
+        elif hasattr(self.system_matrix, 'projector_op') and \
+             hasattr(self.system_matrix.projector_op, 'to') and \
+             callable(getattr(self.system_matrix.projector_op, 'to')):
+            self.system_matrix.projector_op.to(self.device)
+
+
+    def reconstruct(self, projection_data: torch.Tensor, initial_image: torch.Tensor = None) -> torch.Tensor:
+        """
+        Performs OSEM reconstruction. Placeholder implementation.
+
+        The OSEM algorithm iteratively updates the image estimate using subsets of projection data.
+        A typical update rule for a subset 's' is:
+        image_new = image_old * (system_matrix_subset_s^T * (projection_data_subset_s / (system_matrix_subset_s * image_old + epsilon)))
+                    / (system_matrix_subset_s^T * 1 + epsilon)
+
+        Args:
+            projection_data (torch.Tensor): The full set of projection data (sinogram).
+            initial_image (torch.Tensor, optional): An initial guess for the image.
+                                                    If None, a uniform image is often used.
+        Returns:
+            torch.Tensor: The reconstructed image.
+        """
+        if initial_image is not None:
+            if initial_image.device.type != self.device:
+                initial_image = initial_image.to(self.device)
+        else:
+            bs = projection_data.shape[0]
+            ch = 1 # Assuming single channel image for PET
+            try:
+                h, w = self.system_matrix.img_size
+            except AttributeError:
+                print("Warning: OSEM initial_image defaulting to (1,1,128,128) due to missing system_matrix.img_size.")
+                h, w = 128, 128 # Fallback
+            initial_image = torch.ones(bs, ch, h, w, device=self.device)
+
+
+        if projection_data.device.type != self.device:
+            projection_data = projection_data.to(self.device)
+
+        print(f"Placeholder: Would perform OSEM reconstruction for {self.num_iterations} iterations "
+              f"with {self.num_subsets} subsets. Initial image shape: {initial_image.shape}, "
+              f"Projection data shape: {projection_data.shape}")
+        raise NotImplementedError("OSEM `reconstruct` method is not yet implemented. "
+                                  "Subset handling and the iterative update rule need to be implemented.")
+
+    def solve(self, k_space_data: torch.Tensor, forward_op: SystemMatrix, regularizer: Regularizer = None, initial_guess: torch.Tensor = None) -> torch.Tensor:
+        """
+        Calls the OSEM reconstruct method.
+        Adapts OSEM to the general Optimizer interface.
+        'k_space_data' is projection_data, 'forward_op' is the SystemMatrix.
+        """
+        if regularizer is not None:
+            print("Warning: Basic OSEM (via `solve`) does not typically use a regularizer. It will be ignored.")
+        
+        if forward_op is not self.system_matrix:
+            print("Warning: The `forward_op` passed to OSEM.solve() is different from the "
+                  "`system_matrix` it was initialized with. Using the initialized `system_matrix`.")
+
+        return self.reconstruct(projection_data=k_space_data, initial_image=initial_guess)
+
+
+class PenalizedLikelihoodReconstruction(Optimizer):
+    """
+    Framework for Penalized Likelihood Reconstruction using iterative optimizers
+    like FISTA or ADMM, but with a custom data fidelity term (e.g., Poisson likelihood).
+    """
+    def __init__(self,
+                 system_matrix: SystemMatrix,
+                 regularizer: Regularizer,
+                 optimizer_choice: str = 'fista',
+                 optimizer_params: dict = None,
+                 data_fidelity: str = 'poisson', # 'poisson' or 'gaussian'
+                 device: str = 'cpu',
+                 epsilon: float = 1e-9): # Epsilon for Poisson gradient
+        """
+        Initializes the PenalizedLikelihoodReconstruction optimizer.
+        """
+        self.system_matrix = system_matrix
+        self.regularizer = regularizer
+        self.optimizer_choice = optimizer_choice.lower()
+        self.optimizer_params = optimizer_params if optimizer_params is not None else {}
+        self.data_fidelity = data_fidelity.lower()
+        self.device = device
+        self.epsilon = epsilon
+
+        if hasattr(self.system_matrix, 'to') and callable(getattr(self.system_matrix, 'to')):
+            self.system_matrix.to(self.device)
+        elif hasattr(self.system_matrix, 'projector_op') and \
+             hasattr(self.system_matrix.projector_op, 'to') and \
+             callable(getattr(self.system_matrix.projector_op, 'to')):
+            self.system_matrix.projector_op.to(self.device)
+
+        if hasattr(self.regularizer, 'to') and callable(getattr(self.regularizer, 'to')):
+            self.regularizer.to(self.device)
+
+        if self.optimizer_choice == 'fista':
+            self.internal_optimizer = FISTA(**self.optimizer_params)
+        elif self.optimizer_choice == 'admm':
+            self.internal_optimizer = ADMM(**self.optimizer_params)
+        else:
+            raise ValueError(f"Unsupported optimizer_choice: {optimizer_choice}. Choose 'fista' or 'admm'.")
+
+    def _data_fidelity_gradient(self, current_image: torch.Tensor, projection_data: torch.Tensor) -> torch.Tensor:
+        """
+        Calculates the gradient of the data fidelity (negative log-likelihood) term.
+        This is the gradient of -log(L(projection_data | current_image)).
+
+        Args:
+            current_image (torch.Tensor): The current image estimate.
+            projection_data (torch.Tensor): The measured projection data.
+
+        Returns:
+            torch.Tensor: The gradient of the negative log-likelihood w.r.t. current_image.
+
+        Formulas:
+        - Poisson: grad = system_matrix.op_adj(1 - projection_data / (system_matrix.op(current_image) + epsilon))
+        - Gaussian: grad = system_matrix.op_adj(system_matrix.op(current_image) - projection_data)
+        """
+        if current_image.device.type != self.device:
+            current_image = current_image.to(self.device)
+        if projection_data.device.type != self.device:
+            projection_data = projection_data.to(self.device)
+        
+        # Ensure internal components of system_matrix are on device (if applicable)
+        if hasattr(self.system_matrix, 'projector_op') and \
+           hasattr(self.system_matrix.projector_op, 'device') and \
+           self.system_matrix.projector_op.device != self.device:
+             if hasattr(self.system_matrix.projector_op, 'to') and \
+                callable(getattr(self.system_matrix.projector_op, 'to')):
+                 self.system_matrix.projector_op.to(self.device)
+
+        print(f"Placeholder: Would calculate data fidelity gradient for '{self.data_fidelity}' type.")
+        raise NotImplementedError("`_data_fidelity_gradient` is not yet implemented. "
+                                  "The specific gradient formula needs to be applied based on self.data_fidelity.")
+
+    def solve(self, k_space_data: torch.Tensor, 
+              forward_op: SystemMatrix, 
+              regularizer: Regularizer = None, 
+              initial_guess: torch.Tensor = None) -> torch.Tensor:
+        """
+        Solves the penalized likelihood reconstruction problem.
+        This method needs to integrate `_data_fidelity_gradient` with the chosen
+        `self.internal_optimizer` and `self.regularizer`.
+        """
+        if forward_op is not self.system_matrix:
+            print("Warning: `forward_op` in solve() differs from `system_matrix` in __init__. Using initialized one.")
+        if regularizer is not None and regularizer is not self.regularizer:
+            # Note: The regularizer passed to solve() is often the one FISTA/ADMM directly use.
+            # Here, self.regularizer is passed to FISTA/ADMM during their solve call.
+            print("Warning: `regularizer` in solve() might conflict with `regularizer` in __init__. "
+                  "The one from __init__ will be used by the internal optimizer normally.")
+
+        print(f"Placeholder: Would use {self.optimizer_choice} with {self.data_fidelity} likelihood.")
+        raise NotImplementedError(
+            "Integrating custom data fidelity gradient with FISTA/ADMM's `solve` method is non-trivial "
+            "and requires careful adaptation of the optimizer's internal gradient computation. "
+            "This `solve` method for PenalizedLikelihoodReconstruction is not yet implemented."
+        )
+
+# TODO: Further refine PenalizedLikelihoodReconstruction, especially the solve method's integration
+# with FISTA/ADMM and the custom gradient.
