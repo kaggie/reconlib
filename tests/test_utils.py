@@ -91,6 +91,150 @@ class TestCombineCoils(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Mask shape .* must match input data spatial shape"):
             combine_coils_complex_sum(dummy_data, mask=torch.tensor([True, False]).to(self.device))
 
+from reconlib.utils import calculate_density_compensation
+from reconlib.voronoi_utils import EPSILON # For small value comparisons
+
+class TestCalculateDensityCompensation(unittest.TestCase):
+    def setUp(self):
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.image_shape_2d = (64, 64)
+        self.image_shape_3d = (32, 32, 32)
+        # Use float32 for k-trajectories as it's common in recon pipelines
+        self.dtype = torch.float32 
+        self.test_tol = EPSILON * 100 # Tolerance for DCF value checks, can be adjusted
+
+    # --- General DCF Tests ---
+    def test_dcf_invalid_method(self):
+        points = torch.rand(10, 2, device=self.device, dtype=self.dtype)
+        with self.assertRaisesRegex(NotImplementedError, "Density compensation method 'unknown_method' is not implemented."):
+            calculate_density_compensation(points, self.image_shape_2d, method='unknown_method', device=self.device)
+
+    # --- Voronoi DCF Tests ---
+    def test_voronoi_dcf_2d_simple(self):
+        # Simple square of points + center point
+        points_2d = torch.tensor([
+            [-0.5, -0.5], [0.5, -0.5], [0.5, 0.5], [-0.5, 0.5], # Square
+            [0.0, 0.0] # Center
+        ], device=self.device, dtype=self.dtype)
+        
+        weights = calculate_density_compensation(points_2d, self.image_shape_2d, method='voronoi', device=self.device)
+        
+        self.assertEqual(weights.shape, (points_2d.shape[0],))
+        self.assertTrue(torch.all(weights >= 0))
+        # Center point (index 4) should have a relatively larger Voronoi cell area, thus smaller weight
+        # Corner points (0-3) should have smaller cells, thus larger weights
+        # This is heuristic: 1/area means smaller area -> larger weight.
+        # The center point's cell is bounded by the 4 outer points. Outer points have cells extending outwards.
+        # So center point should have a smaller area, thus larger weight than unbounded outer points.
+        # If we assume this test runs without bounds, outer points might get very small weights (large areas).
+        # Let's check that weights are not extremely small (e.g. > EPSILON)
+        self.assertTrue(torch.all(weights > EPSILON))
+
+
+    def test_voronoi_dcf_2d_with_bounds(self):
+        points_2d = torch.tensor([
+            [-0.25, -0.25], [0.25, -0.25], [0.25, 0.25], [-0.25, 0.25], # Inner square
+            [0.0, 0.0] 
+        ], device=self.device, dtype=self.dtype)
+        
+        # Define bounds that are larger than the point extent
+        bounds = torch.tensor([[-0.5, -0.5], [0.5, 0.5]], device=self.device, dtype=self.dtype)
+        
+        weights = calculate_density_compensation(points_2d, self.image_shape_2d, method='voronoi', bounds=bounds, device=self.device)
+        
+        self.assertEqual(weights.shape, (points_2d.shape[0],))
+        self.assertTrue(torch.all(weights > 0)) # With bounds, all finite cells should have positive area.
+        
+        # The center point (index 4) should have the smallest Voronoi cell area, thus the largest weight.
+        # The four corner points (indices 0-3) should have similar, smaller weights than the center.
+        center_weight = weights[4]
+        corner_weights_mean = torch.mean(weights[:4])
+        self.assertTrue(center_weight > corner_weights_mean)
+
+
+    def test_voronoi_dcf_2d_degenerate_collinear(self):
+        # Collinear points. compute_voronoi_density_weights handles this by returning uniform weights (1/N)
+        # or small weights if Voronoi fails.
+        points_2d = torch.tensor([
+            [0.0, 0.0], [0.1, 0.1], [0.2, 0.2], [0.3, 0.3]
+        ], device=self.device, dtype=self.dtype)
+        
+        num_points = points_2d.shape[0]
+        weights = calculate_density_compensation(points_2d, self.image_shape_2d, method='voronoi', device=self.device)
+        
+        self.assertEqual(weights.shape, (num_points,))
+        # Check if it falls back to uniform weights (1/N for N<=dim, or EPSILON if Voronoi fails for N>dim)
+        # For 4 points in 2D, Voronoi might run. If it fails due to collinearity, expect EPSILON for each.
+        # If it runs but cells are problematic, behavior depends on ConvexHull of degenerate cells.
+        # The current compute_voronoi_density_weights has try-except for Voronoi returning EPSILON.
+        # And if n_points <= space_dim it returns 1.0/n_points. Here 4 > 2.
+        # Let's assume it might fail robustly or produce very small weights.
+        # For collinear, SciPy Voronoi often fails or gives weird results.
+        # Our wrapper should catch this and return EPSILON per point.
+        expected_fallback_weights = torch.full((num_points,), EPSILON, dtype=self.dtype, device=self.device)
+        # This assertion might be too strict if SciPy/Qhull manages to produce some result,
+        # however, the current error handling in compute_voronoi_density_weights for Voronoi failure is to return EPSILON.
+        torch.testing.assert_close(weights, expected_fallback_weights, rtol=0, atol=self.test_tol)
+
+
+    def test_voronoi_dcf_3d_simple(self):
+        # Simple cube of points + center point
+        points_3d = torch.tensor([
+            [-0.5, -0.5, -0.5], [0.5, -0.5, -0.5], [0.5, 0.5, -0.5], [-0.5, 0.5, -0.5], # Bottom face
+            [-0.5, -0.5, 0.5], [0.5, -0.5, 0.5], [0.5, 0.5, 0.5], [-0.5, 0.5, 0.5],   # Top face
+            [0.0, 0.0, 0.0] # Center point
+        ], device=self.device, dtype=self.dtype)
+        
+        weights = calculate_density_compensation(points_3d, self.image_shape_3d, method='voronoi', device=self.device)
+        
+        self.assertEqual(weights.shape, (points_3d.shape[0],))
+        self.assertTrue(torch.all(weights >= 0))
+        self.assertTrue(torch.all(weights > EPSILON)) # Expect non-trivial weights for unbounded cells
+
+
+    def test_voronoi_dcf_3d_with_bounds(self):
+        points_3d = torch.tensor([
+            [-0.25, -0.25, -0.25], [0.25, -0.25, -0.25], [0.25, 0.25, -0.25], [-0.25, 0.25, -0.25],
+            [-0.25, -0.25, 0.25], [0.25, -0.25, 0.25], [0.25, 0.25, 0.25], [-0.25, 0.25, 0.25],
+            [0.0, 0.0, 0.0]
+        ], device=self.device, dtype=self.dtype)
+        
+        bounds = torch.tensor([[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]], device=self.device, dtype=self.dtype)
+        
+        weights = calculate_density_compensation(points_3d, self.image_shape_3d, method='voronoi', bounds=bounds, device=self.device)
+        
+        self.assertEqual(weights.shape, (points_3d.shape[0],))
+        self.assertTrue(torch.all(weights > 0))
+        
+        # Center point (index 8) should have the smallest Voronoi cell volume, thus the largest weight.
+        center_weight = weights[8]
+        corner_weights_mean = torch.mean(weights[:8])
+        self.assertTrue(center_weight > corner_weights_mean)
+
+
+    def test_voronoi_dcf_empty_input(self):
+        points_empty = torch.empty((0, 2), device=self.device, dtype=self.dtype)
+        weights = calculate_density_compensation(points_empty, self.image_shape_2d, method='voronoi', device=self.device)
+        self.assertEqual(weights.shape, (0,))
+
+    def test_voronoi_dcf_less_than_required_points_2d(self):
+        # Test with 2 points in 2D (n_points <= space_dim)
+        points_2d = torch.tensor([[0.0,0.0], [0.1,0.1]], device=self.device, dtype=self.dtype)
+        num_points = points_2d.shape[0]
+        weights = calculate_density_compensation(points_2d, self.image_shape_2d, method='voronoi', device=self.device)
+        # Expected: uniform weights 1.0 / num_points
+        expected_weights = torch.full((num_points,), 1.0/num_points, dtype=self.dtype, device=self.device)
+        torch.testing.assert_close(weights, expected_weights, rtol=0, atol=self.test_tol)
+
+    def test_voronoi_dcf_less_than_required_points_3d(self):
+        # Test with 3 points in 3D (n_points <= space_dim)
+        points_3d = torch.tensor([[0.0,0.0,0.0], [0.1,0.1,0.1], [0.2,0.0,0.0]], device=self.device, dtype=self.dtype)
+        num_points = points_3d.shape[0]
+        weights = calculate_density_compensation(points_3d, self.image_shape_3d, method='voronoi', device=self.device)
+        # Expected: uniform weights 1.0 / num_points
+        expected_weights = torch.full((num_points,), 1.0/num_points, dtype=self.dtype, device=self.device)
+        torch.testing.assert_close(weights, expected_weights, rtol=0, atol=self.test_tol)
+
 
 if __name__ == '__main__':
     unittest.main()
