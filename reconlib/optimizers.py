@@ -2,11 +2,14 @@
 
 import torch
 from abc import ABC, abstractmethod
+import numpy as np # Added for OSEM
+from typing import Optional # Added for OSEM
 # Import GradientMatchingRegularizer for type hinting if needed, though not strictly necessary for runtime
 # from reconlib.regularizers import GradientMatchingRegularizer # Example for clarity
-from reconlib.geometry import SystemMatrix
+from reconlib.geometry import SystemMatrix, ScannerGeometry # Added ScannerGeometry for OSEM subset SM
 from reconlib.operators import Operator
-from reconlib.regularizers.base import Regularizer # Added for PenalizedLikelihoodReconstruction
+from reconlib.regularizers.base import Regularizer
+from reconlib.regularizers.common import NonnegativityConstraint # Added for OSEM
 
 class Optimizer(ABC):
     """
@@ -290,7 +293,14 @@ class OrderedSubsetsExpectationMaximization(Optimizer):
     """
     Ordered Subsets Expectation Maximization (OSEM) algorithm for PET reconstruction.
     """
-    def __init__(self, system_matrix: SystemMatrix, num_subsets: int, num_iterations: int, device: str = 'cpu'):
+    def __init__(self,
+                 system_matrix: SystemMatrix,
+                 num_subsets: int,
+                 num_iterations: int,
+                 device: str = 'cpu',
+                 nonnegativity_constraint: Optional[NonnegativityConstraint] = None,
+                 epsilon: float = 1e-9,
+                 verbose: bool = False):
         """
         Initializes the OSEM optimizer.
 
@@ -299,13 +309,24 @@ class OrderedSubsetsExpectationMaximization(Optimizer):
             num_subsets (int): The number of ordered subsets to divide the projection data into.
             num_iterations (int): The total number of iterations to perform.
             device (str): The computational device ('cpu' or 'cuda').
+            nonnegativity_constraint (Optional[NonnegativityConstraint]): Non-negativity constraint operator.
+                                                                        If None, one is created.
+            epsilon (float): Small constant for numerical stability in divisions.
+            verbose (bool): If True, prints progress information.
         """
         self.system_matrix = system_matrix
         self.num_subsets = num_subsets
         self.num_iterations = num_iterations
         self.device = device
-        self.epsilon = 1e-9 # Small epsilon for numerical stability in division
+        self.epsilon = epsilon
+        self.verbose = verbose
 
+        if nonnegativity_constraint is None:
+            self.nonnegativity_constraint = NonnegativityConstraint()
+        else:
+            self.nonnegativity_constraint = nonnegativity_constraint
+
+        # Ensure system_matrix components are on the correct device
         if hasattr(self.system_matrix, 'to') and callable(getattr(self.system_matrix, 'to')):
             self.system_matrix.to(self.device)
         elif hasattr(self.system_matrix, 'projector_op') and \
@@ -313,47 +334,179 @@ class OrderedSubsetsExpectationMaximization(Optimizer):
              callable(getattr(self.system_matrix.projector_op, 'to')):
             self.system_matrix.projector_op.to(self.device)
 
-
-    def reconstruct(self, projection_data: torch.Tensor, initial_image: torch.Tensor = None) -> torch.Tensor:
+    def _get_subset_system_matrix(self, subset_angle_indices: np.ndarray) -> SystemMatrix:
         """
-        Performs OSEM reconstruction. Placeholder implementation.
+        Creates a new SystemMatrix for a given subset of angles.
+        This is a temporary approach due to current SystemMatrix limitations.
+        """
+        original_scanner_geom = self.system_matrix.scanner_geometry
+        
+        # Create new ScannerGeometry for the subset
+        subset_scanner_geom = ScannerGeometry(
+            detector_positions=original_scanner_geom.detector_positions, # Assuming this doesn't change per subset
+            angles=original_scanner_geom.angles[subset_angle_indices],
+            detector_size=original_scanner_geom.detector_size,
+            geometry_type=original_scanner_geom.geometry_type,
+            n_detector_pixels=original_scanner_geom.n_detector_pixels
+        )
+        
+        # Create new SystemMatrix for this subset geometry
+        subset_system_matrix = SystemMatrix(
+            scanner_geometry=subset_scanner_geom,
+            img_size=self.system_matrix.img_size,
+            device=self.device
+        )
+        return subset_system_matrix
+
+    def _calculate_sensitivity_image_subset(self, subset_system_matrix: SystemMatrix, subset_projection_shape: tuple) -> torch.Tensor:
+        """
+        Calculates the sensitivity image for a given subset by backprojecting ones.
+        subset_projection_shape is (batch, channels, num_subset_angles, num_detectors)
+        """
+        # Create a sinogram of ones matching the subset's projection data shape
+        # The shape required by SystemMatrix.backward_project might depend on its internal operator.
+        # For PETForwardProjection, it expects (batch, 1, n_angles, n_detectors)
+        # For IRadon, it expects (batch, 1, n_angles, n_rays_per_proj)
+        # Assuming subset_projection_shape[0] is batch, subset_projection_shape[2] is num_subset_angles,
+        # and subset_projection_shape[3] is num_detectors/rays.
+        
+        # We need the expected shape by the projector, not necessarily the input `subset_projection_shape`
+        # if it has extra channels. For sensitivity, it's usually a single channel.
+        num_subset_angles = subset_system_matrix.scanner_geometry.angles.shape[0]
+        num_detectors = subset_system_matrix.scanner_geometry.n_detector_pixels
+        
+        # Assuming batch size of 1 for sensitivity calculation, or it should match current_image_estimate's batch
+        # Let's assume the sensitivity image is calculated for a single batch item, or it broadcasts.
+        # For now, let's take the batch size from the subset_projection_shape passed.
+        batch_size = subset_projection_shape[0]
+        
+        # The number of channels for the 'ones' tensor should typically be 1 for sensitivity.
+        # The projector op inside system_matrix will handle this.
+        # If system_matrix.backward_project expects (B, C, H, W) for projections,
+        # then C should usually be 1 for the 'ones' tensor.
+        # Let's assume the projector can handle a single channel input for this.
+        ones_sinogram = torch.ones(batch_size, 1, num_subset_angles, num_detectors,
+                                   dtype=torch.float32, device=self.device) # Use float32 for calculations
+
+        sensitivity_image_subset = subset_system_matrix.backward_project(ones_sinogram)
+        sensitivity_image_subset = sensitivity_image_subset + self.epsilon # Avoid division by zero
+        return sensitivity_image_subset
+
+    def reconstruct(self, projection_data: torch.Tensor, initial_image: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Performs OSEM reconstruction.
 
         The OSEM algorithm iteratively updates the image estimate using subsets of projection data.
         A typical update rule for a subset 's' is:
         image_new = image_old * (system_matrix_subset_s^T * (projection_data_subset_s / (system_matrix_subset_s * image_old + epsilon)))
-                    / (system_matrix_subset_s^T * 1 + epsilon)
+                    / (sensitivity_image_subset + epsilon)
+        where sensitivity_image_subset = system_matrix_subset_s^T * 1.
 
         Args:
             projection_data (torch.Tensor): The full set of projection data (sinogram).
-            initial_image (torch.Tensor, optional): An initial guess for the image.
-                                                    If None, a uniform image is often used.
+                                            Expected shape (batch, channels, num_total_angles, num_detectors).
+            initial_image (Optional[torch.Tensor]): An initial guess for the image.
+                                                    If None, a uniform positive image is created.
+                                                    Expected shape (batch, channels, height, width).
         Returns:
             torch.Tensor: The reconstructed image.
         """
+        # --- Input Validation and Initialization ---
+        if not isinstance(projection_data, torch.Tensor):
+            raise ValueError("projection_data must be a PyTorch tensor.")
+        projection_data = projection_data.to(self.device)
+
         if initial_image is not None:
-            if initial_image.device.type != self.device:
-                initial_image = initial_image.to(self.device)
+            if not isinstance(initial_image, torch.Tensor):
+                raise ValueError("initial_image must be a PyTorch tensor if provided.")
+            current_image_estimate = initial_image.clone().to(self.device)
         else:
-            bs = projection_data.shape[0]
-            ch = 1 # Assuming single channel image for PET
+            # Determine image_shape from system_matrix
             try:
-                h, w = self.system_matrix.img_size
-            except AttributeError:
-                print("Warning: OSEM initial_image defaulting to (1,1,128,128) due to missing system_matrix.img_size.")
-                h, w = 128, 128 # Fallback
-            initial_image = torch.ones(bs, ch, h, w, device=self.device)
+                img_h, img_w = self.system_matrix.img_size
+                # Assume batch size and channels from projection_data if possible, else default
+                batch_size = projection_data.shape[0]
+                num_channels = 1 # PET images are typically single-channel
+                current_image_estimate = torch.ones(batch_size, num_channels, img_h, img_w,
+                                                    dtype=torch.float32, device=self.device)
+            except AttributeError as e:
+                raise ValueError(f"Could not determine image size from system_matrix: {e}. "
+                                 "Ensure system_matrix.img_size is set or provide initial_image.")
+
+        # Ensure initial image is positive
+        current_image_estimate[current_image_estimate <= 0] = self.epsilon
+
+        # --- Subset Definition ---
+        all_angles = self.system_matrix.scanner_geometry.angles
+        num_total_angles = len(all_angles)
+        if self.num_subsets <= 0 or self.num_subsets > num_total_angles:
+            raise ValueError(f"Number of subsets ({self.num_subsets}) must be positive and not exceed total angles ({num_total_angles}).")
+
+        subset_angle_indices_list = [[] for _ in range(self.num_subsets)]
+        for i in range(num_total_angles):
+            subset_angle_indices_list[i % self.num_subsets].append(i)
+        
+        # Convert lists to numpy arrays for easier indexing later if needed by ScannerGeometry
+        subset_angle_indices_list = [np.array(indices) for indices in subset_angle_indices_list]
+
+        if self.verbose:
+            print(f"Starting OSEM Reconstruction: {self.num_iterations} iterations, {self.num_subsets} subsets.")
+            print(f"Initial image estimate shape: {current_image_estimate.shape}, device: {current_image_estimate.device}")
+            print(f"Projection data shape: {projection_data.shape}, device: {projection_data.device}")
+
+        # --- Main Iteration Loop ---
+        for iter_num in range(self.num_iterations):
+            if self.verbose:
+                print(f"--- Iteration {iter_num + 1}/{self.num_iterations} ---")
+
+            # --- Subset Loop ---
+            for subset_idx in range(self.num_subsets):
+                current_subset_angle_indices = subset_angle_indices_list[subset_idx]
+                if len(current_subset_angle_indices) == 0:
+                    if self.verbose: print(f"Skipping empty subset {subset_idx + 1}/{self.num_subsets}")
+                    continue
+                
+                if self.verbose:
+                    print(f"  Processing subset {subset_idx + 1}/{self.num_subsets} with {len(current_subset_angle_indices)} angles.")
+
+                # a. Get current subset's projection data
+                # Assuming projection_data is (batch, channels, num_total_angles, num_detectors)
+                # And angles are the 3rd dimension (index 2)
+                measured_projections_subset = projection_data.index_select(2, torch.tensor(current_subset_angle_indices, device=self.device))
+
+                # b. Create SystemMatrix for the current subset
+                subset_system_matrix = self._get_subset_system_matrix(current_subset_angle_indices)
+                
+                # c. Calculate Sensitivity Image for the subset
+                # The shape of measured_projections_subset is (batch, channels, num_subset_angles, num_detectors)
+                sensitivity_image_subset = self._calculate_sensitivity_image_subset(subset_system_matrix, measured_projections_subset.shape)
+
+                # d. Forward Projection
+                # Ensure image estimate is positive before projection (though non-negativity is applied later too)
+                current_image_estimate[current_image_estimate <= self.epsilon] = self.epsilon
+                estimated_projections_subset = subset_system_matrix.forward_project(current_image_estimate)
+                estimated_projections_subset = estimated_projections_subset + self.epsilon # Avoid division by zero
+
+                # e. Ratio and Backprojection
+                ratio_subset = measured_projections_subset / estimated_projections_subset
+                correction_factor_subset = subset_system_matrix.backward_project(ratio_subset)
+
+                # f. Image Update
+                current_image_estimate = current_image_estimate * (correction_factor_subset / sensitivity_image_subset)
+                
+                # g. Apply Non-negativity
+                current_image_estimate = self.nonnegativity_constraint.apply(current_image_estimate)
 
 
-        if projection_data.device.type != self.device:
-            projection_data = projection_data.to(self.device)
+            if self.verbose:
+                img_norm = torch.linalg.norm(current_image_estimate.flatten()).item()
+                print(f"End of Iteration {iter_num + 1}. Image norm: {img_norm:.4e}")
+        
+        if self.verbose:
+            print("OSEM Reconstruction Finished.")
+        return current_image_estimate
 
-        print(f"Placeholder: Would perform OSEM reconstruction for {self.num_iterations} iterations "
-              f"with {self.num_subsets} subsets. Initial image shape: {initial_image.shape}, "
-              f"Projection data shape: {projection_data.shape}")
-        raise NotImplementedError("OSEM `reconstruct` method is not yet implemented. "
-                                  "Subset handling and the iterative update rule need to be implemented.")
-
-    def solve(self, k_space_data: torch.Tensor, forward_op: SystemMatrix, regularizer: Regularizer = None, initial_guess: torch.Tensor = None) -> torch.Tensor:
+    def solve(self, k_space_data: torch.Tensor, forward_op: SystemMatrix, regularizer: Optional[Regularizer] = None, initial_guess: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Calls the OSEM reconstruct method.
         Adapts OSEM to the general Optimizer interface.

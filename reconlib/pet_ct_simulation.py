@@ -70,14 +70,53 @@ class PhantomGenerator:
         # coordinates fall within those shapes. Libraries like `skimage.data.shepp_logan_phantom`
         # (NumPy based) or custom PyTorch implementations would be used here.
 
-        raise NotImplementedError(f"Phantom generation for type '{phantom_type}' is not yet implemented.")
-        # Example (conceptual, not functional without actual shepp_logan_torch):
-        # if phantom_type == 'shepp-logan-pet':
-        #     phantom = shepp_logan_torch(size, modified=kwargs.get('modified', True), pet_values=True, device=self.device)
-        #     return phantom
-        # else:
-        #     # Fallback for unimplemented types or create a simple dummy tensor
-        #     return torch.zeros(size, device=self.device)
+        if phantom_type.lower() == 'circles_pet':
+            if len(size) == 2:
+                H, W = size
+                phantom = torch.zeros(size, dtype=torch.float32, device=self.device)
+                # Add a large circle
+                y_coords, x_coords = torch.ogrid[-H//2:H//2, -W//2:W//2] # Create open grids
+                # Ensure y_coords and x_coords are on the correct device
+                y_coords = y_coords.to(self.device)
+                x_coords = x_coords.to(self.device)
+
+                mask1 = x_coords*x_coords + y_coords*y_coords <= (min(H,W)//3)**2
+                phantom[mask1] = 1.0
+                # Add a smaller circle with different intensity
+                mask2 = (x_coords-W//8)*(x_coords-W//8) + (y_coords-H//8)*(y_coords-H//8) <= (min(H,W)//6)**2
+                phantom[mask2] = 0.5
+                # Add batch and channel dimension: (B, C, H, W)
+                return phantom.unsqueeze(0).unsqueeze(0) 
+            else: # 3D
+                raise NotImplementedError(f"3D phantom generation for type '{phantom_type}' is not yet implemented.")
+        elif phantom_type.lower() == 'shepp-logan-pet': # Minimal 2D Shepp-Logan for PET
+            if len(size) == 2:
+                # This is a very simplified Shepp-Logan, actual implementation would use ellipse parameters
+                # For demonstration, using a similar structure to circles_pet
+                H, W = size
+                phantom = torch.zeros(size, dtype=torch.float32, device=self.device)
+                y_coords, x_coords = torch.ogrid[-H//2:H//2, -W//2:W//2]
+                y_coords = y_coords.to(self.device)
+                x_coords = x_coords.to(self.device)
+
+                # Background ellipse (representing soft tissue)
+                bg_ellipse = ((x_coords / (W*0.45))**2 + (y_coords / (H*0.4))**2) <= 1
+                phantom[bg_ellipse] = 0.2 # Low activity
+
+                # "Tumor" 1 (higher activity)
+                tumor1_ellipse = (((x_coords - W*0.1) / (W*0.1))**2 + ((y_coords + H*0.05) / (H*0.15))**2) <= 1
+                phantom[tumor1_ellipse] = 1.0
+
+                # "Tumor" 2 (medium activity)
+                tumor2_ellipse = (((x_coords + W*0.15) / (W*0.12))**2 + ((y_coords - H*0.1) / (H*0.08))**2) <= 1
+                phantom[tumor2_ellipse] = 0.75
+                
+                # Add batch and channel dimension: (B, C, H, W)
+                return phantom.unsqueeze(0).unsqueeze(0)
+            else: # 3D
+                raise NotImplementedError(f"3D phantom generation for type '{phantom_type}' is not yet implemented.")
+        else:
+            raise NotImplementedError(f"Phantom generation for type '{phantom_type}' is not yet implemented.")
 
 
 def simulate_projection_data(phantom: torch.Tensor,
@@ -147,34 +186,51 @@ def simulate_projection_data(phantom: torch.Tensor,
     #     ideal_projection_data = projector.forward_project(phantom) # or projector.op(phantom)
     # else: ...
 
-    raise NotImplementedError("Core forward projection step in `simulate_projection_data` is not implemented.")
+    # Ensure phantom is on the correct device
+    projector_device_to_check = None
+    if hasattr(projector, 'device'): # SystemMatrix, ForwardProjector directly
+        projector_device_to_check = projector.device
+    elif hasattr(projector, 'system_matrix') and hasattr(projector.system_matrix, 'device'): # ForwardProjector wraps SystemMatrix
+        projector_device_to_check = projector.system_matrix.device
     
-    # ideal_projection_data = torch.rand( (phantom.shape[0] if phantom.ndim > 2 else 1, 1, 180, 128), device=phantom.device) # Dummy data
+    if projector_device_to_check and phantom.device != projector_device_to_check:
+        phantom = phantom.to(projector_device_to_check)
+
+    if isinstance(projector, SystemMatrix):
+        projection_data = projector.op(phantom)
+    elif isinstance(projector, ForwardProjector):
+        projection_data = projector.project(phantom) # project method of ForwardProjector
+    else:
+        raise TypeError("projector must be an instance of SystemMatrix or ForwardProjector")
 
     # 2. Add noise (if specified)
-    # if noise_model:
-    #     print(f"Placeholder: Adding '{noise_model}' noise with params: {noise_params}")
-    #     if noise_model.lower() == 'poisson':
-    #         # For PET, projection data often represents expected counts.
-    #         # y_ideal = ideal_projection_data
-    #         # sensitivity = noise_params.get('sensitivity', 1.0) # Overall scaling
-    #         # y_mean_counts = sensitivity * y_ideal
-    #         # noisy_projection_data = torch.poisson(y_mean_counts) / sensitivity
-    #         # For CT, often log(I0/I), noise added to I then log taken, or Gaussian on log data.
-    #         # This is highly dependent on what ideal_projection_data represents.
-    #         raise NotImplementedError("Poisson noise model not fully implemented for current ideal_projection_data.")
-    #     elif noise_model.lower() == 'gaussian':
-    #         # mean = noise_params.get('mean', 0.0)
-    #         # std = noise_params.get('std', 0.1)
-    #         # noise = torch.normal(mean, std, size=ideal_projection_data.shape, device=ideal_projection_data.device)
-    #         # noisy_projection_data = ideal_projection_data + noise
-    #         raise NotImplementedError("Gaussian noise model not fully implemented.")
-    #     else:
-    #         raise ValueError(f"Unsupported noise model: {noise_model}")
-    # else:
-    #     noisy_projection_data = ideal_projection_data
-    #
-    # return noisy_projection_data
+    if noise_model:
+        if noise_model.lower() == 'poisson':
+            intensity_scale = noise_params.get('intensity_scale', 1000.0)
+            # Ensure projection_data is non-negative before scaling for Poisson noise
+            # And scale it to simulate counts
+            max_abs_val = torch.max(torch.abs(projection_data))
+            if max_abs_val == 0: max_abs_val = torch.tensor(1.0) # Avoid division by zero if projection_data is all zero
+
+            scaled_projections = torch.relu(projection_data / max_abs_val * intensity_scale)
+            
+            noisy_projections = torch.poisson(scaled_projections)
+            # Scale back to original data range
+            noisy_projections = noisy_projections / intensity_scale * max_abs_val
+            return noisy_projections
+        elif noise_model.lower() == 'gaussian':
+            sigma = noise_params.get('sigma', 0.1)
+            # Scale sigma relative to data magnitude if desired, or use absolute sigma
+            # For simplicity, using sigma as a fraction of max intensity if not directly interpretable
+            # actual_sigma = sigma * torch.max(torch.abs(projection_data)) if torch.max(torch.abs(projection_data)) > 0 else sigma
+            # Or, assume sigma is absolute. Let's assume sigma is absolute for now.
+            noise = torch.randn_like(projection_data) * sigma
+            noisy_projections = projection_data + noise
+            return noisy_projections
+        else:
+            raise ValueError(f"Unsupported noise model: {noise_model}. Choose 'poisson' or 'gaussian'.")
+    else: # No noise model
+        return projection_data
 
 # Example Usage (commented out, requires actual implementations)
 # if __name__ == '__main__':
