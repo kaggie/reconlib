@@ -1,13 +1,19 @@
 # reconlib/plotting.py
 """Module for visualization tasks in MRI reconstruction."""
+""" Note that there are also PET CT plotting functions here"""
+""" All Voronoi functions should be eventually fully replaced with custom functions in this library"""
 
 import numpy as np
 import matplotlib.pyplot as plt
-from scipy.spatial import Voronoi, voronoi_plot_2d
+
+
+from typing import Union, List, Optional, Dict, Any # Added for new functions
+
 import torch 
 from mpl_toolkits.mplot3d import Axes3D 
-# Voronoi is already imported by plot_voronoi_diagram_2d
+# Voronoi is already imported by plot_voronoi_diagram_2d - scipy functions should eventually be replaced by this library function
 from .voronoi_utils import ConvexHull # Added for plot_3d_voronoi_with_hull
+from scipy.spatial import Voronoi, voronoi_plot_2d
 
 def plot_phase_image(phase_image: np.ndarray, title: str = "Phase Image", cmap: str = "twilight", vmin: float = -np.pi, vmax: float = np.pi, filename: str = None):
     """
@@ -35,6 +41,226 @@ def plot_phase_image(phase_image: np.ndarray, title: str = "Phase Image", cmap: 
     else:
         plt.show()
 
+
+
+def plot_projection_data(projection_data: np.ndarray, title: str = "Projection Data",
+                         aspect_ratio: str = 'auto', cmap: str = 'viridis',
+                         filename: Optional[str] = None):
+    """
+    Displays or saves 2D projection data (e.g., a sinogram).
+    Assumes projection_data is a 2D NumPy array.
+
+    Args:
+        projection_data (np.ndarray): The 2D projection data.
+        title (str, optional): Title of the plot. Defaults to "Projection Data".
+        aspect_ratio (str, optional): Aspect ratio for imshow. Defaults to 'auto'.
+                                      Use 'equal' for square pixels.
+        cmap (str, optional): Colormap for the plot. Defaults to 'viridis'.
+        filename (Optional[str], optional): If provided, saves the figure. Otherwise, shows it.
+    """
+    if not isinstance(projection_data, np.ndarray) or projection_data.ndim != 2:
+        raise ValueError("projection_data must be a 2D NumPy array.")
+
+    plt.figure()
+    plt.imshow(projection_data, cmap=cmap, aspect=aspect_ratio)
+    plt.colorbar(label="Intensity")
+    plt.title(title)
+    plt.xlabel("Detector Bin")
+    plt.ylabel("Angle/View")
+    # plt.gca().set_aspect(aspect_ratio) # Covered by imshow's aspect argument
+
+    if filename:
+        plt.savefig(filename, bbox_inches='tight')
+        plt.close()
+    else:
+        plt.show()
+
+
+def _get_slice_indices(num_total_slices: int, num_slices_to_display: Optional[int] = None, specific_indices: Optional[List[int]] = None) -> List[int]:
+    """Helper function to determine slice indices for display."""
+    if specific_indices:
+        # Validate specific indices
+        valid_indices = [idx for idx in specific_indices if 0 <= idx < num_total_slices]
+        if not valid_indices:
+            # Fallback if no valid specific indices are provided
+            print(f"Warning: Provided specific_indices {specific_indices} are out of range for {num_total_slices} slices. Defaulting.")
+            return list(np.linspace(0, num_total_slices - 1, min(3, num_total_slices), dtype=int))
+        return sorted(list(set(valid_indices))) # Ensure unique and sorted
+
+    if num_slices_to_display is None or num_slices_to_display <= 0:
+        num_slices_to_display = min(3, num_total_slices) # Default to 3 or fewer if not enough slices
+
+    num_slices_to_display = min(num_slices_to_display, num_total_slices)
+    if num_slices_to_display == 0:
+        return []
+        
+    # Linspace handles cases where num_total_slices < num_slices_to_display by returning fewer points
+    indices = np.linspace(0, num_total_slices - 1, num_slices_to_display, dtype=int).tolist()
+    return sorted(list(set(indices))) # Ensure unique and sorted, handles num_slices_to_display > num_total_slices
+
+
+def visualize_reconstruction(image: np.ndarray,
+                             slice_info: Optional[Union[int, List[int], Dict[int, Union[int, List[int]]]]] = None,
+                             cmap: str = 'gray',
+                             main_title: str = "Reconstructed Image",
+                             row_titles: Optional[List[str]] = None, # e.g., ["Axial", "Sagittal", "Coronal"]
+                             filename: Optional[str] = None):
+    """
+    Displays or saves slices of a 2D or 3D reconstructed image.
+
+    Args:
+        image (np.ndarray): The 2D or 3D image data. Assumes (H, W) for 2D,
+                            and (Depth, Height, Width) or (Slice, H, W) for 3D.
+                            Order of axes for 3D (e.g. ZYX, XYZ) should be consistent.
+        slice_info (Optional[Union[int, List[int], Dict[int, Union[int, List[int]]]]], optional):
+            Determines how slices are displayed for 3D images.
+            - If None (default for 3D): Show N=3 evenly spaced slices for each of the 3 axes (0, 1, 2).
+            - If int (e.g., `slice_info=5`): Show 5 evenly spaced slices for each of the 3 axes.
+            - If List[int] (e.g., `slice_info=[10, 20, 30]`): Interpreted as slice indices for axis 0.
+            - If Dict[int, Union[int, List[int]]] (e.g., `{0: 10, 1: [15, 25], 2: 3}`):
+                Keys are axis indices (0, 1, 2).
+                Values can be an int (number of evenly spaced slices) or a List[int] (specific slice indices for that axis).
+            For 2D images, this parameter is ignored.
+        cmap (str, optional): Colormap for the images. Defaults to 'gray'.
+        main_title (str, optional): Overall title for the figure. Defaults to "Reconstructed Image".
+        row_titles (Optional[List[str]], optional): Titles for rows if multiple axes are plotted.
+                                                   Defaults to ["Slices along Axis 0", ...].
+        filename (Optional[str], optional): If provided, saves the figure. Otherwise, shows it.
+    """
+    if not isinstance(image, np.ndarray):
+        raise ValueError("Image must be a NumPy array.")
+
+    if image.ndim == 2:
+        plt.figure(figsize=(6, 6))
+        plt.imshow(image, cmap=cmap)
+        plt.colorbar()
+        plt.title(main_title)
+        plt.axis('off')
+    elif image.ndim == 3:
+        num_axes_to_plot = 0
+        slices_to_plot_per_axis: Dict[int, List[int]] = {}
+        axis_titles_map = ["Slices along Axis 0 (e.g., Axial)",
+                           "Slices along Axis 1 (e.g., Sagittal)",
+                           "Slices along Axis 2 (e.g., Coronal)"]
+        if row_titles:
+            axis_titles_map = [row_titles[i] if i < len(row_titles) else axis_titles_map[i] for i in range(3)]
+
+
+        if slice_info is None: # Default: 3 slices for each of the 3 axes
+            num_axes_to_plot = 3
+            for axis_idx in range(3):
+                if image.shape[axis_idx] > 0: # Check if axis has size
+                    slices_to_plot_per_axis[axis_idx] = _get_slice_indices(image.shape[axis_idx], 3)
+                else: # Axis has size 0, cannot plot
+                    slices_to_plot_per_axis[axis_idx] = []
+
+        elif isinstance(slice_info, int): # N evenly spaced slices for each of the 3 axes
+            num_axes_to_plot = 3
+            for axis_idx in range(3):
+                if image.shape[axis_idx] > 0:
+                    slices_to_plot_per_axis[axis_idx] = _get_slice_indices(image.shape[axis_idx], slice_info)
+                else:
+                    slices_to_plot_per_axis[axis_idx] = []
+
+        elif isinstance(slice_info, list): # Specific slices for axis 0
+            num_axes_to_plot = 1
+            if image.shape[0] > 0:
+                 slices_to_plot_per_axis[0] = _get_slice_indices(image.shape[0], specific_indices=slice_info)
+            else:
+                 slices_to_plot_per_axis[0] = []
+
+
+        elif isinstance(slice_info, dict):
+            num_axes_to_plot = len(slice_info)
+            for axis_idx, s_info in slice_info.items():
+                if not (0 <= axis_idx < 3):
+                    print(f"Warning: Invalid axis index {axis_idx} in slice_info. Skipping.")
+                    num_axes_to_plot -=1
+                    continue
+                if image.shape[axis_idx] == 0:
+                    slices_to_plot_per_axis[axis_idx] = []
+                    continue
+
+                if isinstance(s_info, int):
+                    slices_to_plot_per_axis[axis_idx] = _get_slice_indices(image.shape[axis_idx], s_info)
+                elif isinstance(s_info, list):
+                    slices_to_plot_per_axis[axis_idx] = _get_slice_indices(image.shape[axis_idx], specific_indices=s_info)
+                else:
+                    print(f"Warning: Invalid slice info for axis {axis_idx}. Defaulting.")
+                    slices_to_plot_per_axis[axis_idx] = _get_slice_indices(image.shape[axis_idx], 3)
+        else:
+            raise ValueError("Invalid slice_info format.")
+
+        # Filter out axes with no valid slices
+        active_axes_to_plot = sorted([axis for axis, slices in slices_to_plot_per_axis.items() if slices])
+        num_active_axes = len(active_axes_to_plot)
+
+        if num_active_axes == 0:
+            print("Warning: No valid slices found to display for the 3D image based on slice_info.")
+            # Optionally plot a placeholder or return
+            plt.figure()
+            plt.text(0.5, 0.5, "No slices to display", ha='center', va='center')
+            plt.title(main_title)
+            if filename: plt.savefig(filename); plt.close()
+            else: plt.show()
+            return
+
+        max_cols = 0
+        for axis_idx in active_axes_to_plot:
+            max_cols = max(max_cols, len(slices_to_plot_per_axis[axis_idx]))
+        
+        if max_cols == 0: # Should be caught by num_active_axes == 0, but as safeguard
+            print("Warning: Max columns for subplots is 0. No slices to display.")
+            # ... (similar placeholder plot as above)
+            plt.figure()
+            plt.text(0.5, 0.5, "No slices to display (max_cols is 0)", ha='center', va='center')
+            plt.title(main_title)
+            if filename: plt.savefig(filename); plt.close()
+            else: plt.show()
+            return
+
+
+        fig, axes = plt.subplots(num_active_axes, max_cols, figsize=(max_cols * 4, num_active_axes * 4), squeeze=False)
+        fig.suptitle(main_title, fontsize=16)
+
+        for row, axis_idx in enumerate(active_axes_to_plot):
+            current_axis_slices = slices_to_plot_per_axis[axis_idx]
+            axes[row, 0].set_ylabel(axis_titles_map[axis_idx], fontsize=12) # Row title
+
+            for col, slice_idx in enumerate(current_axis_slices):
+                ax = axes[row, col]
+                if axis_idx == 0: # Slice along Z (depth) -> (H, W)
+                    slice_data = image[slice_idx, :, :]
+                elif axis_idx == 1: # Slice along Y (height) -> (D, W), transpose for display (W, D)
+                    slice_data = image[:, slice_idx, :].T
+                elif axis_idx == 2: # Slice along X (width) -> (D, H), transpose for display (H, D)
+                    slice_data = image[:, :, slice_idx].T
+                else:
+                    continue # Should not happen
+
+                im = ax.imshow(slice_data, cmap=cmap, origin='lower') # origin='lower' is common for medical images
+                ax.set_title(f"Slice {slice_idx}")
+                ax.axis('off')
+                # Add a colorbar to each subplot. For shared colorbar, it's more complex.
+                fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+
+            # Hide unused subplots in the row
+            for col in range(len(current_axis_slices), max_cols):
+                axes[row, col].axis('off')
+        
+        plt.tight_layout(rect=[0, 0.03, 1, 0.95]) # Adjust layout to make space for suptitle
+
+    else:
+        raise ValueError(f"Unsupported image ndim: {image.ndim}. Must be 2 or 3.")
+
+    if filename:
+        plt.savefig(filename, bbox_inches='tight')
+        plt.close()
+    else:
+        plt.show()
+
+        
 def plot_3d_delaunay(points: torch.Tensor, 
                      tetrahedra: torch.Tensor, 
                      convex_hull: ConvexHull = None, # Accepts a precomputed ConvexHull object
@@ -418,6 +644,7 @@ def plot_3d_hull(points: torch.Tensor, vertices: torch.Tensor, simplices: torch.
         ax.legend(by_label.values(), by_label.keys())
     
     plt.show()
+
 
 def plot_voronoi_diagram_2d(points: np.ndarray, ax: plt.Axes = None, 
                             show_points: bool = True, line_colors='k', 

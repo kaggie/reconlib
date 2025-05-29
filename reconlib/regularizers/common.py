@@ -476,3 +476,72 @@ class CharbonnierRegularizer(Regularizer):
         u_abs = self._solve_charbonnier_prox_scalar(x_abs, gamma_eff)
         
         return torch.sign(x) * u_abs
+
+
+class NonnegativityConstraint(Regularizer):
+    """
+    Non-negativity constraint: R(x) = 0 if x >= 0, infinity otherwise.
+    This is an indicator function for the set of non-negative numbers.
+    """
+    def __init__(self):
+        """
+        Initializes the NonnegativityConstraint.
+        """
+        super().__init__()
+
+    def value(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Value of the non-negativity constraint (0 if x_i >= 0 for all i, infinity otherwise).
+        Returns 0 as a placeholder for finite-value representation if the constraint is met,
+        otherwise effectively infinity (though not explicitly returned as torch.inf for practical reasons
+        unless a specific solver framework handles it).
+
+        Args:
+            x (torch.Tensor): The input tensor.
+
+        Returns:
+            torch.Tensor: Scalar tensor, 0.0 if constraint is met by all elements,
+                          otherwise could be a large number or handled by solver logic.
+                          For simplicity, returns 0.0, assuming proximal operator enforces it.
+        """
+        # A more accurate representation for hard constraints if needed by a solver:
+        # if torch.all(x >= 0):
+        #     return torch.tensor(0.0, device=x.device, dtype=x.dtype)
+        # else:
+        #     return torch.tensor(float('inf'), device=x.device, dtype=x.dtype)
+        # For now, returning 0 and relying on the prox.
+        return torch.tensor(0.0, device=x.device, dtype=x.dtype if x.is_floating_point() else torch.float32)
+
+    def proximal_operator(self, x: torch.Tensor, steplength: float | torch.Tensor) -> torch.Tensor:
+        """
+        Projects the input tensor onto the non-negative set.
+        Assumes real input for image intensities. If complex, applies to real part and zeros imaginary part.
+        The steplength parameter is not used for this particular proximal operator.
+
+        Args:
+            x (torch.Tensor): The input tensor.
+            steplength (float | torch.Tensor): The step length (ignored).
+
+        Returns:
+            torch.Tensor: The tensor projected onto the non-negative set.
+        """
+        if x.is_complex():
+            # This behavior is chosen assuming the underlying physical quantity must be real and non-negative.
+            # If only the real part needs to be non-negative, x.imag could be preserved.
+            print("Warning: NonnegativityConstraint applied to complex tensor. Applying to real part and zeroing imaginary part.")
+            return torch.complex(torch.relu(x.real), torch.zeros_like(x.imag))
+        else:
+            return torch.relu(x)
+
+    def apply(self, image: torch.Tensor) -> torch.Tensor:
+        """
+        Enforces non-negativity on the image by applying the proximal operator.
+
+        Args:
+            image (torch.Tensor): The input image tensor.
+
+        Returns:
+            torch.Tensor: The image tensor with non-negativity enforced.
+        """
+        # steplength is irrelevant for projection onto a convex set like non-negativity
+        return self.proximal_operator(image, steplength=0.0)
