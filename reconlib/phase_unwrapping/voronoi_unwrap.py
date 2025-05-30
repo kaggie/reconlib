@@ -320,5 +320,3 @@ def unwrap_phase_voronoi_region_growing(
     #     unwrapped_phase[unvisited_and_masked] = phase_data[unvisited_and_masked]
 
     return unwrapped_phase
-
-[end of reconlib/phase_unwrapping/voronoi_unwrap.py]
