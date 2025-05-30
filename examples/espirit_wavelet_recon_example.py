@@ -4,25 +4,31 @@ import matplotlib.pyplot as plt
 import sys
 import os
 
-# Add reconlib to path - Adjust if your environment handles this differently
+# This allows running the example directly from the 'examples' folder.
+# For general use, it's recommended to install reconlib (e.g., `pip install -e .` from root).
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 try:
     from reconlib.operators import NUFFTOperator
 except ImportError:
-    print("NUFFTOperator not found in reconlib.operators. Using a MockNUFFTOperator for demonstration.")
+    print("\n*****************************************************************")
+    print("WARNING: NUFFTOperator not found in reconlib.operators.")
+    print("         Using a MOCK NUFFTOperator for demonstration.")
+    print("         RESULTS WILL BE RANDOM AND NOT MEANINGFUL.")
+    print("*****************************************************************\n")
     class MockNUFFTOperator: # Placeholder
         def __init__(self, k_trajectory, image_shape, device='cpu', oversamp_factor=(2.0,2.0), 
-                     kb_J=(6,6), kb_alpha=(12,12), Ld=(128,128), **kwargs):
+                     kb_J=(6,6), kb_alpha=(12,12), Ld=(128,128), Kd=None, **kwargs): # Added Kd to mock
             self.k_trajectory = k_trajectory
             self.image_shape = image_shape
             self.device = device
             self.oversamp_factor = oversamp_factor
             self.kb_J = kb_J
             self.kb_alpha = kb_alpha
-            self.Ld = Ld # Grid size
+            self.Ld_table_length = Ld # Table length
+            self.Kd_oversampled_dims = Kd if Kd is not None else tuple(int(i*o) for i,o in zip(image_shape, oversamp_factor)) # Oversampled grid
             print(f"MockNUFFTOperator initialized for image shape {image_shape} on device {device}.")
-            print(f"  K-traj shape: {k_trajectory.shape}, OS: {oversamp_factor}, Kernel J: {kb_J}, Kernel Alpha: {kb_alpha}, Grid Ld: {Ld}")
+            print(f"  K-traj shape: {k_trajectory.shape}, OS: {oversamp_factor}, Kernel J: {kb_J}, Kernel Alpha: {kb_alpha}, Table Ld: {self.Ld_table_length}, Grid Kd: {self.Kd_oversampled_dims}")
 
         def op(self, x: torch.Tensor) -> torch.Tensor: # Expects (H, W)
             num_k_points = self.k_trajectory.shape[0]
@@ -35,7 +41,11 @@ except ImportError:
 try:
     from reconlib.nufft_multi_coil import MultiCoilNUFFTOperator
 except ImportError:
-    print("MultiCoilNUFFTOperator not found. Using a Mock version.")
+    print("\n*****************************************************************")
+    print("WARNING: MultiCoilNUFFTOperator not found in reconlib.nufft_multi_coil.")
+    print("         Using a MOCK MultiCoilNUFFTOperator for demonstration.")
+    print("         RESULTS WILL BE RANDOM AND NOT MEANINGFUL.")
+    print("*****************************************************************\n")
     class MockOperatorBase: # Simplified base if reconlib.operators.Operator is also missing
         def __init__(self): self.device = torch.device('cpu')
         def op(self, x): raise NotImplementedError
@@ -79,13 +89,19 @@ samples_per_spoke = image_size[0] * 2 # e.g., 128
 oversamp_factor = (2.0, 2.0)
 kb_J = (6, 6) # Kernel width for Kaiser-Bessel
 # kb_alpha calculation as specified, or common alternatives like 2.34 * J_val
-# Using the formula provided: kb_alpha = tuple(k * os for k, os in zip(kb_J, oversamp_factor))
-# However, a more standard approach for kb_alpha might be related to pi and J.
-# Let's use a common approximation if the above is not standard for the NUFFTOperator implementation:
-# kb_alpha = tuple(np.pi * j for j in kb_J) # Or another typical calculation
-# For now, sticking to the prompt's specified calculation, assuming it aligns with the NUFFTOperator's expectation.
+# kb_alpha: Kaiser-Bessel alpha parameter. This example uses kb_J * oversamp_factor.
+# Common alternatives include values around 2.34 * kb_J for os=2.0, or pi * kb_J.
+# The optimal value depends on the specific NUFFT implementation details.
 kb_alpha = tuple(k * os for k, os in zip(kb_J, oversamp_factor)) 
-Ld_grid_size = tuple(int(im_s * os) for im_s, os in zip(image_size, oversamp_factor))
+
+# Kd_oversampled_dims: Dimensions of the oversampled Cartesian grid for NUFFT.
+# This example uses image_shape * oversamp_factor.
+Kd_oversampled_dims = tuple(int(im_s * os) for im_s, os in zip(image_size, oversamp_factor))
+
+# Ld_table_length: Size of the lookup table for Kaiser-Bessel kernel interpolation.
+# Larger values provide more accuracy but increase memory.
+# reconlib.nufft.NUFFT2D/3D default to (1024, 1024) or (512,512,512) respectively.
+Ld_table_length = (1024, 1024) # For 2D example
 
 
 # Reconstruction parameters
@@ -174,19 +190,18 @@ base_nufft_op_params = {
     'k_trajectory': k_trajectory, 
     'image_shape': image_size, 
     'oversamp_factor': oversamp_factor, 
-    'kb_J': kb_J, 
-    'kb_alpha': kb_alpha, 
-    'Ld': Ld_grid_size, 
+    'kb_J': kb_J,
+    'kb_alpha': kb_alpha,
+    'Ld': Ld_table_length,      # Table length
+    'Kd': Kd_oversampled_dims,  # Oversampled grid dimensions
     'device': device
 }
 try:
-    # These parameters are based on common NUFFT library interfaces (e.g., TorchKbNufft, SigPy)
-    # Adjust if your NUFFTOperator has different parameter names or requirements
     single_coil_nufft = NUFFTOperator(**base_nufft_op_params)
 except TypeError as e:
     print(f"NUFFTOperator instantiation failed with TypeError: {e}")
     print("This might be due to parameter name mismatch if using a non-mock NUFFTOperator.")
-    print("Ensure base_nufft_op_params match the expected signature of your NUFFTOperator.")
+    print("Ensure base_nufft_op_params match the expected signature of your NUFFTOperator, including Kd and Ld distinction.")
     sys.exit(1)
     
 multi_coil_nufft = MultiCoilNUFFTOperator(single_coil_nufft)

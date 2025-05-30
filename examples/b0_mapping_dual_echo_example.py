@@ -41,8 +41,10 @@ def run_b0_mapping_example():
 
     # 3. Calculate B0 map using dual-echo method (first two echoes)
     print("\nCalculating B0 map using dual-echo method...")
+    # The calculate_b0_map_dual_echo function specifically requires two echoes.
+    # We select the first two phase images and corresponding echo times.
     b0_map_dual_echo_torch = calculate_b0_map_dual_echo(
-        phase_images_torch, echo_times_torch, mask=mask_torch
+        phase_images_torch[:2,...], echo_times_torch[:2], mask=mask_torch
     )
     b0_map_dual_echo_np = b0_map_dual_echo_torch.cpu().numpy()
 

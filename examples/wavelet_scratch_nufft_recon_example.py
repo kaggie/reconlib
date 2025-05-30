@@ -4,23 +4,34 @@ import matplotlib.pyplot as plt
 import sys
 import os
 
-# Add reconlib to path - Adjust if your environment handles this differently
+# This allows running the example directly from the 'examples' folder.
+# For general use, it's recommended to install reconlib (e.g., `pip install -e .` from root).
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 try:
     from reconlib.operators import NUFFTOperator
 except ImportError:
-    print("NUFFTOperator not found in reconlib.operators. Using a MockNUFFTOperator for demonstration.")
+    print("\n*****************************************************************")
+    print("WARNING: NUFFTOperator not found in reconlib.operators.")
+    print("         Using a MOCK NUFFTOperator for demonstration.")
+    print("         RESULTS WILL BE RANDOM AND NOT MEANINGFUL.")
+    print("*****************************************************************\n")
     # Define a Mock NUFFT operator if the real one is not available
     class MockNUFFTOperator:
-        def __init__(self, k_trajectory, image_shape, device='cpu', oversamp_factor=(2.0,2.0), kernel_params=(6,6), **kwargs):
+        def __init__(self, k_trajectory, image_shape, device='cpu', oversamp_factor=(2.0,2.0),
+                     kb_J=(6,6), kb_alpha=(13.8,13.8), Ld=(1024,1024), Kd=(128,128), kb_m=(0.0,0.0), **kwargs): # Standardized mock signature
             self.k_trajectory = k_trajectory
             self.image_shape = image_shape
             self.device = device
             self.oversamp_factor = oversamp_factor
-            self.kernel_params = kernel_params
+            self.kb_J = kb_J
+            self.kb_alpha = kb_alpha
+            self.Ld_table_length = Ld
+            self.Kd_oversampled_dims = Kd if Kd is not None else tuple(int(i*o) for i,o in zip(image_shape, oversamp_factor))
+            self.kb_m = kb_m
             print(f"MockNUFFTOperator initialized for image shape {image_shape} on device {device}.")
-            print(f"  Trajectory shape: {k_trajectory.shape}, Oversampling: {oversamp_factor}, Kernel: {kernel_params}")
+            print(f"  K-traj shape: {k_trajectory.shape}, OS: {self.oversamp_factor}, Kernel J: {self.kb_J}, "
+                  f"Alpha: {self.kb_alpha}, Table Ld: {self.Ld_table_length}, Grid Kd: {self.Kd_oversampled_dims}, KB_m: {self.kb_m}")
 
         def op(self, x: torch.Tensor) -> torch.Tensor: # Expects (H, W) or (B, H, W)
             if x.ndim == 2: # H, W
@@ -62,6 +73,18 @@ num_coils = 1 # For simplicity in this example
 # NUFFT parameters
 num_spokes = 32
 samples_per_spoke = image_size[0] * 2 # Oversampled radial
+# Define NUFFT parameters more explicitly for clarity and consistency
+oversamp_factor = (2.0, 2.0)
+kb_J_param = (6, 6)  # Using _param to avoid potential name collisions
+# kb_alpha: Kaiser-Bessel alpha parameter.
+# Common alternatives include values around 2.34 * kb_J for os=2.0.
+kb_alpha_param = tuple(k * os for k, os in zip(kb_J_param, oversamp_factor))
+# Kd_param: Dimensions of the oversampled Cartesian grid for NUFFT.
+Kd_param = tuple(int(im_s * os) for im_s, os in zip(image_size, oversamp_factor))
+# Ld_param: Size of the Kaiser-Bessel interpolation lookup table.
+Ld_param = (1024, 1024) # A common default for 2D
+kb_m_param = (0.0,0.0)
+
 
 # Reconstruction parameters
 lambda_reg_val = 0.005 # Adjusted for potentially noisy mock NUFFT
@@ -126,18 +149,18 @@ for wavelet_name in wavelet_names_to_test:
     sensitivity_maps = generate_dummy_sensitivity_maps(num_coils, image_size, device)
 
     # Instantiate NUFFT Operator
-    # Common defaults for NUFFTOperator if not using the mock
-    # These might be needed if the actual NUFFTOperator requires them.
-    nufft_kwargs = {
-        'oversamp_factor': (2.0, 2.0), 
-        'kernel_params': (6,6), # (kb_J, kb_alpha) for Kaiser-Bessel, or just J for Bart
-        'verbose': False
+    # Instantiate NUFFT Operator
+    nufft_op_args = {
+        'oversamp_factor': oversamp_factor, # Use the globally defined one
+        'kb_J': kb_J_param,
+        'kb_alpha': kb_alpha_param,
+        'Ld': Ld_param,
+        'Kd': Kd_param,
+        'kb_m': kb_m_param
+        # device is passed directly to constructor
     }
-    try:
-        nufft_op = NUFFTOperator(k_trajectory=k_trajectory, image_shape=image_size, device=device, **nufft_kwargs)
-    except TypeError as te: # Handle if some kwargs are not accepted by the actual NUFFTOperator
-        print(f"Warning: NUFFTOperator init failed with TypeError: {te}. Trying without extra kwargs.")
-        nufft_op = NUFFTOperator(k_trajectory=k_trajectory, image_shape=image_size, device=device)
+    # The TypeError fallback is removed as we are now providing the expected detailed parameters.
+    nufft_op = NUFFTOperator(k_trajectory=k_trajectory, image_shape=image_size, device=device, **nufft_op_args)
 
 
     # Instantiate Wavelet Regularizer and Reconstructor
