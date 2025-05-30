@@ -20,32 +20,56 @@ def iterative_reconstruction(
     """
     Performs iterative image reconstruction using gradient descent.
 
-    Args:
-        kspace_data (torch.Tensor): Complex-valued k-space measurements at sampling_points. Shape (N,).
-        sampling_points (torch.Tensor): Coordinates of k-space samples. Shape (N, d).
-        image_shape (tuple): Target image shape (e.g., (H, W) or (D, H, W)).
-        nufft_operator_class: The NUFFT operator class to instantiate (e.g., from reconlib.nufft).
-        nufft_kwargs (dict): Keyword arguments for initializing the NUFFT operator.
-                             This should include parameters like `oversamp_factor`, `kb_J`, etc.,
-                             but NOT `k_trajectory` (sampling_points) or `image_shape` which are
-                             passed directly. `device` will be inferred from `kspace_data`.
-        use_voronoi (bool, optional): If True, applies `voronoi_weights` to `kspace_data`
-                                      and passes them to NUFFT if `density_comp` is part of `nufft_kwargs`.
-                                      Defaults to False.
-        voronoi_weights (torch.Tensor, optional): Precomputed Voronoi weights. Required if `use_voronoi` is True.
-                                                  Shape (N,). Defaults to None.
-        max_iters (int, optional): Maximum number of iterations. Defaults to 10.
-        tol (float, optional): Tolerance for the L2 norm of the gradient to stop iterations. Defaults to 1e-6.
-        alpha_update_type (str, optional): Method for updating step size 'alpha'.
-                                           Currently, only 'fixed' is implemented. Defaults to 'fixed'.
-        fixed_alpha (float, optional): The fixed step size if `alpha_update_type` is 'fixed'. Defaults to 0.01.
+    This method aims to solve `argmin_x ||A x - y'||_2^2` where `y'` might be
+    pre-weighted k-space data if `use_voronoi` is True. The NUFFT operator `A`
+    itself might also apply density compensation during its adjoint operation
+    if `density_comp_weights` are passed via `nufft_kwargs`.
 
+    Args:
+        kspace_data (torch.Tensor): Complex-valued k-space measurements at
+            `sampling_points`. Expected shape: (num_k_points,).
+        sampling_points (torch.Tensor): Tensor of k-space trajectory coordinates,
+            typically normalized to [-0.5, 0.5] in each dimension.
+            Expected shape: (num_k_points, data_dimensionality).
+        image_shape (tuple): Desired shape of the reconstructed image
+            (e.g., (H, W) for 2D, (D, H, W) for 3D).
+        nufft_operator_class: The NUFFT operator class to be instantiated
+            (e.g., `reconlib.nufft.NUFFT2D` or `reconlib.nufft.NUFFT3D`).
+        nufft_kwargs (dict): Keyword arguments for initializing the
+            `nufft_operator_class`. This dictionary should contain NUFFT-specific
+            parameters like `oversamp_factor`, `kb_J`, `kb_alpha`, `Ld`, etc.
+            It can also include `density_comp_weights` for the NUFFT operator's
+            internal use.
+            Note: `image_shape` and `k_trajectory` (i.e., `sampling_points`)
+            are passed directly by this solver to the NUFFT operator and
+            should *not* be included in `nufft_kwargs`. The `device` for the
+            NUFFT operator will be inferred from `kspace_data`.
+        use_voronoi (bool, optional): If True, `voronoi_weights` are used.
+            These weights are applied (via square root) to `kspace_data` before
+            the gradient calculation's right-hand side `At(y')`. The full
+            `voronoi_weights` are also passed to the NUFFT operator via
+            `nufft_kwargs` (as `density_comp_weights`) if not already present,
+            for its internal density compensation during the adjoint operation.
+            Defaults to False.
+        voronoi_weights (torch.Tensor, optional): Precomputed Voronoi density
+            compensation weights. Required if `use_voronoi` is True.
+            Expected shape: (num_k_points,). Defaults to None.
+        max_iters (int, optional): Maximum number of gradient descent iterations.
+            Defaults to 10.
+        tol (float, optional): Tolerance for the L2 norm of the gradient.
+            Iteration stops if `||gradient||_2 < tol`. Defaults to 1e-6.
+        alpha_update_type (str, optional): Method for updating step size 'alpha'.
+            Currently, only 'fixed' is implemented. Defaults to 'fixed'.
+        fixed_alpha (float, optional): The fixed step size (learning rate) if
+            `alpha_update_type` is 'fixed'. Defaults to 0.01.
 
     Returns:
-        torch.Tensor: Reconstructed image of shape `image_shape`.
+        torch.Tensor: The reconstructed image tensor, with shape `image_shape`
+            and on the same device as `kspace_data`.
 
     Raises:
-        ValueError: If `use_voronoi` is True but `voronoi_weights` are not provided or have incorrect shape.
+        ValueError: If `use_voronoi` is True but `voronoi_weights` are not
+            provided or have an incorrect shape.
     """
     device = kspace_data.device
     dtype_complex = kspace_data.dtype # Should be complex
@@ -151,35 +175,56 @@ def fista_reconstruction(
     Performs iterative image reconstruction using the Fast Iterative Shrinkage-Thresholding
     Algorithm (FISTA).
 
-    Solves problems of the form: min_x 0.5 * ||A x - y||_2^2 + lambda_reg * g(x),
-    where y is k-space data, A is the NUFFT operator (which internally handles density compensation
-    if weights are provided), and g(x) is a regularizer with a known proximal operator.
+    Solves problems of the form: `min_x 0.5 * ||A x - y||_2^2 + lambda_reg * g(x)`,
+    where `y` is k-space data, `A` is the NUFFT operator, and `g(x)` is a
+    regularizer with a known proximal operator. The NUFFT operator `A` handles
+    density compensation internally if `density_comp_weights` (e.g., Voronoi
+    weights) are provided via `nufft_kwargs`.
 
     Args:
-        kspace_data (torch.Tensor): Complex-valued k-space measurements. Shape (N,).
-        sampling_points (torch.Tensor): Coordinates of k-space samples. Shape (N, d).
-        image_shape (tuple): Target image shape.
-        nufft_operator_class: The NUFFT operator class.
-        nufft_kwargs (dict): Keyword arguments for initializing NUFFT.
-        regularizer: Regularizer object with a `proximal_operator(data, step_size)` method.
-        lambda_reg (float): Regularization strength.
-        use_voronoi (bool, optional): If True, passes `voronoi_weights` to NUFFT.
-        voronoi_weights (torch.Tensor, optional): Precomputed Voronoi weights for NUFFT.
-        max_iters (int, optional): Maximum FISTA iterations. Defaults to 100.
-        tol (float, optional): Tolerance for relative change in solution to stop. Defaults to 1e-6.
-        line_search_params (dict, optional): Parameters for backtracking line search for Lipschitz constant.
-                                             If None, a fixed step size derived from an initial L (initial_L)
-                                             is used, and L might be increased if line search condition fails.
-                                             Expected keys: 'beta' (L increase factor, e.g. 2.0),
-                                                            'max_ls_iter' (max line search steps per FISTA iter),
-                                                            'initial_L' (initial estimate for Lipschitz constant).
-                                             A simple fixed step size can be used if line_search_params is None,
-                                             but backtracking is more robust.
-        verbose (bool, optional): If True, prints progress information. Defaults to False.
-
+        kspace_data (torch.Tensor): Complex-valued k-space measurements.
+            Expected shape: (num_k_points,).
+        sampling_points (torch.Tensor): Tensor of k-space trajectory coordinates,
+            typically normalized to [-0.5, 0.5].
+            Expected shape: (num_k_points, data_dimensionality).
+        image_shape (tuple): Desired shape of the reconstructed image.
+        nufft_operator_class: The NUFFT operator class to instantiate
+            (e.g., `reconlib.nufft.NUFFT2D` or `reconlib.nufft.NUFFT3D`).
+        nufft_kwargs (dict): Keyword arguments for initializing the
+            `nufft_operator_class`. This should contain NUFFT-specific
+            parameters like `oversamp_factor`, `kb_J`, etc. It can also include
+            `density_comp_weights`.
+            Note: `image_shape`, `k_trajectory` (i.e., `sampling_points`), and
+            `device` are handled by the solver and should not be in `nufft_kwargs`.
+        regularizer: An object representing the regularization term `g(x)`.
+            This object must implement a `proximal_operator(data, step_size)`
+            method which computes `prox_{step_size*g}(data)`.
+            For verbose cost calculation (currently not fully implemented beyond data
+            cost), it should also implement a `value(data)` method returning `g(data)`.
+        lambda_reg (float): The regularization strength parameter.
+        use_voronoi (bool, optional): If True, `voronoi_weights` are prepared
+            and passed to the NUFFT operator via `nufft_kwargs` under the key
+            `density_comp_weights` (if not already present). Defaults to False.
+        voronoi_weights (torch.Tensor, optional): Precomputed Voronoi density
+            compensation weights. Required if `use_voronoi` is True.
+            Expected shape: (num_k_points,). Defaults to None.
+        max_iters (int, optional): Maximum number of FISTA iterations.
+            Defaults to 100.
+        tol (float, optional): Tolerance for the relative change in the solution `x_k`
+            to determine convergence. Defaults to 1e-6.
+        line_search_params (dict, optional): Parameters for backtracking line search
+            to estimate the Lipschitz constant `L_k`. If None or empty,
+            defaults are used: `initial_L=1.0`, `beta=2.0`, `max_ls_iter=20`.
+            - `initial_L`: Initial estimate for `L_k`.
+            - `beta`: Factor by which `L_k` is increased during line search.
+            - `max_ls_iter`: Maximum iterations for line search within each FISTA step.
+        verbose (bool, optional): If True, prints progress information including
+            iteration number, Lipschitz constant, step size, data cost, and
+            relative change. Defaults to False.
 
     Returns:
-        torch.Tensor: Reconstructed image of shape `image_shape`.
+        torch.Tensor: The reconstructed image tensor, with shape `image_shape`
+            and on the same device as `kspace_data`.
     """
     device = kspace_data.device
     dtype_complex = kspace_data.dtype
@@ -380,30 +425,54 @@ def admm_reconstruction(
     Performs iterative image reconstruction using the Alternating Direction Method of
     Multipliers (ADMM).
 
-    Solves problems of the form: min_x 0.5 * ||A x - y||_2^2 + g(x)
-    by splitting into: min_x,z 0.5 * ||A x - y||_2^2 + g(z) subject to x - z = 0.
-    (Here, g(z) is handled by regularizer.proximal_operator with strength lambda_reg)
+    Solves problems of the form: `min_x 0.5 * ||A x - y||_2^2 + g(x)`
+    by reformulating as: `min_x,z 0.5 * ||A x - y||_2^2 + g(z)` subject to `x - z = 0`.
+    The NUFFT operator `A` handles density compensation internally if
+    `density_comp_weights` (e.g., Voronoi weights) are provided via `nufft_kwargs`.
 
     Args:
         kspace_data (torch.Tensor): Complex-valued k-space measurements.
-        sampling_points (torch.Tensor): Coordinates of k-space samples.
-        image_shape (tuple): Target image shape.
-        nufft_operator_class: The NUFFT operator class.
-        nufft_kwargs (dict): Keyword arguments for initializing NUFFT.
-        regularizer: Regularizer object with a `proximal_operator(data, step_size)` method.
-        lambda_reg (float): Regularization strength. The effective step for prox is lambda_reg/rho.
-        use_voronoi (bool, optional): If True, passes `voronoi_weights` to NUFFT.
-        voronoi_weights (torch.Tensor, optional): Precomputed Voronoi weights for NUFFT.
-        rho (float, optional): ADMM penalty parameter. Defaults to 1.0.
-        max_iters (int, optional): Maximum ADMM iterations. Defaults to 50.
-        tol_abs (float, optional): Absolute tolerance for convergence. Defaults to 1e-4.
-        tol_rel (float, optional): Relative tolerance for convergence. Defaults to 1e-3.
-        cg_max_iters_x_update (int, optional): Max CG iterations for x-update. Defaults to 10.
-        cg_tol_x_update (float, optional): CG tolerance for x-update. Defaults to 1e-5.
-        verbose (bool, optional): If True, prints progress information. Defaults to False.
+            Expected shape: (num_k_points,).
+        sampling_points (torch.Tensor): Tensor of k-space trajectory coordinates,
+            typically normalized to [-0.5, 0.5].
+            Expected shape: (num_k_points, data_dimensionality).
+        image_shape (tuple): Desired shape of the reconstructed image.
+        nufft_operator_class: The NUFFT operator class to instantiate
+            (e.g., `reconlib.nufft.NUFFT2D` or `reconlib.nufft.NUFFT3D`).
+        nufft_kwargs (dict): Keyword arguments for initializing the
+            `nufft_operator_class`. This should contain NUFFT-specific
+            parameters like `oversamp_factor`, `kb_J`, etc. It can also include
+            `density_comp_weights`.
+            Note: `image_shape`, `k_trajectory` (i.e., `sampling_points`), and
+            `device` are handled by the solver and should not be in `nufft_kwargs`.
+        regularizer: An object representing the regularization term `g(x)`.
+            Must implement `proximal_operator(data, step_size)` method,
+            which computes `prox_{step_size*g}(data)`.
+        lambda_reg (float): Regularization strength. The effective step size
+            for the proximal operator in the z-update is `lambda_reg / rho`.
+        use_voronoi (bool, optional): If True, `voronoi_weights` are prepared
+            and passed to the NUFFT operator via `nufft_kwargs` under the key
+            `density_comp_weights` (if not already present). Defaults to False.
+        voronoi_weights (torch.Tensor, optional): Precomputed Voronoi density
+            compensation weights. Required if `use_voronoi` is True.
+            Expected shape: (num_k_points,). Defaults to None.
+        rho (float, optional): The ADMM penalty parameter. Defaults to 1.0.
+        max_iters (int, optional): Maximum number of ADMM iterations.
+            Defaults to 50.
+        tol_abs (float, optional): Absolute tolerance for primal and dual
+            residuals. Defaults to 1e-4.
+        tol_rel (float, optional): Relative tolerance for primal and dual
+            residuals. Defaults to 1e-3.
+        cg_max_iters_x_update (int, optional): Maximum CG iterations for the
+            x-update subproblem. Defaults to 10.
+        cg_tol_x_update (float, optional): Tolerance for the CG solver in the
+            x-update subproblem. Defaults to 1e-5.
+        verbose (bool, optional): If True, prints progress information for ADMM
+            iterations and for the CG sub-problem. Defaults to False.
 
     Returns:
-        torch.Tensor: Reconstructed image of shape `image_shape`.
+        torch.Tensor: The reconstructed image tensor, with shape `image_shape`
+            and on the same device as `kspace_data`.
     """
     device = kspace_data.device
     dtype_complex = kspace_data.dtype
@@ -515,30 +584,50 @@ def conjugate_gradient_reconstruction(
     """
     Performs iterative image reconstruction using the Conjugate Gradient (CG) method.
 
-    Solves the normal equations A^H A x = A^H y, where y is the k-space data
-    (potentially pre-weighted if use_voronoi is True) and A is the NUFFT operator.
+    Solves the normal equations `A^H A x = A^H y`, where `y` is the k-space data
+    and `A` is the NUFFT operator. The NUFFT operator `A` handles density
+    compensation internally if `density_comp_weights` (e.g., Voronoi weights)
+    are provided via `nufft_kwargs`. In this case, the system effectively
+    becomes `A^H W A x = A^H W y` if the weights `W` are applied within the
+    adjoint operation of `A`.
 
     Args:
-        kspace_data (torch.Tensor): Complex-valued k-space measurements. Shape (N,).
-        sampling_points (torch.Tensor): Coordinates of k-space samples. Shape (N, d).
-        image_shape (tuple): Target image shape (e.g., (H, W) or (D, H, W)).
-        nufft_operator_class: The NUFFT operator class to instantiate.
-        nufft_kwargs (dict): Keyword arguments for initializing the NUFFT operator.
-                             This should include parameters like `oversamp_factor`, `kb_J`, etc.,
-                             but NOT `k_trajectory` or `image_shape`. `device` will be inferred.
-        use_voronoi (bool, optional): If True, applies `voronoi_weights` to `kspace_data`
-                                      before forming A^H y. Defaults to False.
-        voronoi_weights (torch.Tensor, optional): Precomputed Voronoi weights. Shape (N,).
-                                                  Required if `use_voronoi` is True. Defaults to None.
-        max_iters (int, optional): Maximum number of CG iterations. Defaults to 10.
-        tol (float, optional): Tolerance for the L2 norm of the residual to stop iterations.
-                               Defaults to 1e-6.
+        kspace_data (torch.Tensor): Complex-valued k-space measurements.
+            Expected shape: (num_k_points,).
+        sampling_points (torch.Tensor): Tensor of k-space trajectory coordinates,
+            typically normalized to [-0.5, 0.5].
+            Expected shape: (num_k_points, data_dimensionality).
+        image_shape (tuple): Desired shape of the reconstructed image.
+        nufft_operator_class: The NUFFT operator class to instantiate
+            (e.g., `reconlib.nufft.NUFFT2D` or `reconlib.nufft.NUFFT3D`).
+        nufft_kwargs (dict): Keyword arguments for initializing the
+            `nufft_operator_class`. This should contain NUFFT-specific
+            parameters like `oversamp_factor`, `kb_J`, `kb_alpha`, `Ld`, etc.
+            It can also include `density_comp_weights`.
+            Note: `image_shape` and `k_trajectory` (i.e., `sampling_points`)
+            are passed directly by this solver to the NUFFT operator and
+            should *not* be included in `nufft_kwargs`. The `device` for the
+            NUFFT operator will be inferred from `kspace_data`.
+        use_voronoi (bool, optional): If True, `voronoi_weights` are prepared
+            and passed to the NUFFT operator via `nufft_kwargs` under the key
+            `density_comp_weights` (if not already present). The NUFFT operator's
+            adjoint method is then responsible for applying these weights.
+            Defaults to False.
+        voronoi_weights (torch.Tensor, optional): Precomputed Voronoi density
+            compensation weights. Required if `use_voronoi` is True.
+            Expected shape: (num_k_points,). Defaults to None.
+        max_iters (int, optional): Maximum number of Conjugate Gradient iterations.
+            Defaults to 10.
+        tol (float, optional): Tolerance for the L2 norm of the residual.
+            Iteration stops if `||residual||_2 < tol`. Defaults to 1e-6.
 
     Returns:
-        torch.Tensor: Reconstructed image of shape `image_shape`.
+        torch.Tensor: The reconstructed image tensor, with shape `image_shape`
+            and on the same device as `kspace_data`.
 
     Raises:
-        ValueError: If `use_voronoi` is True but `voronoi_weights` are not provided or have incorrect shape.
+        ValueError: If `use_voronoi` is True but `voronoi_weights` are not
+            provided or have an incorrect shape.
     """
     device = kspace_data.device
     dtype_complex = kspace_data.dtype
