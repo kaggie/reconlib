@@ -40,3 +40,6 @@ This document describes a conceptually refactored version of the `compute_vorono
     -   This refactoring is primarily **structural** to demonstrate how the function would interface with a PyTorch-based Voronoi backend.
     -   The accuracy and robustness of the results heavily depend on the (currently placeholder) PyTorch Voronoi construction functions. Differences in how Voronoi diagrams are computed (e.g., qhull in SciPy vs. a custom Delaunay-dual method) can lead to variations in cell shapes, especially near boundaries or for points on the convex hull of the input set.
     -   The handling of unbounded Voronoi cells, particularly their interaction with finite `bounds`, is a complex topic that is simplified in this conceptual version. A full, robust implementation would require careful geometric logic for these cases.
+
+---
+For an example of how these Voronoi density weights are used in a full non-Cartesian MRI reconstruction pipeline, see the [main wiki example page on Voronoi Reconstruction](../../../wiki/VoronoiReconstructionExample.md).
