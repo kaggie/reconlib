@@ -1,12 +1,12 @@
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
-from reconlib.phase_unwrapping import unwrap_phase_romeo # Placeholder
+from reconlib.phase_unwrapping import unwrap_phase_romeo # Actual import
 from reconlib.phase_unwrapping.utils import generate_mask_for_unwrapping
 from reconlib.plotting import plot_phase_image, plot_unwrapped_phase_map # Using plot_unwrapped_phase_map for unwrapped
 
 def run_phase_unwrapping_example():
-    print("--- Running Phase Unwrapping ROMEO Example (Placeholder) ---")
+    print("--- Running Phase Unwrapping ROMEO Example ---")
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     # 1. Create Dummy Data
@@ -34,9 +34,8 @@ def run_phase_unwrapping_example():
     mask_np = generate_mask_for_unwrapping(magnitude_np, method='threshold', threshold_factor=0.05)
     mask_torch = torch.from_numpy(mask_np).bool().to(device) if mask_np is not None else None
 
-    # 3. Call ROMEO phase unwrapping (placeholder)
-    print("\nCalling ROMEO phase unwrapping (placeholder function)...")
-    # Since unwrap_phase_romeo is a placeholder, it will just return the input.
+    # 3. Call ROMEO phase unwrapping
+    print("\nCalling ROMEO phase unwrapping...")
     unwrapped_phase_torch = unwrap_phase_romeo(
         wrapped_phase_torch, 
         magnitude=magnitude_torch, 
@@ -59,8 +58,7 @@ def run_phase_unwrapping_example():
     plot_unwrapped_phase_map(true_phase_np * mask_np, title="True Unwrapped Phase (Masked)", filename=fn_t)
 
     plt.subplot(1, 3, 3)
-    # Since ROMEO is a placeholder, this will look like the wrapped phase.
-    plot_unwrapped_phase_map(unwrapped_phase_np * mask_np, title="ROMEO Unwrapped (Placeholder, Masked)", filename=fn_p)
+    plot_unwrapped_phase_map(unwrapped_phase_np * mask_np, title="ROMEO Unwrapped (Masked)", filename=fn_p)
     
     plt.suptitle("Phase Unwrapping ROMEO Example Results")
     plt.tight_layout(rect=[0, 0, 1, 0.96])

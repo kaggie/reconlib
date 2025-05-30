@@ -21,6 +21,9 @@ def run_espirit_nufft_example():
     kb_J = (6, 6) 
     kb_alpha = tuple(val * 2.34 for val in kb_J) # Common heuristic
     Ld = tuple(int(ims * ovs) for ims, ovs in zip(image_shape, oversamp_factor))
+    # Ld: Table length for NUFFT. This example uses image_shape * oversampling_factor.
+    # For higher accuracy, especially with larger kernels or higher precision needs,
+    # larger table lengths (e.g., 1024 or 2048 for 2D) can be used, similar to defaults in reconlib.nufft.NUFFT2D.
 
 
     # 2. Create Dummy Data
@@ -56,8 +59,8 @@ def run_espirit_nufft_example():
 
     #   c. Coil Sensitivity Maps (ESPIRiT placeholder)
     print("\nEstimating ESPIRiT maps (using placeholder)...")
-    # estimate_espirit_maps is a placeholder, will return zeros.
-    # We need non-zero maps for the example to run.
+    # NOTE: estimate_espirit_maps is a placeholder. Using simplified dummy sensitivity maps for this example.
+    # The actual estimate_espirit_maps function (if implemented) would derive these from calibration data.
     s_maps_np = np.zeros((num_coils,) + image_shape, dtype=np.complex64)
     for c in range(num_coils):
         # Simple phase variation across coils
@@ -135,23 +138,12 @@ def run_espirit_nufft_example():
 
     # True Image Phase
     plt.subplot(2, 2, 2)
-    # Using plot_phase_image for phase part
-    plot_phase_image(np.angle(true_image_np), title="True Image (Phase)", filename=fn_true_phase)
-    # The plot_phase_image function handles its own figure saving if filename is provided,
-    # so we don't call plt.savefig for this subplot if using that helper.
-    # For consistency, if plot_phase_image is used in a subplot, ensure it doesn't create a new figure.
-    # The current reconlib.plotting.plot_phase_image creates a new figure.
-    # For subplots, it's better to use plt.imshow directly for phase as well or modify plot_phase_image
-    # to accept an `ax` argument. For simplicity here, let's use imshow.
-    # Re-doing subplot for true phase with imshow:
-    if fn_true_phase: plt.close() # Close figure from plot_phase_image if it made one
-    plt.subplot(2, 2, 2) # Re-claim subplot
     plt.imshow(np.angle(true_image_np), cmap='twilight', vmin=-np.pi, vmax=np.pi)
     plt.title("True Image (Phase)")
     plt.colorbar(label="Phase (radians)")
     plt.axis('off')
-    if fn_true_phase: plt.savefig(fn_true_phase)
-
+    # If individual saving was intended for fn_true_phase, it would go here.
+    # However, the main figure is saved later, so this might be redundant.
 
     # Initial Estimate (Adjoint Recon)
     plt.subplot(2, 2, 3)
