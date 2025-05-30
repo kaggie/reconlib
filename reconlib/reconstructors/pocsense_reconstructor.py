@@ -256,5 +256,3 @@ if __name__ == '__main__':
     
     print(f"\nReconstructed image shape: {reconstructed_image.shape}, dtype: {reconstructed_image.dtype}")
     print("POCSENSEreconstructor basic test passed successfully.")
-
-```

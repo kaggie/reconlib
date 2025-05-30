@@ -6,7 +6,7 @@ import torchvision.transforms.functional as TF
 from reconlib.operators import NUFFTOperator # Assuming NUFFTOperator is in __init__ of operators
 
 # Attempt to import SigPy and related modules
-try:
+# try: # This try block was empty after removing SigPy imports.
     # Removed SigPy specific imports, as this will be a native PyTorch implementation.
     # _SIGPY_AVAILABLE = False # No longer needed
 

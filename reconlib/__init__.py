@@ -12,7 +12,7 @@ from .operators import (Operator, NUFFTOperator, CoilSensitivityOperator,
 # Updated import for regularizers to reflect their new structure
 from .regularizers.base import Regularizer
 from .regularizers.common import L1Regularizer, L2Regularizer, TVRegularizer, NonnegativityConstraint, HuberRegularizer, CharbonnierRegularizer
-from .regularizers.functional import SparsityTransform # Assuming functional.py holds this
+# from .regularizers.functional import SparsityTransform # Assuming functional.py holds this
 # GradientMatchingRegularizer might be in common or its own file, adjust as needed.
 # For now, assuming it might be in common or needs specific import if elsewhere.
 # If GradientMatchingRegularizer is in common.py, L1Regularizer etc. are there too.
@@ -86,7 +86,7 @@ from .voronoi.geometry_core import normalize_weights
 __all__ = [
     'MRIData', 'DICOMIO', # Added DICOMIO
     'Operator', 'NUFFTOperator', 'CoilSensitivityOperator', 'MRIForwardOperator', 'SlidingWindowNUFFTOperator',
-    'Regularizer', 'L1Regularizer', 'L2Regularizer', 'SparsityTransform', 'TVRegularizer', 'NonnegativityConstraint', 'HuberRegularizer', 'CharbonnierRegularizer', # Added NonnegativityConstraint etc.
+    'Regularizer', 'L1Regularizer', 'L2Regularizer', 'TVRegularizer', 'NonnegativityConstraint', 'HuberRegularizer', 'CharbonnierRegularizer', # Added NonnegativityConstraint etc. # Removed SparsityTransform
     'Optimizer', 'FISTA', 'ADMM', 'OrderedSubsetsExpectationMaximization', 'PenalizedLikelihoodReconstruction', # Added OSEM, PLR
     # 'Reconstructor', 'IterativeReconstructor', 'RegriddingReconstructor', 'ConstrainedReconstructor', # Old reconstructors
     'ProximalGradientReconstructor', # New reconstructor

@@ -10,10 +10,10 @@ from .common import (
 )
 
 # Assuming the refactored reconlib/regularizers.py still exists with these classes
-from .regularizers import (
-    SparsityTransform,
-    GradientMatchingRegularizer
-)
+# from .regularizers import (
+#     SparsityTransform,
+#     GradientMatchingRegularizer
+# )
 
 from .functional import (
     l1_norm,
@@ -30,8 +30,8 @@ __all__ = [
     'TVRegularizer',
     # 'HuberRegularizer', # To be added
     # 'CharbonnierRegularizer', # To be added
-    'SparsityTransform',
-    'GradientMatchingRegularizer',
+    # 'SparsityTransform',
+    # 'GradientMatchingRegularizer',
     'l1_norm',
     'l2_norm_squared',
     'total_variation',

@@ -265,5 +265,3 @@ if __name__ == '__main__':
     assert not torch.isnan(x_k_plus_1_output).any(), "NaNs found in output."
 
     print("LearnedRegularizationIteration basic test passed successfully.")
-
-```

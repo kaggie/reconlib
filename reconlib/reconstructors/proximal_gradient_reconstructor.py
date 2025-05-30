@@ -208,5 +208,3 @@ if __name__ == '__main__':
     )
     assert reconstructed_image_zero_init.shape == image_shape_test
     print("Zero initialization test (modified steplength) passed.")
-
-```

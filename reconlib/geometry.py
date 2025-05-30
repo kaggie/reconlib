@@ -4,7 +4,7 @@ import numpy as np
 import torch
 from abc import ABC, abstractmethod
 import matplotlib.pyplot as plt # Added for visualization
-from typing import Tuple, Optional, Union, List, Dict # Added for type hinting
+from typing import Tuple, Optional, Union, List, Dict, Any # Added for type hinting
 
 from reconlib.operators import PETForwardProjection, IRadon
 # Placeholder for image size, will be refined later
