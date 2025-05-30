@@ -278,5 +278,3 @@ assert not torch.isnan(reconstructed_image).any(), "NaNs found in reconstructed 
 
 print(f"\nESPIRiT-like example with {wavelet_name} completed successfully.")
 print("Note: If using MockNUFFTOperator, results are illustrative only.")
-
-```
