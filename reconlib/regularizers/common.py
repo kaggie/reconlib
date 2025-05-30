@@ -4,90 +4,184 @@ from .base import Regularizer # IMPORTANT: Inherit from the new base class
 from .functional import l1_norm, l2_norm_squared, total_variation, huber_penalty, charbonnier_penalty # Added charbonnier_penalty
 
 class L1Regularizer(Regularizer):
-    """
-    L1 Norm Regularizer: R(x) = lambda_reg * ||x||_1.
+    """L1 Norm Regularizer: R(x) = lambda_reg * ||x||_1.
+
+    This regularizer promotes sparsity in the solution `x` by penalizing the
+    sum of the absolute values of its elements. It is widely used in compressed
+    sensing and feature selection.
+    The L1 norm is applied element-wise and summed. For complex numbers,
+    the absolute value (magnitude) is used.
     """
     def __init__(self, lambda_reg: float):
+        """Initializes the L1 Regularizer.
+
+        Args:
+            lambda_reg (float): The regularization strength parameter.
+                Must be non-negative.
+        """
         super().__init__()
         if lambda_reg < 0:
             raise ValueError("lambda_reg must be non-negative.")
         self.lambda_reg = lambda_reg
 
     def value(self, x: torch.Tensor) -> torch.Tensor:
-        """Computes lambda_reg * ||x||_1."""
+        """Computes the L1 regularization value: lambda_reg * ||x||_1.
+
+        Args:
+            x (torch.Tensor): The input tensor. Can be real or complex.
+
+        Returns:
+            torch.Tensor: A scalar tensor representing the regularization value.
+        """
         return self.lambda_reg * l1_norm(x)
 
     def _soft_threshold_complex(self, x: torch.Tensor, threshold: float | torch.Tensor) -> torch.Tensor:
         """
-        Complex-aware soft-thresholding: sign(x) * max(|x| - threshold, 0).
+        Complex-aware soft-thresholding: sgn(x_i) * max(|x_i| - threshold, 0) for each element x_i.
+        If x is real, sgn(x_i) is equivalent to sign(x_i).
+        If x is complex, sgn(x_i) is x_i / |x_i| (or 0 if x_i is 0).
         """
         abs_x = torch.abs(x)
-        # threshold should be broadcastable with abs_x if it's a tensor
         shrinkage = torch.maximum(abs_x - threshold, torch.zeros_like(abs_x))
 
+        # Handle x_i = 0 case for complex sgn to avoid division by zero (0/0 -> NaN)
+        # torch.sgn handles this correctly for complex numbers (sgn(0) = 0).
         if x.is_complex():
             return torch.sgn(x) * shrinkage
         else: # Real case
             return torch.sign(x) * shrinkage
 
     def proximal_operator(self, x: torch.Tensor, steplength: float | torch.Tensor) -> torch.Tensor:
+        """Computes the proximal operator of the L1 regularizer.
+
+        Solves: `argmin_u { lambda_reg * ||u||_1 + (1/(2*steplength)) * ||u - x||_2^2 }`
+        This is equivalent to element-wise complex soft-thresholding:
+        `sgn(x_i) * max(|x_i| - lambda_reg * steplength, 0)`.
+
+        Args:
+            x (torch.Tensor): The input tensor. Can be real or complex.
+            steplength (float | torch.Tensor): The step length parameter (often
+                denoted as gamma or tau in optimization algorithms, sometimes
+                referred to as `t` or `alpha`). This scales the influence of the
+                quadratic term. Can be a float or a tensor broadcastable with `x`.
+
+        Returns:
+            torch.Tensor: The result of the proximal operation on `x`.
+            Has the same shape and dtype as `x`.
         """
-        Computes prox_R(x, steplength) = argmin_u { lambda_reg * ||u||_1 + (1/(2*steplength)) * ||u - x||_2^2 }
-        This is equivalent to soft_threshold(x, lambda_reg * steplength).
-        """
-        # Note: The 'steplength' here is the gamma in (1/(2*gamma)) * ||u-x||^2.
-        # The threshold for soft-thresholding is typically lambda_reg_true * gamma_optimizer.
-        # If self.lambda_reg is the true lambda, then the threshold is self.lambda_reg * steplength.
         if isinstance(steplength, torch.Tensor) and steplength.numel() > 1:
-            if not steplength.shape == x.shape: # Ensure broadcastable or same shape
-                 raise ValueError("If steplength is a tensor, its shape must be broadcastable to x.")
+            if not steplength.shape == x.shape and not x.shape == steplength.shape: # Basic check
+                 # A more robust check would be to try broadcasting and catch error, or use torch.broadcast_shapes
+                 try:
+                     torch.broadcast_shapes(x.shape, steplength.shape)
+                 except RuntimeError:
+                     raise ValueError(f"If steplength is a tensor ({steplength.shape}), its shape must be broadcastable to x ({x.shape}).")
         
         threshold_val = self.lambda_reg * steplength
         return self._soft_threshold_complex(x, threshold_val)
 
 class L2Regularizer(Regularizer):
-    """
-    Squared L2 Norm Regularizer: R(x) = 0.5 * lambda_reg * ||x||_2^2.
+    """Squared L2 Norm Regularizer: R(x) = 0.5 * lambda_reg * ||x||_2^2.
+
+    This regularizer, also known as Tikhonov regularization or Ridge regression,
+    penalizes large values in `x`, promoting solutions with smaller magnitudes.
+    The L2 norm is the sum of squares of the elements. For complex numbers,
+    it's the sum of squares of their magnitudes: `0.5 * lambda_reg * sum(|x_i|^2)`.
     """
     def __init__(self, lambda_reg: float):
+        """Initializes the L2 Regularizer.
+
+        Args:
+            lambda_reg (float): The regularization strength parameter.
+                Must be non-negative.
+        """
         super().__init__()
         if lambda_reg < 0:
             raise ValueError("lambda_reg must be non-negative.")
         self.lambda_reg = lambda_reg
 
     def value(self, x: torch.Tensor) -> torch.Tensor:
-        """Computes 0.5 * lambda_reg * ||x||_2^2."""
+        """Computes the L2 regularization value: 0.5 * lambda_reg * ||x||_2^2.
+
+        Args:
+            x (torch.Tensor): The input tensor. Can be real or complex.
+
+        Returns:
+            torch.Tensor: A scalar tensor representing the regularization value.
+        """
         return 0.5 * self.lambda_reg * l2_norm_squared(x)
 
     def proximal_operator(self, x: torch.Tensor, steplength: float | torch.Tensor) -> torch.Tensor:
+        """Computes the proximal operator of the squared L2 regularizer.
+
+        Solves: `argmin_u { 0.5 * lambda_reg * ||u||_2^2 + (1/(2*steplength)) * ||u - x||_2^2 }`
+        The solution is `x / (1 + lambda_reg * steplength)`.
+
+        Args:
+            x (torch.Tensor): The input tensor. Can be real or complex.
+            steplength (float | torch.Tensor): The step length parameter.
+                Can be a float or a tensor broadcastable with `x`.
+
+        Returns:
+            torch.Tensor: The result of the proximal operation on `x`.
+            Has the same shape and dtype as `x`.
         """
-        Computes prox_R(x, steplength) = argmin_u { 0.5 * lambda_reg * ||u||_2^2 + (1/(2*steplength)) * ||u - x||_2^2 }
-        This simplifies to x / (1 + lambda_reg * steplength).
-        """
-        # Here, steplength is gamma. The factor in prox is (lambda_reg * gamma).
         return x / (1 + self.lambda_reg * steplength)
 
 class TVRegularizer(Regularizer):
-    """
-    Total Variation (TV) Regularizer: R(x) = lambda_param * TV(x).
-    The proximal operator is solved using Chambolle's algorithm.
-    Assumes isotropic TV.
+    """Total Variation (TV) Regularizer: R(x) = lambda_param * TV(x).
+
+    This regularizer promotes piece-wise constant solutions by penalizing the
+    sum of the magnitudes of the gradients (or finite differences) of `x`.
+    It is commonly used for image denoising and reconstruction to preserve edges
+    while smoothing flat regions. This implementation assumes isotropic TV:
+    `TV(x) = sum_i sqrt( (grad_x x)_i^2 + (grad_y x)_i^2 + ... )`.
+
+    The proximal operator is solved using Chambolle's projection algorithm (for 2D/3D)
+    or its variants.
     """
     def __init__(self, 
                  lambda_param: float, 
                  max_chambolle_iter: int = 50, 
                  tol_chambolle: float = 1e-5, 
                  verbose_chambolle: bool = False):
+        """Initializes the Total Variation (TV) Regularizer.
+
+        Args:
+            lambda_param (float): The regularization strength parameter.
+                Must be non-negative.
+            max_chambolle_iter (int, optional): Maximum number of iterations for
+                Chambolle's algorithm in the proximal operator. Defaults to 50.
+            tol_chambolle (float, optional): Tolerance for convergence of
+                Chambolle's algorithm. Defaults to 1e-5.
+            verbose_chambolle (bool, optional): If True, prints convergence
+                information from Chambolle's algorithm. Defaults to False.
+        """
         super().__init__()
         if lambda_param < 0:
             raise ValueError("lambda_param must be non-negative.")
-        self.lambda_param = lambda_param # lambda_reg for consistency with L1/L2
+        self.lambda_param = lambda_param
         self.max_iter = max_chambolle_iter
         self.tol = tol_chambolle
         self.verbose = verbose_chambolle
 
     def value(self, x: torch.Tensor) -> torch.Tensor:
-        """Computes lambda_param * TV(x) using isotropic TV."""
+        """Computes the TV regularization value: lambda_param * TV(x).
+
+        Assumes isotropic TV. For complex data, TV is typically applied to the
+        magnitude or to real and imaginary parts separately. This implementation
+        passes the complex data to `functional.total_variation` which may
+        handle it by summing TV of real and imaginary parts or by using
+        complex-valued gradients.
+
+        Args:
+            x (torch.Tensor): The input tensor. Can be real or complex.
+                Expected to be 2D (H,W), 3D (D,H,W), or higher with leading
+                batch/channel dimensions.
+
+        Returns:
+            torch.Tensor: A scalar tensor representing the regularization value.
+        """
         return self.lambda_param * total_variation(x, isotropic=True)
 
     def _gradient(self, x: torch.Tensor) -> torch.Tensor:
@@ -213,66 +307,50 @@ class TVRegularizer(Regularizer):
 
 
         p = torch.zeros((p_spatial_dims,) + x_proc.shape, device=x_proc.device, dtype=x_proc.dtype)
-        tau = 0.120 
+        # Tau selection: For L2 norm (isotropic TV), tau <= 1/ (2*num_spatial_dims) for stability of standard Chambolle.
+        # However, the formulation used (dual of FGP or similar) might have different stability constraints.
+        # The MIRT value 0.120 is likely a safe empirical value.
+        tau = 0.120 # Step size for the dual update (p)
+
+        # Effective lambda for this specific prox computation
+        # prox_{steplength * R(x)} where R(x) = lambda_param * TV(x)
+        # So, we are solving prox_{steplength * lambda_param * TV(x)}
+        effective_lambda_prox = self.lambda_param * steplength
+        if effective_lambda_prox == 0: # No regularization
+            return x_tensor # Return original tensor if lambda is zero
 
         for i in range(self.max_iter):
-            # x_bar = x_proc - effective_lambda * self._divergence(p)
-            # grad_x_bar = self._gradient(x_bar) # grad_x_bar is (p_spatial_dims, *x_proc.shape)
-            # p_candidate = p + tau * grad_x_bar
-            # norm_p_candidate_vec = torch.sqrt(torch.sum(p_candidate**2, dim=0, keepdim=True))
-            # p_new = p_candidate / torch.maximum(torch.ones_like(norm_p_candidate_vec), norm_p_candidate_vec)
-            
-            # Simpler equivalent from Chambolle's paper (equation 11 / alg 3.1)
-            # This version avoids recomputing gradient of x_bar each time.
-            # It updates p based on grad_div_p_minus_f where f = x_proc / effective_lambda
-            # p_tilde = p + tau * self._gradient(self._divergence(p) - x_proc / effective_lambda)
-            # p_new = p_tilde / (1 + tau * torch.abs(p_tilde_over_tau_grad_component_wise_not_vector_norm)) <- this is for anisotropic
-            # For isotropic TV (L2 norm of gradient):
-            # p_tilde = p + tau * self._gradient(self._divergence(p) - x_proc / effective_lambda)
-            # norm_p_tilde_vec = torch.sqrt(torch.sum(p_tilde**2, dim=0, keepdim=True))
-            # p_new = p_tilde / torch.maximum(torch.ones_like(norm_p_tilde_vec), norm_p_tilde_vec)
-
-            # Let's use the formulation from the user's code which is more common:
-            # grad_of_term_in_prox = self._gradient(self._divergence(p) - (x_proc / effective_lambda) )
-            # p_temp = p + tau * grad_of_term_in_prox
-            # norm_p_temp_vec = torch.sqrt(torch.sum(p_temp**2, dim=0, keepdim=True))
-            # p_new = p_temp / torch.maximum(torch.ones_like(norm_p_temp_vec), norm_p_temp_vec)
-
-            # The provided code has:
-            # grad_x_p = self._gradient(x_proc - effective_lambda * self._divergence(p))
-            # p_candidate = p + tau * grad_x_p
-            # norm_p_candidate_vec = torch.sqrt(torch.sum(p_candidate**2, dim=0, keepdim=True))
-            # p_new = p_candidate / torch.maximum(torch.ones_like(norm_p_candidate_vec), norm_p_candidate_vec)
-            # This is correct for prox_{lambda*TV}(x_proc) where TV is isotropic.
-
+            # Update dual variable p using Chambolle's algorithm for isotropic TV (L2 norm of gradient)
+            # This corresponds to a fixed-point iteration for the dual problem.
+            # The term (div_p - x_proc / effective_lambda_prox) is related to the gradient of the Fenchel conjugate.
             div_p = self._divergence(p)
-            grad_term = self._gradient(div_p - x_proc / effective_lambda) #Matches MIRT if lambda is eff_lambda
+            grad_term = self._gradient(div_p - x_proc / effective_lambda_prox)
             p_candidate = p + tau * grad_term
             
-            # Projection of each vector p(i,j) onto the unit L2 ball
-            norm_p_candidate_vectors = torch.sqrt(torch.sum(p_candidate**2, dim=0, keepdim=True))
+            # Projection step: p_new = p_candidate / max(1, ||p_candidate||_vec)
+            # where ||.||_vec is the L2 norm computed for each gradient vector (over spatial dimensions component)
+            norm_p_candidate_vectors = torch.sqrt(torch.sum(p_candidate**2, dim=0, keepdim=True)) # keepdim for broadcasting
             p_new = p_candidate / torch.maximum(torch.ones_like(norm_p_candidate_vectors), norm_p_candidate_vectors)
 
-            diff_p_norm = torch.norm(p_new.flatten() - p.flatten())
-            p_norm = torch.norm(p.flatten()) + 1e-9
-            diff_p = diff_p_norm / p_norm
+            # Convergence check
+            diff_p_norm = torch.linalg.norm(p_new.flatten() - p.flatten())
+            p_norm = torch.linalg.norm(p.flatten()) + 1e-9 # Avoid division by zero
+            relative_diff_p = diff_p_norm / p_norm
             
             p = p_new
 
             if self.verbose and (i % 10 == 0 or i == self.max_iter -1):
-                # For verbose, calculate current objective value or TV of current estimate
-                current_estimate = x_proc - effective_lambda * self._divergence(p)
-                tv_val = total_variation(current_estimate, isotropic=True)
-                data_fidelity = 0.5 * torch.sum((current_estimate - x_proc)**2)
-                obj = effective_lambda * tv_val + data_fidelity # This is not quite right.
-                                                            # Objective is lambda*TV(u) + 1/(2*step)*||u-x||^2
-                print(f"TV Prox iter {i+1}/{self.max_iter}, diff_p: {diff_p.item():.2e}, current TV(u_k): {tv_val:.2e}")
+                # For verbose output, calculate current estimate and its TV
+                current_estimate = x_proc - effective_lambda_prox * self._divergence(p)
+                tv_val = total_variation(current_estimate, isotropic=True) # Using functional for consistency
+                print(f"TV Prox iter {i+1}/{self.max_iter}, rel_diff_p: {relative_diff_p.item():.2e}, est. TV: {tv_val.item():.2e}")
 
-            if diff_p < self.tol:
-                if self.verbose: print(f"TV Prox converged at iter {i+1}, diff_p: {diff_p.item():.2e}")
+            if relative_diff_p < self.tol:
+                if self.verbose: print(f"TV Prox converged at iter {i+1}, rel_diff_p: {relative_diff_p.item():.2e}")
                 break
         
-        x_denoised = x_proc - effective_lambda * self._divergence(p)
+        # Primal update: x_denoised = x_input - effective_lambda_prox * div(p_final)
+        x_denoised = x_proc - effective_lambda_prox * self._divergence(p)
 
         # Restore original shape if squeezed
         if is_squeezed_channel:
@@ -294,12 +372,24 @@ class TVRegularizer(Regularizer):
 
 
 class HuberRegularizer(Regularizer):
-    """
-    Huber Regularizer: R(x) = lambda_reg * sum(H_delta(x_i)),
-    where H_delta(a) = 0.5 * a^2 if |a| <= delta,
-                     = delta * (|a| - 0.5 * delta) if |a| > delta.
+    """Huber Regularizer: R(x) = lambda_reg * sum_i H_delta(x_i).
+
+    The Huber penalty H_delta(a) is defined as:
+    - `0.5 * a^2` if `|a| <= delta` (quadratic region)
+    - `delta * (|a| - 0.5 * delta)` if `|a| > delta` (linear region)
+
+    It combines the properties of L2 (smoothness for small errors) and L1
+    (robustness to outliers for large errors). It is convex and continuously
+    differentiable.
     """
     def __init__(self, lambda_reg: float, delta: float):
+        """Initializes the Huber Regularizer.
+
+        Args:
+            lambda_reg (float): The regularization strength. Must be non-negative.
+            delta (float): The threshold parameter that separates the quadratic
+                and linear regions of the Huber penalty. Must be positive.
+        """
         super().__init__()
         if lambda_reg < 0:
             raise ValueError("lambda_reg must be non-negative.")
@@ -309,94 +399,90 @@ class HuberRegularizer(Regularizer):
         self.delta = delta
 
     def value(self, x: torch.Tensor) -> torch.Tensor:
-        """Computes lambda_reg * sum(H_delta(x_i))."""
-        # huber_penalty from functional.py should compute sum(H_delta(x_i))
+        """Computes the Huber regularization value: lambda_reg * sum_i H_delta(x_i).
+
+        Args:
+            x (torch.Tensor): The input tensor. Typically real-valued.
+                If complex, the Huber penalty is usually applied to the magnitude
+                or real/imaginary parts separately (current functional.huber_penalty
+                applies to elements as if they are real).
+
+        Returns:
+            torch.Tensor: A scalar tensor representing the regularization value.
+        """
         return self.lambda_reg * huber_penalty(x, self.delta)
 
     def proximal_operator(self, x: torch.Tensor, steplength: float) -> torch.Tensor:
+        """Computes the proximal operator of the Huber regularizer.
+
+        Solves element-wise:
+        `argmin_u { lambda_reg * H_delta(u) + (1/(2*steplength)) * (u - x)^2 }`
+
+        The solution is:
+        - `x / (1 + lambda_reg * steplength)` if `|x / (1 + lambda_reg * steplength)| <= delta`
+        - `x - lambda_reg * steplength * delta * sgn(x)` if `|x - lambda_reg * steplength * delta * sgn(x)| > delta`
+        - This means the solution `u` is `x / (1 + gamma_eff)` if `|u| <= delta`,
+          and `x - gamma_eff * delta * sgn(x)` if `|u| > delta`, where `gamma_eff = lambda_reg * steplength`.
+
+        Args:
+            x (torch.Tensor): The input tensor. Typically real-valued.
+                If complex, this prox might not be standard; usually Huber is
+                applied to magnitude or real/imaginary parts. Current
+                implementation is element-wise, so complex numbers are processed
+                with their real/imaginary parts potentially following different regimes.
+            steplength (float): The step length parameter.
+
+        Returns:
+            torch.Tensor: The result of the proximal operation on `x`.
+            Same shape and dtype as `x`.
         """
-        Computes prox_R(x, steplength) for R(u) = lambda_reg * sum(H_delta(u_i)).
-        The steplength parameter here is the gamma in (1/(2*gamma)) * ||u-x||_2^2.
-        The effective coefficient for the regularizer in the prox problem is lambda_reg * steplength.
-        Let sigma = self.lambda_reg * steplength.
-        The prox of sigma * H_delta(u) is:
-        y = x / (1 + sigma)
-        result = torch.where(torch.abs(y) <= self.delta, y, x - sigma * self.delta * torch.sign(x))
-        This can be simplified:
-        result_i = x_i if |x_i| <= self.delta * (sigma + 1), else x_i - sigma * self.delta * torch.sign(x_i)
-        This is equivalent to:
-        x_abs = torch.abs(x)
-        result = torch.where(x_abs <= self.delta * (1 + sigma),
-                             x / (1 + sigma), # This part is actually x if |x| <= delta * sigma
-                                             # and x / (1+sigma) if delta*sigma < |x| <= delta*(1+sigma)
-                                             # This is getting tricky.
-                             x - sigma * self.delta * torch.sign(x)
-                            )
-        Let's use a standard formulation for prox_{gamma * H_delta}(x):
-        """
-        x_abs = abs(x)
-        idx_quadratic = x_abs <= delta * (1 + gamma)
-        idx_linear = x_abs > delta * (1 + gamma)
+        gamma_eff = self.lambda_reg * steplength # Effective coefficient for Huber in prox objective
 
-        out = torch.zeros_like(x)
-        gamma = self.lambda_reg * steplength
+        # Solution for u:
+        # Case 1: If |u_quadratic| <= delta, then u = u_quadratic = x / (1 + gamma_eff)
+        # Case 2: If |u_linear| > delta, then u = u_linear = x - gamma_eff * delta * sgn(x)
+        
+        # Compute potential solution from quadratic region shrinkage
+        u_quadratic_candidate = x / (1 + gamma_eff)
+        
+        # Compute potential solution from linear region shrinkage
+        u_linear_candidate = x - gamma_eff * self.delta * torch.sign(x) # sign(x) works for real and complex sgn(0)=0
+        
+        # Determine which case applies for each element
+        # An element is in Case 1 if its quadratic solution u_quadratic_candidate satisfies |u_quadratic_candidate| <= delta.
+        # Otherwise, it's in Case 2 (linear region).
+        
+        # For complex numbers, torch.abs is magnitude.
+        # torch.sign(complex) = complex_val / abs(complex_val) or 0 if complex_val is 0.
+        
+        condition_case1 = torch.abs(u_quadratic_candidate) <= self.delta
 
-        # Quadratic region: x / (1 + gamma) -- this is only if |x| <= delta
-        # More general form (Combettes, Pesquet, "Proximal Splitting Methods in Signal Processing"):
-        # prox_{gamma*H_delta}(x) = x - gamma * prox_{H_delta/gamma*}(x/gamma)
-        # prox_{gamma*H_delta}(x)_i = x_i - gamma * P_B(x_i/gamma)
-        # where P_B(y)_i = sign(y_i) * min(|y_i|, delta)
-        # So, prox(x)_i = x_i - (lambda_reg * steplength) * sign(x_i/ (lambda_reg*steplength)) * min(|x_i/(lambda_reg*steplength)|, delta)
-        # prox(x)_i = x_i - sign(x_i) * min(|x_i|, delta * lambda_reg * steplength)
-
-        gamma_eff = self.lambda_reg * steplength # This is the 'sigma' or 'tau' coefficient of Huber in prox objective
-        
-        # Moreau's identity: prox_f(x) = x - prox_f*(x) if f is proper, convex, lsc
-        # For f(u) = gamma_eff * H_delta(u)
-        # prox_f*(x)_i = gamma_eff * delta * ( (x_i/(gamma_eff*delta)) - proj_unitball(x_i/(gamma_eff*delta)) )
-        # This is not simple.
-
-        # Let's use the element-wise solution:
-        # solve u + gamma_eff * grad(H_delta(u)) = x
-        # grad H_delta(u) = u if |u| <= delta
-        # grad H_delta(u) = delta * sign(u) if |u| > delta
-        # Case 1: |u| <= delta. Then u + gamma_eff * u = x  => u = x / (1 + gamma_eff).
-        #   This case holds if |x / (1 + gamma_eff)| <= delta.
-        # Case 2: |u| > delta. Then u + gamma_eff * delta * sign(u) = x.
-        #   If u > delta, then u = x - gamma_eff * delta. This holds if x - gamma_eff * delta > delta.
-        #   If u < -delta, then u = x + gamma_eff * delta. This holds if x + gamma_eff * delta < -delta.
-        # Combining these:
-        
-        out = torch.zeros_like(x)
-        
-        # Condition for u = x / (1 + gamma_eff)
-        # Check if |x / (1 + gamma_eff)| <= delta
-        u_case1 = x / (1 + gamma_eff)
-        idx_case1 = (torch.abs(u_case1) <= self.delta)
-        out[idx_case1] = u_case1[idx_case1]
-        
-        # Condition for u = x - gamma_eff * delta (implies u > 0)
-        # Check if (x - gamma_eff * delta) > delta AND not already in case 1
-        u_case2_pos = x - gamma_eff * self.delta
-        idx_case2_pos = (u_case2_pos > self.delta) & (~idx_case1)
-        out[idx_case2_pos] = u_case2_pos[idx_case2_pos]
-        
-        # Condition for u = x + gamma_eff * delta (implies u < 0)
-        # Check if (x + gamma_eff * delta) < -delta AND not already in case 1
-        u_case2_neg = x + gamma_eff * self.delta
-        idx_case2_neg = (u_case2_neg < -self.delta) & (~idx_case1)
-        out[idx_case2_neg] = u_case2_neg[idx_case2_neg]
+        out = torch.where(condition_case1, u_quadratic_candidate, u_linear_candidate)
         
         return out
 
 
 class CharbonnierRegularizer(Regularizer):
-    """
-    Charbonnier Regularizer: R(x) = lambda_reg * sum(sqrt(x_i^2 + epsilon^2) - epsilon).
-    The "- epsilon" term is sometimes included so R(0)=0, but often omitted.
-    Here, we use R(x) = lambda_reg * sum(sqrt(x_i^2 + epsilon^2)).
+    """Charbonnier Regularizer: R(x) = lambda_reg * sum_i (sqrt(x_i^2 + epsilon^2)).
+
+    This is a smooth approximation of the L1 norm, also known as the
+    L2-L1 norm or pseudo-Huber loss (related, but not identical).
+    It is continuously differentiable and promotes sparsity while being less
+    sensitive to very small values compared to L1.
+    The form `sqrt(x_i^2 + epsilon^2) - epsilon` is sometimes used to ensure R(0)=0;
+    this implementation uses `sqrt(x_i^2 + epsilon^2)`.
     """
     def __init__(self, lambda_reg: float, epsilon: float, newton_iter: int = 5):
+        """Initializes the Charbonnier Regularizer.
+
+        Args:
+            lambda_reg (float): The regularization strength. Must be non-negative.
+            epsilon (float): A small positive constant that controls the smoothness
+                near zero. Must be positive.
+            newton_iter (int, optional): Number of Newton-Raphson iterations used
+                to solve the scalar non-linear equation in the proximal operator.
+                Defaults to 5.
+        """
         super().__init__()
         if lambda_reg < 0:
             raise ValueError("lambda_reg must be non-negative.")
@@ -404,11 +490,19 @@ class CharbonnierRegularizer(Regularizer):
             raise ValueError("epsilon must be positive.")
         self.lambda_reg = lambda_reg
         self.epsilon = epsilon
-        self.newton_iter = newton_iter # Iterations for solving the prox subproblem
+        self.newton_iter = newton_iter
 
     def value(self, x: torch.Tensor) -> torch.Tensor:
-        """Computes lambda_reg * sum(sqrt(x_i^2 + epsilon^2))."""
-        # charbonnier_penalty from functional.py should compute sum(sqrt(x_i^2 + epsilon^2))
+        """Computes lambda_reg * sum_i (sqrt(x_i^2 + epsilon^2)).
+
+        Args:
+            x (torch.Tensor): The input tensor. Can be real or complex.
+                If complex, `x_i^2` is typically `|x_i|^2`.
+                The `functional.charbonnier_penalty` handles this.
+
+        Returns:
+            torch.Tensor: A scalar tensor representing the regularization value.
+        """
         return self.lambda_reg * charbonnier_penalty(x, self.epsilon)
 
     def _solve_charbonnier_prox_scalar(self, v_abs: torch.Tensor, gamma_eff: float) -> torch.Tensor:
@@ -480,63 +574,83 @@ class CharbonnierRegularizer(Regularizer):
 
 
 class NonnegativityConstraint(Regularizer):
-    """
-    Non-negativity constraint: R(x) = 0 if x >= 0, infinity otherwise.
-    This is an indicator function for the set of non-negative numbers.
+    """Non-negativity Constraint Regularizer.
+
+    This acts as an indicator function for the set of non-negative numbers.
+    R(x) = 0 if all elements of x are >= 0.
+    R(x) = +infinity if any element of x is < 0.
+
+    The proximal operator for this regularizer is a projection onto the
+    non-negative orthant, which means setting negative values to zero.
     """
     def __init__(self):
-        """
-        Initializes the NonnegativityConstraint.
-        """
+        """Initializes the NonnegativityConstraint regularizer."""
         super().__init__()
 
     def value(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Value of the non-negativity constraint (0 if x_i >= 0 for all i, infinity otherwise).
-        Returns 0 as a placeholder for finite-value representation if the constraint is met,
-        otherwise effectively infinity (though not explicitly returned as torch.inf for practical reasons
-        unless a specific solver framework handles it).
+        """Computes the value of the non-negativity constraint.
+
+        Returns 0 if all elements of x are non-negative, otherwise conceptually
+        returns infinity. For practical purposes in optimization, this function
+        might return 0 if the constraint is satisfied, assuming the proximal
+        operator enforces the constraint. A large penalty could be returned if
+        violated, but typically this is handled by the prox.
 
         Args:
             x (torch.Tensor): The input tensor.
 
         Returns:
-            torch.Tensor: Scalar tensor, 0.0 if constraint is met by all elements,
-                          otherwise could be a large number or handled by solver logic.
-                          For simplicity, returns 0.0, assuming proximal operator enforces it.
+            torch.Tensor: A scalar tensor. Returns 0.0 if all elements of `x`
+            (or `x.real` if complex) are >= 0. For simplicity in typical proximal
+            algorithms, this often returns 0, as the enforcement is done by the prox.
         """
-        # A more accurate representation for hard constraints if needed by a solver:
-        # if torch.all(x >= 0):
-        #     return torch.tensor(0.0, device=x.device, dtype=x.dtype)
-        # else:
-        #     return torch.tensor(float('inf'), device=x.device, dtype=x.dtype)
-        # For now, returning 0 and relying on the prox.
-        return torch.tensor(0.0, device=x.device, dtype=x.dtype if x.is_floating_point() else torch.float32)
+        # Check based on real part if complex, as non-negativity typically applies to real quantities.
+        data_to_check = x.real if x.is_complex() else x
+        if torch.all(data_to_check >= -1e-9): # Allow for small numerical errors
+            return torch.tensor(0.0, device=x.device, dtype=x.dtype if x.is_floating_point() else torch.float32)
+        else:
+            # Representing infinity can be problematic for some solvers if not handled explicitly.
+            # Returning a very large number or relying on the prox is common.
+            # For now, returning 0 and assuming prox enforces it.
+            return torch.tensor(0.0, device=x.device, dtype=x.dtype if x.is_floating_point() else torch.float32)
+
 
     def proximal_operator(self, x: torch.Tensor, steplength: float | torch.Tensor) -> torch.Tensor:
-        """
-        Projects the input tensor onto the non-negative set.
-        Assumes real input for image intensities. If complex, applies to real part and zeros imaginary part.
-        The steplength parameter is not used for this particular proximal operator.
+        """Computes the proximal operator (projection onto the non-negative set).
+
+        For real `x`, this is `max(x, 0)`.
+        For complex `x`, this implementation applies non-negativity to the real
+        part and zeros out the imaginary part. This behavior is chosen assuming
+        the underlying physical quantity (e.g., image intensity) must be real
+        and non-negative. Other behaviors for complex data might be valid
+        depending on the application (e.g., preserving the imaginary part if
+        only the real part is constrained).
+
+        The `steplength` parameter is not used for projection onto a convex set.
 
         Args:
-            x (torch.Tensor): The input tensor.
-            steplength (float | torch.Tensor): The step length (ignored).
+            x (torch.Tensor): The input tensor. Can be real or complex.
+            steplength (float | torch.Tensor): The step length parameter (ignored).
 
         Returns:
-            torch.Tensor: The tensor projected onto the non-negative set.
+            torch.Tensor: The tensor `x` projected onto the non-negative set,
+            with the same shape and dtype as `x`.
         """
         if x.is_complex():
-            # This behavior is chosen assuming the underlying physical quantity must be real and non-negative.
-            # If only the real part needs to be non-negative, x.imag could be preserved.
-            print("Warning: NonnegativityConstraint applied to complex tensor. Applying to real part and zeroing imaginary part.")
+            # Behavior for complex: Apply ReLu to real part, zero imaginary part.
+            # Consider if a warning is appropriate if this is not always desired.
+            # print("Warning: NonnegativityConstraint applied to complex tensor. "
+            #       "Applying to real part and zeroing imaginary part.")
             return torch.complex(torch.relu(x.real), torch.zeros_like(x.imag))
         else:
             return torch.relu(x)
 
     def apply(self, image: torch.Tensor) -> torch.Tensor:
-        """
-        Enforces non-negativity on the image by applying the proximal operator.
+        """Enforces non-negativity on the input tensor.
+
+        This is a convenience method that calls the proximal operator.
+        The `steplength` argument to the proximal operator is irrelevant for
+        this projection.
 
         Args:
             image (torch.Tensor): The input image tensor.
@@ -544,5 +658,4 @@ class NonnegativityConstraint(Regularizer):
         Returns:
             torch.Tensor: The image tensor with non-negativity enforced.
         """
-        # steplength is irrelevant for projection onto a convex set like non-negativity
-        return self.proximal_operator(image, steplength=0.0)
+        return self.proximal_operator(image, steplength=0.0) # steplength value doesn't matter

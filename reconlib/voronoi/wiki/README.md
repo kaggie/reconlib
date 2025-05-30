@@ -40,3 +40,6 @@ Please explore the following pages for in-depth information:
 
 ---
 *Navigate to the respective pages to learn more about each component.*
+
+---
+For an example of how these Voronoi density weights are used in a full non-Cartesian MRI reconstruction pipeline, see the [main wiki example page on Voronoi Reconstruction](../../../wiki/VoronoiReconstructionExample.md).

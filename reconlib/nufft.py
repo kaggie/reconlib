@@ -144,37 +144,70 @@ class NUFFT2D(NUFFT):
     def __init__(self, 
                  image_shape: tuple[int, int], 
                  k_trajectory: torch.Tensor, 
-                 oversamp_factor: tuple[float, float],
-                 kb_J: tuple[int, int],
-                 kb_alpha: tuple[float, float],
-                 Ld: tuple[int, int],
-                 kb_m: tuple[float, float] | None = None,
+                 oversamp_factor: tuple[float, float] = (2.0, 2.0),
+                 kb_J: tuple[int, int] = (4, 4),
+                 kb_alpha: tuple[float, float] | None = None,
+                 Ld: tuple[int, int] = (1024, 1024),
+                 kb_m: tuple[float, float] = (0.0, 0.0),
                  Kd: tuple[int, int] | None = None,
-                 density_comp_weights: torch.Tensor = None, # New parameter
+                 density_comp_weights: torch.Tensor | None = None,
                  device: str | torch.device = 'cpu'):
+        """Initializes the 2D Non-Uniform Fast Fourier Transform (NUFFT) operator.
+
+        This operator uses a Kaiser-Bessel kernel for interpolation between the
+        non-uniform k-space samples and a Cartesian grid.
+
+        Args:
+            image_shape: Shape of the target image (Ny, Nx), e.g., (128, 128).
+            k_trajectory: Tensor of k-space trajectory coordinates, normalized to
+                the range [-0.5, 0.5] in each dimension.
+                Shape: (num_k_points, 2).
+            oversamp_factor: Oversampling factor for the Cartesian grid for NUFFT
+                operations. Default is (2.0, 2.0).
+            kb_J: Width of the Kaiser-Bessel interpolation kernel in grid units
+                (number of neighbors). Default is (4, 4).
+            kb_alpha: Shape parameter for the Kaiser-Bessel kernel. If None,
+                it's automatically calculated as `2.34 * J` for each dimension,
+                which is a common heuristic for `oversamp_factor=2.0`.
+                Default is None.
+            Ld: Size of the lookup table for Kaiser-Bessel kernel interpolation.
+                Larger values provide more accuracy but increase memory.
+                Default is (1024, 1024).
+            kb_m: Order of the Kaiser-Bessel kernel (typically 0.0 for standard
+                MRI applications). Default is (0.0, 0.0).
+            Kd: Dimensions of the oversampled Cartesian grid (Kdy, Kdx). If None,
+                it's calculated as `image_shape * oversamp_factor`.
+                Default is None.
+            density_comp_weights: Optional tensor of precomputed density
+                compensation weights. If provided, these are applied during the
+                `adjoint` operation. Shape: (num_k_points,).
+                Default is None.
+            device: Computation device ('cpu' or 'cuda' or torch.device object).
+                Default is 'cpu'.
+        """
+        # Determine kb_alpha if not provided
+        final_kb_alpha: tuple[float, float]
+        if kb_alpha is None:
+            # Common heuristic for oversamp_factor = 2.0
+            final_kb_alpha = (2.34 * kb_J[0], 2.34 * kb_J[1])
+        else:
+            final_kb_alpha = kb_alpha
         
         super().__init__(image_shape=image_shape, 
                          k_trajectory=k_trajectory, 
                          oversamp_factor=oversamp_factor, 
                          kb_J=kb_J, 
-                         kb_alpha=kb_alpha, 
+                         kb_alpha=final_kb_alpha,
                          kb_m=kb_m, 
                          Ld=Ld, 
                          Kd=Kd,
-                         density_comp_weights=density_comp_weights, # Pass to parent
+                         density_comp_weights=density_comp_weights,
                          device=device)
 
         if len(self.image_shape) != 2: # This check is also in parent, but good for explicitness
             raise ValueError(f"NUFFT2D expects a 2D image_shape, got {self.image_shape}")
         if self.k_trajectory.shape[-1] != 2:
             raise ValueError(f"NUFFT2D expects k_trajectory with last dimension 2, got {self.k_trajectory.shape}")
-
-        # Specific 2D validations for tuple lengths (already done in parent, but can be re-asserted for clarity)
-        # For example:
-        # if not (len(self.kb_J) == 2 and len(self.kb_alpha) == 2 and len(self.kb_m) == 2 and \
-        #         len(self.oversamp_factor) == 2 and len(self.Ld) == 2 and len(self.Kd) == 2):
-        #    raise ValueError("All tuple parameters (kb_J, kb_alpha, kb_m, oversamp_factor, Ld, Kd) must have length 2 for NUFFT2D.")
-
 
     def _kaiser_bessel_kernel(self, r: torch.Tensor) -> torch.Tensor:
         """
@@ -235,10 +268,27 @@ class NUFFT2D(NUFFT):
         return dcf
 
     def adjoint(self, kspace_data: torch.Tensor) -> torch.Tensor:
-        """
-        Apply the adjoint NUFFT operation (k-space to image) for 2D.
-        If `density_comp_weights` were provided at initialization, they are used.
-        Otherwise, a simple radial density compensation is estimated and applied.
+        """Applies the adjoint NUFFT operation (k-space to image domain).
+
+        Transforms non-uniform k-space data to an image on a Cartesian grid.
+        This operation is commonly referred to as gridding.
+
+        If `density_comp_weights` were provided during initialization, they are
+        multiplied with `kspace_data` before gridding. Otherwise, a simple
+        internally estimated radial density compensation function is applied.
+
+        Args:
+            kspace_data: Input non-uniform k-space data tensor. Expected to be
+                complex-valued.
+                Shape: (num_k_points,), matching the number of points in
+                `self.k_trajectory`.
+                Device: Should match `self.device`.
+
+        Returns:
+            Tensor containing the reconstructed image data on a Cartesian grid.
+            Complex-valued.
+            Shape: (image_shape[0], image_shape[1]), matching `self.image_shape`.
+            Device: `self.device`.
         """
         if kspace_data.ndim != 1: # Assuming k_trajectory is (num_k_points, 2)
             raise ValueError(f"Expected kspace_data to be 1D (num_k_points,), got shape {kspace_data.shape}")
@@ -313,8 +363,21 @@ class NUFFT2D(NUFFT):
 
 
     def forward(self, image_data: torch.Tensor) -> torch.Tensor:
-        """
-        Apply the forward NUFFT operation (image to k-space) for 2D.
+        """Applies the forward NUFFT operation (image domain to k-space).
+
+        Transforms an image on a Cartesian grid to non-uniform k-space samples
+        defined by the `k_trajectory`.
+
+        Args:
+            image_data: Input image data tensor. Expected to be complex-valued.
+                Shape: (image_shape[0], image_shape[1]), matching `self.image_shape`.
+                Device: Should match `self.device`.
+
+        Returns:
+            Tensor containing the simulated k-space data at the non-uniform
+            `k_trajectory` points. Complex-valued.
+            Shape: (num_k_points,).
+            Device: `self.device`.
         """
         if image_data.shape != self.image_shape:
             raise ValueError(f"Input image_data shape {image_data.shape} does not match expected {self.image_shape}")
@@ -378,26 +441,69 @@ class NUFFT3D(NUFFT):
     def __init__(self, 
                  image_shape: tuple[int, int, int], 
                  k_trajectory: torch.Tensor, 
-                 oversamp_factor: tuple[float, float, float],
-                 kb_J: tuple[int, int, int],
-                 kb_alpha: tuple[float, float, float],
-                 Ld: tuple[int, int, int],
-                 kb_m: tuple[float, float, float] | None = None,
+                 oversamp_factor: tuple[float, float, float] = (1.5, 1.5, 1.5),
+                 kb_J: tuple[int, int, int] = (4, 4, 4),
+                 kb_alpha: tuple[float, float, float] | None = None,
+                 Ld: tuple[int, int, int] = (512, 512, 512),
+                 kb_m: tuple[float, float, float] = (0.0, 0.0, 0.0),
                  Kd: tuple[int, int, int] | None = None,
                  n_shift: tuple[float, float, float] | None = None,
                  interpolation_order: int = 1,
-                 density_comp_weights: torch.Tensor = None, # New parameter
+                 density_comp_weights: torch.Tensor | None = None,
                  device: str | torch.device = 'cpu'):
-        
+        """Initializes the 3D Non-Uniform Fast Fourier Transform (NUFFT) operator.
+
+        This operator uses a table-based approach with Kaiser-Bessel interpolation
+        for transforming data between non-uniform k-space samples and a
+        Cartesian grid. It precomputes interpolation tables and scaling factors.
+
+        Args:
+            image_shape: Shape of the target image (Nz, Ny, Nx), e.g., (64, 64, 64).
+            k_trajectory: Tensor of k-space trajectory coordinates, normalized to
+                the range [-0.5, 0.5] in each dimension.
+                Shape: (num_k_points, 3).
+            oversamp_factor: Oversampling factor for the Cartesian grid.
+                Default is (1.5, 1.5, 1.5).
+            kb_J: Width of the Kaiser-Bessel interpolation kernel in grid units
+                for each dimension. Default is (4, 4, 4).
+            kb_alpha: Shape parameter for the Kaiser-Bessel kernel for each
+                dimension. If None, automatically calculated as `2.34 * J_dim`.
+                Default is None.
+            Ld: Size of the lookup table for Kaiser-Bessel kernel interpolation
+                for each dimension. Default is (512, 512, 512).
+            kb_m: Order of the Kaiser-Bessel kernel for each dimension.
+                Default is (0.0, 0.0, 0.0).
+            Kd: Dimensions of the oversampled Cartesian grid (Kdz, Kdy, Kdx).
+                If None, calculated as `image_shape * oversamp_factor`.
+                Default is None.
+            n_shift: Optional tuple (sz, sy, sx) specifying shifts in image
+                domain samples. This translates to phase shifts in k-space.
+                Useful for sub-pixel shifts or aligning field-of-view.
+                Default is None (no shift).
+            interpolation_order: Order for table interpolation.
+                0 for Nearest Neighbor, 1 for Linear Interpolation.
+                Default is 1 (Linear).
+            density_comp_weights: Optional tensor of precomputed density
+                compensation weights. Applied during the `adjoint` operation.
+                Shape: (num_k_points,). Default is None.
+            device: Computation device ('cpu', 'cuda', or torch.device object).
+                Default is 'cpu'.
+        """
+        final_kb_alpha: tuple[float, float, float]
+        if kb_alpha is None:
+            final_kb_alpha = (2.34 * kb_J[0], 2.34 * kb_J[1], 2.34 * kb_J[2])
+        else:
+            final_kb_alpha = kb_alpha
+
         super().__init__(image_shape=image_shape, 
                          k_trajectory=k_trajectory, 
                          oversamp_factor=oversamp_factor, 
                          kb_J=kb_J, 
-                         kb_alpha=kb_alpha, 
+                         kb_alpha=final_kb_alpha,
                          kb_m=kb_m, 
                          Ld=Ld, 
                          Kd=Kd,
-                         density_comp_weights=density_comp_weights, # Pass to parent
+                         density_comp_weights=density_comp_weights,
                          device=device)
 
         if len(self.image_shape) != 3:
@@ -424,13 +530,9 @@ class NUFFT3D(NUFFT):
         self._precompute_scaling_factors()
 
         if not all(s == 0.0 for s in self.n_shift):
-            # k_trajectory is (num_k_points, D), n_shift is (D,)
-            # Phase shifts for k-space: exp(1j * k_traj @ n_shift_vec)
             n_shift_tensor = torch.tensor(self.n_shift, dtype=torch.float32, device=self.device)
-            # Ensure k_trajectory is float for matmul if it's not already
             k_traj_float = self.k_trajectory.float() 
             self.phase_shifts = torch.exp(1j * (k_traj_float @ n_shift_tensor))
-            # phase_shifts will be (num_k_points,)
 
     def _compute_kb_values_1d(self, r_vals: torch.Tensor, J: int, alpha: float, m: float) -> torch.Tensor:
         """
@@ -655,8 +757,24 @@ class NUFFT3D(NUFFT):
         return interpolated_val
 
     def forward(self, image_data: torch.Tensor) -> torch.Tensor:
-        """
-        Apply the forward NUFFT operation (image to k-space) for 3D using table interpolation.
+        """Applies the forward 3D NUFFT (image domain to k-space).
+
+        Transforms a 3D image on a Cartesian grid to non-uniform k-space
+        samples defined by `self.k_trajectory`. Uses precomputed scaling
+        factors and table-based interpolation with Kaiser-Bessel kernels.
+        Applies phase shifts if `n_shift` was specified during initialization.
+
+        Args:
+            image_data: Input 3D image data tensor. Expected to be complex-valued.
+                Shape: (image_shape[0], image_shape[1], image_shape[2]),
+                matching `self.image_shape`.
+                Device: Should match `self.device`.
+
+        Returns:
+            Tensor containing simulated k-space data at `self.k_trajectory` points.
+            Complex-valued.
+            Shape: (num_k_points,).
+            Device: `self.device`.
         """
         # 1. Input Validation
         if image_data.shape != self.image_shape:
@@ -789,12 +907,27 @@ class NUFFT3D(NUFFT):
         return interpolated_k_space_values
 
     def adjoint(self, kspace_data: torch.Tensor) -> torch.Tensor:
-        """
-        Apply the adjoint NUFFT operation (k-space to image) for 3D using table-based gridding.
+        """Applies the adjoint 3D NUFFT (k-space to image domain).
 
-        If `density_comp_weights` were provided during initialization, they are applied to
-        `kspace_data` at the beginning of this method. Otherwise, no density compensation
-        is applied by this method.
+        Transforms non-uniform 3D k-space data to an image on a Cartesian grid.
+        This operation involves table-based gridding with Kaiser-Bessel kernels
+        and application of conjugate scaling factors.
+
+        If `density_comp_weights` were provided during `__init__`, they are
+        multiplied with `kspace_data` before gridding.
+        If `n_shift` was specified, corresponding conjugate phase shifts are
+        applied to `kspace_data`.
+
+        Args:
+            kspace_data: Input non-uniform 3D k-space data. Complex-valued.
+                Shape: (num_k_points,), matching `self.k_trajectory`.
+                Device: Should match `self.device`.
+
+        Returns:
+            Reconstructed 3D image data on a Cartesian grid. Complex-valued.
+            Shape: (image_shape[0], image_shape[1], image_shape[2]),
+            matching `self.image_shape`.
+            Device: `self.device`.
         """
         # 1. Input Validation
         if kspace_data.ndim != 1:

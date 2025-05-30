@@ -70,6 +70,10 @@ For in-depth information on the Voronoi submodule's architecture, algorithms, an
 
 *(Note: The relative path `../reconlib/voronoi/wiki/README.md` assumes this main wiki README is in `<repo_root>/wiki/README.md` and the submodule wiki is at `<repo_root>/reconlib/voronoi/wiki/README.md`)*.
 
+## Examples and Tutorials
+
+*   **[Voronoi-Weighted Non-Cartesian MRI Reconstruction](./VoronoiReconstructionExample.md)**: Demonstrates how to use Voronoi density compensation for non-Cartesian MRI reconstruction and compares it with other methods. Includes a link to a [Jupyter Notebook example](../examples/voronoi_recon_comparison.ipynb).
+
 ## Getting Started
 
 [Instructions on how to install and use `reconlib` will be added here.]
