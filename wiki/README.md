@@ -75,6 +75,7 @@ For in-depth information on the Voronoi submodule's architecture, algorithms, an
 *   **[Voronoi-Weighted Non-Cartesian MRI Reconstruction](./VoronoiReconstructionExample.md)**: Demonstrates how to use Voronoi density compensation for non-Cartesian MRI reconstruction and compares it with other methods. Includes a link to a [Jupyter Notebook example](../examples/voronoi_recon_comparison.ipynb).
 *   **[User Guide: Basic Non-Cartesian Reconstruction Pipeline](../examples/tutorial_basic_pipeline.ipynb)**: A step-by-step guide to setting up a simple 2D non-Cartesian reconstruction from data simulation to image display using NUFFT and a conjugate gradient solver.
 *   **[User Guide: Reconstruction with Regularizers](../examples/tutorial_regularizers.ipynb)**: Demonstrates how to use L1 and Total Variation (TV) regularizers with the FISTA algorithm to improve reconstruction quality, especially for noisy or undersampled data.
+*   **[User Guide: Compressed Sensing (L1-Wavelet)](../examples/tutorial_compressed_sensing.ipynb)**: Illustrates how to perform Compressed Sensing MRI reconstruction from undersampled k-space data using L1 regularization in the Wavelet domain with the FISTA solver.
 
 ## Getting Started
 
