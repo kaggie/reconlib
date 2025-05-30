@@ -18,9 +18,44 @@ def compute_voronoi_density_weights_pytorch(
     bounds: torch.Tensor | None = None, 
     space_dim: int | None = None
 ) -> torch.Tensor:
-    """
-    Computes Voronoi-based density compensation weights for a set of k-space points.
-    Refactored to use PyTorch-based Voronoi construction (conceptual).
+    """Computes Voronoi-based density compensation weights for a set of points.
+
+    This function calculates density compensation factors (DCF) based on the
+    area (2D) or volume (3D) of the Voronoi cells corresponding to each input
+    point. The weights are typically inversely proportional to these measures.
+    The computation involves constructing Voronoi cells (implicitly via Delaunay
+    triangulation using functions from `.voronoi_from_delaunay`), clipping them
+    to specified `bounds` (if provided), calculating their geometric measure,
+    and then normalizing the resulting weights.
+
+    Args:
+        points: A PyTorch tensor of point coordinates. For k-space applications,
+            these are typically normalized k-space sample locations.
+            Shape: (N, D), where N is the number of points and D is the
+            dimensionality (2 for 2D, 3 for 3D).
+            Device: The computation will be attempted on the device of this tensor.
+        bounds: Optional PyTorch tensor defining the rectangular/cuboidal boundary
+            for the Voronoi tessellation. Voronoi cells are clipped to these
+            bounds before their measure is calculated.
+            For 2D, shape is ((2, 2)), e.g., `[[min_x, min_y], [max_x, max_y]]`.
+            For 3D, shape is ((2, 3)), e.g., `[[min_x, min_y, min_z], [max_x, max_y, max_z]]`.
+            If None, cells are not explicitly bounded by this function, though
+            underlying Voronoi construction might assume implicit bounds or handle
+            unbounded cells. Default is None.
+        space_dim: The spatial dimension of the points (2 for 2D, 3 for 3D).
+            If None, it is inferred from `points.shape[1]`. Default is None.
+
+    Returns:
+        A PyTorch tensor of normalized density compensation weights.
+        Shape: (N,). The weights are non-negative.
+        These weights are typically normalized (e.g., to sum to 1 or scaled
+        relative to the number of points by the `normalize_weights` utility
+        from `.geometry_core`).
+
+    Raises:
+        TypeError: If `points` or `bounds` are not PyTorch tensors.
+        ValueError: If `points` is not 2-dimensional, `space_dim` is not 2 or 3,
+            or if shapes of `points` or `bounds` are inconsistent with `space_dim`.
     """
     if not isinstance(points, torch.Tensor): raise TypeError("Input points must be a PyTorch tensor.")
     if points.ndim != 2: raise ValueError("Input points tensor must be 2-dimensional (N, D).")
