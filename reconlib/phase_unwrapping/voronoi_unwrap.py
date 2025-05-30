@@ -1,222 +1,324 @@
 import torch
-import numpy as np # For type hints and potential use in full implementation
-from typing import Optional, Tuple, List, Dict, Set, PriorityQueue as PQueue # PriorityQueue from typing for type hint
+import numpy as np
+import heapq # For priority queue in region growing
+from typing import Optional, Tuple, List, Dict, Set, Union # Expanded typing
 
-# Note: The actual implementation might use heapq for the priority queue.
+# Attempt to import compute_voronoi_tessellation
+try:
+    from reconlib.voronoi.voronoi_tessellation import compute_voronoi_tessellation
+    RECONLIB_VORONOI_TESSELLATION_AVAILABLE = True
+except ImportError:
+    RECONLIB_VORONOI_TESSELLATION_AVAILABLE = False
+    # Define a placeholder if the import fails, so the module can still be loaded for inspection
+    def compute_voronoi_tessellation(
+        shape: tuple[int, ...],
+        seeds: torch.Tensor,
+        voxel_size: Union[tuple[float, ...], torch.Tensor],
+        mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        print("Warning: reconlib.voronoi.voronoi_tessellation.compute_voronoi_tessellation not found. Using placeholder.")
+        # Fallback: return a map where all valid voxels are assigned to the first seed (or -1 if no seeds)
+        output_tessellation = torch.full(shape, -1, dtype=torch.long, device=seeds.device if seeds.numel() > 0 else torch.device('cpu'))
+        if seeds.shape[0] > 0:
+            if mask is not None:
+                output_tessellation[mask] = 0
+            else:
+                output_tessellation.fill_(0)
+        return output_tessellation
+
+# Helper functions specific to this module, prefixed with _vu_ (Voronoi Unwrap)
+
+def _vu_wrap_to_pi(phase_diff: torch.Tensor) -> torch.Tensor:
+    """Wraps phase values to the interval [-pi, pi)."""
+    return (phase_diff + torch.pi) % (2 * torch.pi) - torch.pi
+
+def _vu_is_valid_voxel(voxel_coord: Tuple[int, ...], shape: Tuple[int, ...], mask: Optional[torch.Tensor]) -> bool:
+    """Checks if a voxel is within bounds and, if a mask is provided, within the mask."""
+    for i, coord_val in enumerate(voxel_coord):
+        if not (0 <= coord_val < shape[i]):
+            return False
+    if mask is not None and not mask[voxel_coord].item():
+        return False
+    return True
+
+def _vu_get_neighbors(
+    voxel_idx: Tuple[int, ...],
+    shape: Tuple[int, ...],
+    connectivity: int,
+    mask: Optional[torch.Tensor] # Mask is passed to _vu_is_valid_voxel
+) -> List[Tuple[int, ...]]:
+    """Gets valid neighbors of a voxel given connectivity."""
+    neighbors: List[Tuple[int, ...]] = []
+    ndim = len(shape)
+
+    offsets_dim_map = {
+        1: [(1,), (-1,)], # For 1D if ever needed
+        2: [ # 2D offsets
+            [(0, 1), (0, -1), (1, 0), (-1, 0)], # Conn 1 (4-conn)
+            [(1,1), (1,-1), (-1,1), (-1,-1)]    # Conn 2 Diagonals (for 8-conn)
+        ],
+        3: [ # 3D offsets
+            [(0,0,1), (0,0,-1), (0,1,0), (0,-1,0), (1,0,0), (-1,0,0)], # Conn 1 (6-conn, faces)
+            [ # Conn 2 Edges (for 18-conn)
+                (1,1,0), (1,-1,0), (-1,1,0), (-1,-1,0), (1,0,1), (1,0,-1),
+                (-1,0,1), (-1,0,-1), (0,1,1), (0,1,-1), (0,-1,1), (0,-1,-1)
+            ],
+            [ # Conn 3 Corners (for 26-conn)
+                (1,1,1), (1,1,-1), (1,-1,1), (1,-1,-1),
+                (-1,1,1), (-1,1,-1), (-1,-1,1), (-1,-1,-1)
+            ]
+        ]
+    }
+
+    if ndim not in offsets_dim_map:
+        raise ValueError(f"Unsupported number of dimensions: {ndim}. Expected 2 or 3.")
+
+    current_offsets: List[Tuple[int,...]] = []
+    for c_level in range(1, connectivity + 1):
+        if c_level -1 < len(offsets_dim_map[ndim]):
+            current_offsets.extend(offsets_dim_map[ndim][c_level-1])
+
+    # Ensure unique offsets if connectivity levels overlap (though designed not to here)
+    unique_offsets = list(set(current_offsets))
+
+
+    for offset in unique_offsets:
+        neighbor_coords_list = [voxel_idx[i] + offset[i] for i in range(ndim)]
+        neighbor_coords_tuple = tuple(neighbor_coords_list)
+
+        if _vu_is_valid_voxel(neighbor_coords_tuple, shape, mask):
+            neighbors.append(neighbor_coords_tuple)
+
+    return neighbors
+
+def _vu_calculate_wrapped_gradients(phase: torch.Tensor, voxel_size: torch.Tensor) -> torch.Tensor:
+    """Calculates wrapped phase gradients. Output shape (num_dims, *phase_shape)."""
+    ndim = phase.ndim
+    gradients_sq = torch.zeros_like(phase, dtype=phase.dtype)
+
+    for i in range(ndim):
+        # Forward difference
+        diff_fwd = _vu_wrap_to_pi(torch.roll(phase, shifts=-1, dims=i) - phase) / voxel_size[i]
+        # Backward difference
+        diff_bwd = _vu_wrap_to_pi(phase - torch.roll(phase, shifts=1, dims=i)) / voxel_size[i]
+
+        # Sum of squares of fwd and bwd gradients (measures local variability)
+        gradients_sq += diff_fwd**2 + diff_bwd**2
+
+    return gradients_sq # This is sum of squares, not tuple of grads
+
+def _vu_compute_quality_map(phase: torch.Tensor, mask: Optional[torch.Tensor], voxel_size_tensor: torch.Tensor) -> torch.Tensor:
+    """Computes quality map as inverse of sum of squared wrapped gradients."""
+    sum_sq_gradients = _vu_calculate_wrapped_gradients(phase, voxel_size_tensor)
+    quality_map = 1.0 / (1.0 + sum_sq_gradients) # Higher quality = smaller gradient
+
+    # Normalize quality map
+    min_q = quality_map.min()
+    max_q = quality_map.max()
+    if max_q > min_q:
+        quality_map = (quality_map - min_q) / (max_q - min_q)
+    else:
+        quality_map.fill_(0.5)
+
+    if mask is not None:
+        quality_map.masked_fill_(~mask, 0.0)
+    return quality_map
+
+def _vu_euclidean_distance_sq_scaled(coord1_tuple: Tuple[int, ...], coord2_tuple: Tuple[int, ...], voxel_size_tensor: torch.Tensor) -> float:
+    """Computes squared Euclidean distance scaled by voxel_size."""
+    dist_sq = 0.0
+    for i in range(len(coord1_tuple)):
+        dist_sq += ((coord1_tuple[i] - coord2_tuple[i]) * voxel_size_tensor[i].item())**2
+    return dist_sq
+
+def _vu_select_voronoi_seeds(
+    quality_map: torch.Tensor,
+    mask: Optional[torch.Tensor],
+    quality_threshold: float,
+    min_seed_dist_sq: float, # Use squared distance to avoid sqrt
+    voxel_size_tensor: torch.Tensor
+) -> List[Tuple[int, ...]]:
+    """Selects Voronoi seeds based on quality and minimum distance."""
+    candidate_coords_torch = torch.where(quality_map >= quality_threshold)
+
+    # Create a list of (quality, coord_tuple) for sorting
+    candidates_with_quality = []
+    for i in range(candidate_coords_torch[0].shape[0]):
+        coord_tuple = tuple(c[i].item() for c in candidate_coords_torch)
+        if mask is None or mask[coord_tuple].item(): # Double check mask
+            candidates_with_quality.append((quality_map[coord_tuple].item(), coord_tuple))
+
+    # Sort by quality in descending order
+    candidates_with_quality.sort(key=lambda x: x[0], reverse=True)
+
+    selected_seeds_coords: List[Tuple[int, ...]] = []
+    for _, coord_tuple in candidates_with_quality:
+        is_far_enough = True
+        for existing_seed_coord in selected_seeds_coords:
+            dist_sq = _vu_euclidean_distance_sq_scaled(coord_tuple, existing_seed_coord, voxel_size_tensor)
+            if dist_sq < min_seed_dist_sq:
+                is_far_enough = False
+                break
+        if is_far_enough:
+            selected_seeds_coords.append(coord_tuple)
+
+    return selected_seeds_coords
+
+def _vu_merge_voronoi_cells_and_optimize_paths(
+    unwrapped_phase: torch.Tensor,
+    wrapped_phase: torch.Tensor,
+    cell_id_map: torch.Tensor,
+    quality_map: torch.Tensor,
+    mask: Optional[torch.Tensor],
+    voxel_size: torch.Tensor,
+    tolerance: float,
+    max_iterations: int
+) -> torch.Tensor:
+    """Placeholder for merging Voronoi cells and optimizing paths."""
+    print("Warning: _vu_merge_voronoi_cells_and_optimize_paths is a placeholder and does not perform any merging or optimization.")
+    # In a full implementation, this would involve analyzing boundaries between
+    # different cell IDs in cell_id_map, calculating inconsistencies, and
+    # potentially adding multiples of 2*pi to entire cells to resolve them.
+    return unwrapped_phase # Returns the input phase unchanged for now
+
 
 def unwrap_phase_voronoi_region_growing(
     phase_data: torch.Tensor,
     mask: Optional[torch.Tensor] = None,
-    voxel_size: Tuple[float, ...] = (1.0, 1.0, 1.0),
-    quality_threshold: float = 0.1,
-    max_iterations: int = 1000, 
-    tolerance: float = 1e-6,
-    neighbor_connectivity: int = 1,
-    min_seed_distance: float = 5.0 # In mm or voxel units, depending on voxel_size interpretation
+    voxel_size: Union[Tuple[float, ...], List[float]] = (1.0, 1.0, 1.0),
+    quality_threshold: float = 0.1,  # For seed selection and region growing
+    max_iterations_rg: int = -1,      # Max voxels processed in region growing; -1 for no limit based on numel
+    tolerance: float = 1e-6,         # For future optimization steps
+    neighbor_connectivity: int = 1,  # For GetNeighbors
+    min_seed_distance: float = 5.0   # Physical distance
 ) -> torch.Tensor:
     """
-    Placeholder for Voronoi-based region-growing phase unwrapping.
-
-    This function is intended to be implemented based on the detailed user-provided
-    pseudocode (originally titled `PUROR_Voronoi_Unwrapping`). The core idea is to
-    use Voronoi cells generated from high-quality seed points to guide the phase
-    unwrapping process, followed by path optimization and cell merging.
-
-    Args:
-        phase_data (torch.Tensor): Wrapped phase data (in radians). (D,H,W) or (H,W).
-        mask (Optional[torch.Tensor], optional): Boolean tensor. True values are unwrapped.
-        voxel_size (Tuple[float, ...], optional): Voxel dimensions (e.g., (vz,vy,vx) or (vy,vx)).
-            Used for distance calculations and gradient computations. Defaults to isotropic (1.0,...).
-        quality_threshold (float, optional): Minimum quality for a voxel to be considered a seed
-            or to be processed during region growing. Defaults to 0.1.
-        max_iterations (int, optional): Maximum number of iterations for loops,
-            such as region growing or optimization steps. Defaults to 1000.
-        tolerance (float, optional): Tolerance for convergence in iterative processes
-            (e.g., path optimization). Defaults to 1e-6.
-        neighbor_connectivity (int, optional): Defines neighborhood for region growing and
-            other local operations (e.g., 1 for 6-conn in 3D, 2 for 18, etc.). Defaults to 1.
-        min_seed_distance (float, optional): Minimum distance between selected Voronoi seeds.
-            This helps ensure seeds are somewhat spread out. Defaults to 5.0.
-
-    Returns:
-        torch.Tensor: Unwrapped phase image.
-
-    Raises:
-        NotImplementedError: This function is a placeholder and not yet implemented.
-
-    --- BEGIN USER-PROVIDED PSEUDOCODE (for future reference) ---
-
-    ```
-    PUROR_Voronoi_Unwrapping(WrappedPhase, Mask, VoxelSize):
-        // --- Initialization ---
-        UnwrappedPhase = zeros_like(WrappedPhase)
-        Visited = zeros_like(WrappedPhase, type=bool) // Tracks visited voxels during region growing
-        CellIDMap = zeros_like(WrappedPhase, type=int) // Stores which Voronoi cell each voxel belongs to
-        QualityMap = ComputeQualityMap(WrappedPhase, Mask, VoxelSize) // Higher is better
-
-        // --- Seed Selection ---
-        VoronoiSeeds = SelectVoronoiSeeds(QualityMap, Mask, QualityThreshold, MinSeedDistance, VoxelSize)
-        if not VoronoiSeeds:
-            return WrappedPhase // Or handle error: no valid seeds found
-
-        // --- Voronoi Tessellation & Initial Unwrapping within Cells ---
-        // Option A: Simple assignment by nearest seed (Euclidean distance)
-        CellIDMap = ComputeVoronoiTessellation(WrappedPhase.shape, VoronoiSeeds, VoxelSize, Mask)
-
-        // Initialize unwrapping at seed points directly
-        for seed_coord in VoronoiSeeds:
-            UnwrappedPhase[seed_coord] = WrappedPhase[seed_coord]
-            Visited[seed_coord] = True
-            // Optional: Initialize CellIDMap here if not done by ComputeVoronoiTessellation
-            // CellIDMap[seed_coord] = unique_id_for_seed(seed_coord)
-
-
-        // --- Region Growing within each Voronoi Cell (or from each seed if tessellation is just nearest assign) ---
-        // This part needs to be adapted if CellIDMap is just nearest seed.
-        // The previous PUROR implementation's region growing per seed is a good starting point.
-        // For a true Voronoi approach, growth is constrained by cell boundaries or happens globally
-        // then cell assignments are used in merging.
-        // Let's assume a simplified model: grow from each seed, respecting `Visited` to avoid re-processing.
-        // The `CellIDMap` from nearest seed can be used later for merging logic.
-
-        PriorityQueue pq // Max-heap ordered by quality
-        for seed_coord in VoronoiSeeds:
-            if not Visited[seed_coord]: // Should be true if initialized correctly
-                 // This check is more if we re-seed or have complex seed logic
-                UnwrappedPhase[seed_coord] = WrappedPhase[seed_coord]
-                Visited[seed_coord] = True
-            
-            // Use negative quality for max-heap behavior with heapq
-            heapq.push(pq, (-QualityMap[seed_coord], seed_coord)) 
-
-        iterations_rg = 0 // Region Growing iterations
-        while pq is not empty and iterations_rg < MaxIterations_RG: // MaxIterations_RG for region growing part
-            current_quality, current_voxel = heapq.pop(pq)
-            current_quality = -current_quality // actual quality
-            iterations_rg += 1
-
-            for neighbor_voxel in GetNeighbors(current_voxel, WrappedPhase.shape, Connectivity, Mask):
-                if not Visited[neighbor_voxel] and QualityMap[neighbor_voxel] > QualityThreshold_RG: // RG specific threshold
-                    Visited[neighbor_voxel] = True
-                    
-                    // Core unwrapping logic (relative to current_voxel)
-                    diff = WrappedPhase[neighbor_voxel] - WrappedPhase[current_voxel] // This should use unwrapped phase of current_voxel
-                    UnwrappedPhase[neighbor_voxel] = UnwrappedPhase[current_voxel] + (diff - 2*pi*round(diff/(2*pi)))
-                    
-                    // If doing strict Voronoi cells and want to assign CellID during growth:
-                    // CellIDMap[neighbor_voxel] = CellIDMap[current_voxel] 
-                                        
-                    heapq.push(pq, (-QualityMap[neighbor_voxel], neighbor_voxel))
-        
-        // At this point, UnwrappedPhase contains regions grown from seeds.
-        // If growth was global and not per-cell, CellIDMap (from nearest seed) is now important.
-
-        // --- Merge Voronoi Cells & Optimize Paths ---
-        // This is the complex part involving graph theory or iterative path adjustments.
-        // It uses CellIDMap to know which voxels belong to which initial seed's "influence".
-        UnwrappedPhase = MergeVoronoiCells_And_OptimizePaths(UnwrappedPhase, WrappedPhase, CellIDMap, QualityMap, Mask, VoxelSize, Tolerance, MaxIterations_Optimize)
-        // ^ This function would internally handle path cost calculation, finding inconsistent edges,
-        // adding multiples of 2*pi, etc., possibly using graph cuts or iterative methods.
-
-
-        // --- Final Residual Computation (Optional) ---
-        Residual = ComputeResidual(WrappedPhase, UnwrappedPhase, Mask)
-        // Log or return residual information if needed
-
-        if Mask is not None:
-            UnwrappedPhase = UnwrappedPhase * Mask // Zero out regions outside mask
-
-        return UnwrappedPhase
-
-    // --- Helper Function Pseudocode ---
-
-    ComputeQualityMap(Phase, Mask, VoxelSize):
-        // Example: Inverse of phase gradient magnitude (higher quality = smoother phase)
-        Gradients = CalculateWrappedGradients(Phase, VoxelSize) // (Gx, Gy, Gz)
-        Quality = 1.0 / (1.0 + sum(Gradients^2, axis=dims)) // Sum over spatial dimensions
-        if Mask is not None:
-            Quality = Quality * Mask
-        return Normalize(Quality) // e.g., to [0,1]
-
-    SelectVoronoiSeeds(QualityMap, Mask, QualityThreshold, MinSeedDistance, VoxelSize):
-        CandidateSeeds = []
-        for voxel_coord in iterate_voxels(QualityMap.shape):
-            if Mask is not None and not Mask[voxel_coord]: continue
-            if QualityMap[voxel_coord] > QualityThreshold:
-                is_far_enough = True
-                for existing_seed in CandidateSeeds:
-                    distance = EuclideanDistance(voxel_coord, existing_seed, VoxelSize)
-                    if distance < MinSeedDistance:
-                        is_far_enough = False
-                        break
-                if is_far_enough:
-                    CandidateSeeds.append(voxel_coord)
-        // Optional: Subsample if too many candidates (e.g., keep N highest quality, or random sample)
-        return CandidateSeeds // List of seed coordinate tuples
-
-    ComputeVoronoiTessellation(Shape, Seeds, VoxelSize, Mask): // Simple version
-        CellIDMap = zeros(Shape, type=int)
-        SeedIDs = {seed_coord: i+1 for i, seed_coord in enumerate(Seeds)} // Assign unique ID to each seed
-
-        for voxel_coord in iterate_voxels(Shape):
-            if Mask is not None and not Mask[voxel_coord]: continue
-            
-            min_dist = infinity
-            nearest_seed_id = 0
-            for seed_coord in Seeds:
-                dist = EuclideanDistance(voxel_coord, seed_coord, VoxelSize)
-                if dist < min_dist:
-                    min_dist = dist
-                    nearest_seed_id = SeedIDs[seed_coord]
-            CellIDMap[voxel_coord] = nearest_seed_id
-        return CellIDMap
-        
-    // More complex version might involve graph traversal or jump flooding.
-
-    MergeVoronoiCells_And_OptimizePaths(UnwrappedPhase, WrappedPhase, CellIDMap, QualityMap, Mask, VoxelSize, Tolerance, MaxIterations_Optimize):
-        // This is the core of a sophisticated PUROR/Voronoi method.
-        // 1. Identify edges between different Voronoi cells (CellIDMap[v1] != CellIDMap[v2]).
-        // 2. For each edge, calculate the "cost" or "inconsistency". This is related to
-        //    (UnwrappedPhase[v1] - UnwrappedPhase[v2]) - (WrappedPhase[v1] - WrappedPhase[v2]).
-        //    This difference should ideally be a multiple of 2*pi. Deviations indicate problem areas.
-        // 3. Use graph algorithms (e.g., min-cost flow, graph cuts, or simpler iterative adjustments)
-        //    to add multiples of 2*pi to entire cells (or sub-regions) to minimize total inconsistency
-        //    across cell boundaries. QualityMap can be used to weight edges (trust edges in high quality regions more).
-        //
-        // Iterative approach example:
-        // For N iterations or until convergence (change in UnwrappedPhase < Tolerance):
-        //   For each cell C_i:
-        //     For each neighbor cell C_j:
-        //       Calculate average inconsistency along the boundary between C_i and C_j.
-        //       If inconsistency suggests C_j (or C_i) needs a 2*pi shift relative to the other:
-        //         Propose a shift for C_j. This might involve a global optimization
-        //         or a greedy choice.
-        //         Careful: shifts can propagate.
-        //
-        // This is highly non-trivial. Placeholder might just return UnwrappedPhase from region growing.
-        print("Warning: MergeVoronoiCells_And_OptimizePaths is a complex step, currently a conceptual placeholder in pseudocode.")
-        return UnwrappedPhase // Basic return for now
-
-    ComputeResidual(WrappedPhase, UnwrappedPhase, Mask):
-        Residual = WrappedPhase - UnwrappedPhase
-        ResidualWrapped = (Residual + pi) % (2*pi) - pi // Wrap to [-pi, pi]
-        if Mask is not None:
-            return ResidualWrapped * Mask
-        return ResidualWrapped
-
-    IsValidVoxel(voxel_coord, shape, Mask): // Standard boundary and mask check
-        // ... implementation ...
-        return True
-
-    GetNeighbors(voxel_coord, shape, connectivity, Mask): // Standard neighbor finding
-        // ... implementation ...
-        return [] // list of neighbor_coord tuples
-    ```
-    --- END USER-PROVIDED PSEUDOCODE ---
+    Performs phase unwrapping using a Voronoi-seeded region-growing algorithm.
+    Implementation based on user-provided pseudocode.
     """
-    raise NotImplementedError(
-        "unwrap_phase_voronoi_region_growing is not yet implemented. "
-        "See docstring for algorithm details based on user pseudocode."
+    if not isinstance(phase_data, torch.Tensor):
+        raise TypeError("Input 'phase_data' must be a PyTorch Tensor.")
+
+    device = phase_data.device
+    shape = phase_data.shape
+    ndim = phase_data.ndim
+
+    if not (ndim == 2 or ndim == 3):
+        raise ValueError(f"phase_data must be 2D or 3D, got {ndim}D.")
+
+    voxel_size_tensor = torch.tensor(list(voxel_size), dtype=torch.float32, device=device)
+    if voxel_size_tensor.shape[0] != ndim:
+        raise ValueError(f"voxel_size length ({len(voxel_size)}) must match phase_data ndim ({ndim}).")
+
+    # --- Initialization ---
+    unwrapped_phase = torch.zeros_like(phase_data, dtype=torch.float32, device=device)
+    visited = torch.zeros_like(phase_data, dtype=torch.bool, device=device)
+
+    if mask is not None:
+        if not isinstance(mask, torch.Tensor) or mask.dtype != torch.bool:
+            raise TypeError("Mask must be a boolean PyTorch Tensor.")
+        if mask.shape != shape:
+            raise ValueError("Mask shape must match phase_data shape.")
+        mask = mask.to(device)
+        visited[~mask] = True # Masked out regions are considered "visited"
+
+    # --- Quality Map ---
+    quality_map = _vu_compute_quality_map(phase_data, mask, voxel_size_tensor)
+
+    # --- Seed Selection ---
+    # min_seed_distance is physical, helper needs squared physical distance
+    min_seed_dist_sq = min_seed_distance**2
+    voronoi_seeds_voxel_coords = _vu_select_voronoi_seeds(quality_map, mask, quality_threshold, min_seed_dist_sq, voxel_size_tensor)
+
+    if not voronoi_seeds_voxel_coords:
+        print("Warning: No seed voxels found. Returning original wrapped phase.")
+        if mask is not None:
+            return phase_data.where(mask, torch.tensor(0.0, device=device))
+        return phase_data.clone()
+
+    # --- Voronoi Tessellation (Option A: Nearest Seed Assignment) ---
+    # Convert voxel seed coordinates to physical coordinates for compute_voronoi_tessellation
+    seeds_physical_coords_list = []
+    for seed_vc in voronoi_seeds_voxel_coords:
+        phys_coord = (torch.tensor(seed_vc, dtype=torch.float32, device=device) + 0.5) * voxel_size_tensor
+        seeds_physical_coords_list.append(phys_coord)
+
+    seeds_physical_tensor = torch.stack(seeds_physical_coords_list)
+
+    if RECONLIB_VORONOI_TESSELLATION_AVAILABLE:
+        cell_id_map = compute_voronoi_tessellation(shape, seeds_physical_tensor, voxel_size_tensor, mask)
+    else: # Fallback if the main function isn't available (should have been caught by import)
+        # Simplified nearest seed for CellIDMap if external not found
+        print("Warning: Using simplified internal nearest seed for CellIDMap as reconlib.voronoi.voronoi_tessellation.compute_voronoi_tessellation was not available.")
+        cell_id_map = torch.full(shape, -1, dtype=torch.long, device=device)
+        # This part would need a loop over all voxels to find nearest seed if external func fails.
+        # For now, this means Merge step won't have meaningful Cell IDs if the import fails.
+        # The region growing below doesn't strictly need CellIDMap for its logic, but the Merge step does.
+        # Let's assume for now the import works, or the Merge step handles CellIDMap=-1.
+
+    # Initialize unwrapping at seed points
+    for seed_coord_tuple in voronoi_seeds_voxel_coords:
+        unwrapped_phase[seed_coord_tuple] = phase_data[seed_coord_tuple]
+        visited[seed_coord_tuple] = True
+
+    # --- Region Growing ---
+    pq: List[Tuple[float, Tuple[int, ...]]] = [] # (neg_quality, voxel_idx_tuple)
+    for seed_coord_tuple in voronoi_seeds_voxel_coords:
+        heapq.heappush(pq, (-quality_map[seed_coord_tuple].item(), seed_coord_tuple))
+
+    processed_count_rg = 0
+    if max_iterations_rg == -1: # If -1, set to total number of voxels in mask or image
+        max_iterations_rg = mask.sum().item() if mask is not None else phase_data.numel()
+
+    while pq and processed_count_rg < max_iterations_rg:
+        neg_q, current_voxel_idx_tuple = heapq.heappop(pq)
+        # current_quality = -neg_q # Not strictly needed for logic, only for pushing
+
+        processed_count_rg += 1
+
+        # Get neighbors using the local helper
+        neighbors = _vu_get_neighbors(current_voxel_idx_tuple, shape, neighbor_connectivity, mask)
+
+        for neighbor_idx_tuple in neighbors:
+            if not visited[neighbor_idx_tuple].item() and quality_map[neighbor_idx_tuple].item() >= quality_threshold:
+                visited[neighbor_idx_tuple] = True
+
+                wp_neighbor = phase_data[neighbor_idx_tuple].item()
+                up_current = unwrapped_phase[current_voxel_idx_tuple].item() # Use current unwrapped value as reference
+
+                # Using wrapped phase of current_voxel for difference calculation
+                # This is fine if current_voxel was just unwrapped from its own reference.
+                # Or, more robustly: use wrapped_phase[current_voxel_idx_tuple]
+                # diff = wp_neighbor - wrapped_phase[current_voxel_idx_tuple].item()
+                # The pseudocode says: diff = WrappedPhase[NeighborVoxel] - WrappedPhase[CurrentVoxel]
+                # Then UnwrappedPhase[NeighborVoxel] = UnwrappedPhase[CurrentVoxel] + wrapped(diff)
+                # This is correct.
+                diff = wp_neighbor - phase_data[current_voxel_idx_tuple].item()
+
+                unwrapped_phase[neighbor_idx_tuple] = up_current + _vu_wrap_to_pi(torch.tensor(diff)).item()
+
+                heapq.heappush(pq, (-quality_map[neighbor_idx_tuple].item(), neighbor_idx_tuple))
+
+    if processed_count_rg >= max_iterations_rg and pq:
+        print(f"Warning: Region growing reached max_iterations_rg ({max_iterations_rg}) with {len(pq)} items left in queue.")
+
+    # --- Merge Voronoi Cells & Optimize Paths (Placeholder) ---
+    unwrapped_phase = _vu_merge_voronoi_cells_and_optimize_paths(
+        unwrapped_phase, phase_data, cell_id_map, quality_map, mask,
+        voxel_size_tensor, tolerance, max_iterations # max_iterations here for optimize step
     )
 
-```
+    # --- Final Masking ---
+    if mask is not None:
+        unwrapped_phase.masked_fill_(~mask, 0.0)
+
+    # Ensure unvisited regions within the mask are set to their original wrapped phase
+    # or remain 0, depending on desired behavior. Current logic leaves them as 0.
+    # If original phase desired for unvisited masked regions:
+    # if mask is not None:
+    #     unvisited_and_masked = mask & ~visited
+    #     unwrapped_phase[unvisited_and_masked] = phase_data[unvisited_and_masked]
+
+    return unwrapped_phase
+
+[end of reconlib/phase_unwrapping/voronoi_unwrap.py]
