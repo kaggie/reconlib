@@ -333,6 +333,7 @@ class HuberRegularizer(Regularizer):
                              x - sigma * self.delta * torch.sign(x)
                             )
         Let's use a standard formulation for prox_{gamma * H_delta}(x):
+        """
         x_abs = abs(x)
         idx_quadratic = x_abs <= delta * (1 + gamma)
         idx_linear = x_abs > delta * (1 + gamma)
