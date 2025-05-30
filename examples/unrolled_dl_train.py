@@ -8,7 +8,8 @@ import argparse
 import os
 import sys
 
-# Adjust path to import from reconlib
+# This allows running the example directly from the 'examples' folder.
+# For general use, it's recommended to install reconlib (e.g., `pip install -e .` from root).
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from reconlib.operators import NUFFTOperator
@@ -55,6 +56,10 @@ def train_modl_network(args):
     oversamp_factor = tuple([args.oversamp_factor] * args.dim)
     kb_J = tuple([args.kb_width] * args.dim)
     kb_alpha = tuple([args.kb_alpha_scale * J for J in kb_J]) # e.g. 2.34 * J
+    # Ld: Table length for NUFFT. Default args.table_oversamp is 256.
+    # For higher accuracy, especially with larger kernels or higher precision needs,
+    # larger table lengths (e.g., 1024 for 2D, 512 for 3D) can be used,
+    # consistent with defaults in reconlib.nufft.NUFFT2D/3D.
     Ld = tuple([args.table_oversamp] * args.dim)
     # Kd (oversampled grid size) can be derived by NUFFTOperator if None
     Kd = tuple(int(N * os) for N, os in zip(image_shape, oversamp_factor))

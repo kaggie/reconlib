@@ -6,7 +6,8 @@ import os
 import sys
 import matplotlib.pyplot as plt
 
-# Adjust path to import from reconlib
+# This allows running the example directly from the 'examples' folder.
+# For general use, it's recommended to install reconlib (e.g., `pip install -e .` from root).
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from reconlib.operators import NUFFTOperator
@@ -54,6 +55,10 @@ def evaluate_modl_network(args):
     oversamp_factor = tuple([args.oversamp_factor] * args.dim)
     kb_J = tuple([args.kb_width] * args.dim)
     kb_alpha = tuple([args.kb_alpha_scale * J for J in kb_J])
+    # Ld: Table length for NUFFT. Default args.table_oversamp is 256.
+    # For higher accuracy, especially with larger kernels or higher precision needs,
+    # larger table lengths (e.g., 1024 for 2D, 512 for 3D) can be used,
+    # consistent with defaults in reconlib.nufft.NUFFT2D/3D.
     Ld = tuple([args.table_oversamp] * args.dim)
     Kd = tuple(int(N * os) for N, os in zip(image_shape, oversamp_factor))
     n_shift = tuple([0.0] * args.dim)
@@ -156,13 +161,13 @@ def evaluate_modl_network(args):
             if data_range_slice_eval == 0: data_range_slice_eval = 1.0
 
             current_mse = mse(gt_abs_slice, rec_abs_slice)
-            current_psnr = psnr(gt_abs_slice, rec_abs_slice, data_range=data_range_slice_eval)
-            current_ssim = ssim(gt_abs_slice, rec_abs_slice, data_range=data_range_slice_eval) # SSIM on 2D slice
+            current_psnr = psnr(gt_abs_slice, rec_abs_slice, data_range=data_range_slice_eval.item())
+            current_ssim = ssim(gt_abs_slice.unsqueeze(0).unsqueeze(0), rec_abs_slice.unsqueeze(0).unsqueeze(0), data_range=data_range_slice_eval.item())
             print(f"Sample {i+1}/{test_dataset_size} - Slice {center_slice_idx_eval} - MSE: {current_mse.item():.4e}, PSNR: {current_psnr.item():.2f} dB, SSIM: {current_ssim.item():.4f}")
         else: # 2D
             current_mse = mse(gt_abs, rec_abs)
-            current_psnr = psnr(gt_abs, rec_abs, data_range=data_range_eval)
-            current_ssim = ssim(gt_abs, rec_abs, data_range=data_range_eval)
+            current_psnr = psnr(gt_abs, rec_abs, data_range=data_range_eval.item())
+            current_ssim = ssim(gt_abs.unsqueeze(0).unsqueeze(0), rec_abs.unsqueeze(0).unsqueeze(0), data_range=data_range_eval.item())
             print(f"Sample {i+1}/{test_dataset_size} - MSE: {current_mse.item():.4e}, PSNR: {current_psnr.item():.2f} dB, SSIM: {current_ssim.item():.4f}")
         
         total_mse += current_mse.item()
@@ -210,6 +215,9 @@ def evaluate_modl_network(args):
 
 
 if __name__ == '__main__':
+    print("NOTE: This script evaluates a pre-trained MoDL model.")
+    print("      It requires a valid --checkpoint_path to a .pth file.")
+    print("      This script does NOT train a model.\n")
     parser = argparse.ArgumentParser(description="MoDL Network Evaluation Script")
     # Inherit most args from training script for consistency
     parser.add_argument('--checkpoint_path', type=str, required=True, help="Path to trained model checkpoint (.pth)")
