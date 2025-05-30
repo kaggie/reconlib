@@ -77,9 +77,9 @@ from .plotting import (
 from .pipeline_utils import preprocess_multi_coil_multi_echo_data
 
 # Exports from voronoi_utils.py
-from .voronoi_utils import compute_polygon_area
-from .voronoi_utils import compute_convex_hull_volume
-from .voronoi_utils import normalize_weights
+from .voronoi.geometry_core import compute_polygon_area
+from .voronoi.geometry_core import compute_convex_hull_volume
+from .voronoi.geometry_core import normalize_weights
 
 
 # Optionally, define __all__ to specify what `from reconlib import *` imports

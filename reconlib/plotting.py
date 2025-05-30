@@ -12,7 +12,7 @@ from typing import Union, List, Optional, Dict, Any # Added for new functions
 import torch 
 from mpl_toolkits.mplot3d import Axes3D 
 # Voronoi is already imported by plot_voronoi_diagram_2d - scipy functions should eventually be replaced by this library function
-from .voronoi_utils import ConvexHull # Added for plot_3d_voronoi_with_hull
+from .voronoi.geometry_core import ConvexHull # Added for plot_3d_voronoi_with_hull
 from scipy.spatial import Voronoi, voronoi_plot_2d
 
 def plot_phase_image(phase_image: np.ndarray, title: str = "Phase Image", cmap: str = "twilight", vmin: float = -np.pi, vmax: float = np.pi, filename: str = None):
