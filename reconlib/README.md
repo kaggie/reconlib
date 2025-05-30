@@ -18,9 +18,11 @@ Offers algorithms for resolving 3D phase ambiguities.
 -   `least_squares_unwrap.py`: Implements a 3D least-squares spatial phase unwrapping algorithm via an FFT-based Poisson solver (PyTorch-based).
 -   `goldstein_unwrap.py`: Implements a 3D Goldstein-style spatial phase unwrapping algorithm using k-space spectral filtering (PyTorch-based).
 -   `reference_echo_unwrap.py`: Implements `unwrap_multi_echo_masked_reference` for multi-echo phase unwrapping using a reference echo strategy. This function expects coil-combined input phase and magnitude for each echo and utilizes a user-provided spatial unwrapper. For a full pipeline from multi-coil data, see `preprocess_multi_coil_multi_echo_data` in `reconlib.pipeline_utils`.
--   `puror.py`: Placeholder for the PUROR algorithm (not yet implemented).
--   `romeo.py`: Placeholder for the ROMEO algorithm (not yet implemented).
--   `deep_learning_unwrap.py`: Placeholder for U-Net based phase unwrapping (not yet implemented).
+-   `puror.py`: Implements `unwrap_phase_puror`, a native PyTorch Voronoi-seeded region-growing phase unwrapping algorithm.
+-   `romeo.py`: Implements `unwrap_phase_romeo`, a native PyTorch region-growing phase unwrapping algorithm based on ROMEO principles.
+-   `deep_learning_unwrap.py`: Implements `unwrap_phase_deep_learning`, providing a framework to use a U-Net model (defined in `reconlib.deeplearning.models.unet_denoiser.py`) for phase unwrapping with pre-trained weights.
+-   `voronoi_unwrap.py`: Placeholder for `unwrap_phase_voronoi_region_growing`, a detailed Voronoi-based region-growing algorithm.
+-   `residue_unwrap.py`: Placeholder for `unwrap_phase_residue_guided`, a residue/branch-cut based phase unwrapping algorithm.
 -   `utils.py`: Utilities for phase unwrapping, including mask generation.
 
 ### Data Handling and Preprocessing (`reconlib.data`, `reconlib.utils`, `reconlib.io`, `reconlib.pipeline_utils`)
@@ -41,14 +43,19 @@ A new module for visualizing MRI data, including:
 -   B0 field maps (`plot_b0_field_map`)
 
 ### ESPIRiT Sensitivity Maps (`reconlib.csm`)
--   A placeholder function `estimate_espirit_maps` has been added for ESPIRiT coil sensitivity map estimation. The full algorithm implementation is pending.
+-   `estimate_espirit_maps`: Implemented natively in PyTorch for ESPIRiT coil sensitivity map estimation, including ACS data gridding, calibration matrix construction, SVD, and pixel-wise eigenvalue analysis.
+
+### Reconstructors (`reconlib.reconstructors`)
+-   `phase_aided_reconstructor.py`: Placeholder for `PhaseAidedReconstruction`, a method for phase-aided MRI image reconstruction.
+-   Proximal Gradient based iterative solvers (existing, e.g. `pg_reconstructor.py`).
+
 
 ## Core Features (Existing)
 -   **NUFFT**: Non-Uniform Fast Fourier Transform operators (`reconlib.nufft`, `reconlib.operators.NUFFTOperator`).
--   **Coil Sensitivity Maps**: Basic CSM estimation and operator (`reconlib.csm`, `reconlib.operators.CoilSensitivityOperator`).
+-   **Coil Sensitivity Maps**: Basic CSM estimation and operator (`reconlib.csm` - see above for ESPIRiT, `reconlib.operators.CoilSensitivityOperator`).
 -   **Forward Operator**: Composite MRI forward operator (`reconlib.operators.MRIForwardOperator`).
 -   **Regularizers**: L1, L2, Total Variation, etc. (`reconlib.regularizers`).
--   **Reconstructors**: Proximal Gradient based iterative solvers (`reconlib.reconstructors`).
+-   **Reconstructors**: (See above for new placeholders and existing iterative solvers).
 
 ## Examples
 Example scripts and Jupyter Notebooks demonstrating the use of these modules can be found in the main `examples/` directory of the repository. New Jupyter Notebook examples include:
