@@ -217,4 +217,3 @@ for wavelet_name in wavelet_names_to_test:
 
 print("\nExample script finished.")
 
-```
