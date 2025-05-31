@@ -116,3 +116,93 @@
     *   **Deconvolution Microscopy:** Computationally improves resolution and contrast by reassigning blurred light to its original location, based on knowledge of the PSF.
     *   **Super-Resolution Microscopy (Nanoscopy):** Techniques like PALM, STORM, STED, SIM that overcome the diffraction limit to achieve resolutions down to tens of nanometers. These often involve specialized optics, fluorophores, and complex image processing.
     *   Data is typically 2D or 3D images (stacks of 2D images). Time-lapse (4D) imaging is also common.
+
+## Structured Illumination Microscopy (SIM)
+*   **Description:** A super-resolution microscopy technique using patterned illumination to enhance resolution beyond the diffraction limit. It typically involves acquiring multiple images with different phases and orientations of the illumination pattern. These raw images are then processed to reconstruct a super-resolved image.
+*   **Key Papers:**
+    *   Gustafsson, M. G. (2000). Surpassing the lateral resolution limit by a factor of two using structured illumination microscopy. Journal of microscopy, 198(2), 82-87. (Foundational paper on SIM)
+    *   Heintzmann, R., & Cremer, C. G. (1999). Laterally modulated excitation microscopy: improvement of resolution by using a diffraction grating. Optical Preamplifiers and their Applications. (Early concepts related to SIM)
+*   **Important Algorithms:**
+    *   **SIM Reconstruction Algorithms:** Often involve processing in Fourier space. The core idea is that the patterned illumination shifts high-frequency information (normally inaccessible) into the observable region of the optical transfer function (OTF). By acquiring multiple images with different patterns, one can separate these components and extend the effective OTF.
+    *   **Generalized Wiener Filter / Iterative Methods:** Used for separating and recombining the frequency components, often with regularization to handle noise and ill-conditioning.
+    *   **Parameter Estimation:** Precise knowledge of illumination pattern parameters (frequency, phase, orientation) is critical and often needs to be estimated from the data.
+*   **Key Features:**
+    *   Doubles resolution compared to widefield microscopy (in 2D SIM, can be more in 3D SIM).
+    *   Relatively fast and compatible with live-cell imaging compared to some other super-resolution methods.
+    *   Requires multiple raw images per final super-resolved image (e.g., 9-15 for 2D/3D SIM).
+    *   Sensitive to artifacts if parameters are incorrect or noise is high.
+*   **Regularization in SIM:**
+    *   **L1:** Can be used in super-resolution SIM (SR-SIM) or non-linear SIM variants to exploit sparsity in high-frequency components or object features during reconstruction.
+    *   **L2 (Wiener-like):** Applied in Fourier domain reconstruction (e.g., generalized Wiener filtering) to stabilize solutions against noise, especially when separating frequency components.
+    *   **TV:** Employed in regularization-based iterative optimization (e.g., for non-linear SIM or robust reconstruction) to preserve edges and reduce noise in the final super-resolved image.
+
+## X-ray Diffraction Imaging
+
+*   **Description:** Uses X-ray diffraction patterns to image crystalline structures and electron density distributions, crucial in materials science, structural biology (e.g., protein crystallography), and non-destructive testing. Phase retrieval is often a key challenge as detectors typically only measure intensity (magnitude squared of the diffraction pattern).
+*   **Key Papers:**
+    *   Sayre, D. (1952). Some implications of a theorem due to Shannon. Acta Crystallographica, 5(6), 843-843. (Early work on phasing)
+    *   Fienup, J. R. (1982). Phase retrieval algorithms: a comparison. Applied optics, 21(15), 2758-2769. (Classic paper on phase retrieval algorithms)
+    *   Rodenburg, J. M., & Faulkner, H. M. L. (2004). A phase retrieval algorithm for shifting illumination. Applied Physics Letters, 85(20), 4795-4797. (Ptychography concept)
+*   **Important Algorithms:**
+    *   **Phase Retrieval Algorithms:**
+        *   *Gerchberg-Saxton (GS):* Iterates between real and Fourier space, applying known constraints in each domain.
+        *   *Hybrid Input-Output (HIO):* An improvement over GS, often more robust.
+        *   *Difference Map:* Another iterative phase retrieval algorithm.
+    *   **Ptychography:** A scanning coherent diffraction imaging technique that uses multiple overlapping diffraction patterns to reconstruct both the object and the illumination probe, often providing robust phase retrieval.
+    *   **Direct Methods:** Used in crystallography, leveraging statistical properties of diffraction data.
+*   **Key Features:**
+    *   Provides atomic or near-atomic resolution information about material structure.
+    *   Sensitive to crystal lattice, orientation, strain, and electron density.
+    *   **Phase Problem:** A central challenge; detectors measure intensities, so the phase of the diffracted waves is lost and must be recovered.
+    *   Coherent Diffraction Imaging (CDI) techniques use coherent X-ray beams.
+*   **Regularization in X-ray Diffraction Imaging:**
+    *   **L1:** Applied in phase retrieval problems (e.g., ptychography, CDI) to exploit sparsity in the object's electron density, its gradient (TV-like), or in a wavelet domain. This helps in regularizing the ill-posed phase problem.
+    *   **L2:** Used in iterative phase retrieval algorithms (e.g., variants of Gerchberg-Saxton or gradient descent methods for minimizing error metrics) to stabilize solutions and ensure consistency with measured magnitudes.
+    *   **TV (Total Variation):** Enhances edge preservation and reduces noise in reconstructed electron density maps or object images, especially when combined with iterative phase retrieval.
+
+## Electrical Impedance Tomography (EIT)
+
+*   **Description:** A non-invasive imaging technique that reconstructs the internal conductivity (or impedance) distribution of a body from electrical measurements made at its surface. Electrodes are attached to the surface, small currents are injected, and resulting voltages are measured.
+*   **Key Papers:**
+    *   Barber, D. C., & Brown, B. H. (1984). Applied potential tomography. Journal of Physics E: Scientific Instruments, 17(9), 723. (Early work and review)
+    *   Cheney, M., Isaacson, D., & Newell, J. C. (1999). Electrical impedance tomography. SIAM review, 41(1), 85-101. (Mathematical overview)
+    *   Adler, A., & Guardo, R. (1996). Electrical impedance tomography: regularized imaging and contrast detection. IEEE Transactions on medical imaging, 15(2), 170-179.
+*   **Important Algorithms:**
+    *   **Linearized Reconstruction:** Based on a sensitivity matrix (Jacobian) derived from a forward model (e.g., Complete Electrode Model). Common algorithms include Filtered Back-Projection (FBP-like), Tikhonov regularization.
+    *   **Iterative Non-linear Reconstruction:** Algorithms like Gauss-Newton, Levenberg-Marquardt, or iteratively reweighted least squares that solve the full non-linear inverse problem. These require repeated solutions of the forward problem.
+    *   **Regularization Methods:** Tikhonov (L2), Total Variation (TV), Laplace regularization are crucial due to the ill-posed nature of EIT.
+    *   **Difference Imaging:** Reconstructing changes in conductivity over time, often more robust than absolute imaging.
+*   **Key Features:**
+    *   Non-invasive, portable, relatively low-cost.
+    *   No ionizing radiation.
+    *   Used for monitoring physiological functions (e.g., lung ventilation, gastric emptying, brain activity) and industrial process tomography.
+    *   Highly ill-posed inverse problem: small changes in internal conductivity can lead to very small changes in surface measurements, making it sensitive to noise and modeling errors.
+    *   Spatial resolution is generally low compared to other tomographic modalities.
+*   **Regularization in EIT:**
+    *   **L1:** Promotes sparse conductivity changes, useful in dynamic EIT (imaging changes over time) or when expecting localized conductivity anomalies.
+    *   **L2 (Tikhonov):** Most common for stabilizing the ill-posed inverse problem by penalizing large variations in the conductivity map, leading to smoother solutions.
+    *   **TV (Total Variation):** Widely used to preserve sharp boundaries between regions of different conductivity, which is often desired in medical images. It can help counteract the smoothing effect of L2 regularization.
+
+## Diffuse Optical Tomography (DOT)
+
+*   **Description:** A non-invasive imaging technique that uses near-infrared (NIR) light to image optical properties (primarily absorption `mu_a` and reduced scattering `mu_s'`) of biological tissues. Light is delivered to the tissue surface via source optodes, and detected at other locations by detector optodes after it has propagated through the tissue.
+*   **Key Papers:**
+    *   Arridge, S. R. (1999). Optical tomography in medical imaging. Inverse problems, 15(2), R41. (Comprehensive review of DOT physics and maths)
+    *   Boas, D. A., Brooks, D. H., Miller, E. L., DiMarzio, C. A., Kilmer, M., Gaudette, R. J., & Zhang, Q. (2001). Imaging the body with diffuse optical tomography. IEEE signal processing magazine, 18(6), 57-75.
+    *   Gibson, A. P., Hebden, J. C., & Arridge, S. R. (2005). Recent advances in diffuse optical imaging. Physics in medicine & biology, 50(4), R1.
+*   **Important Algorithms:**
+    *   **Forward Model Solvers:** Based on approximations to the Radiative Transfer Equation (RTE), most commonly the Diffusion Equation (DE). Finite Element Method (FEM) is often used to solve the DE for complex geometries.
+    *   **Inverse Problem Solvers:**
+        *   *Linearized Methods:* Using a sensitivity matrix (Jacobian) relating changes in optical properties to changes in measurements. Iterative methods like ART, SART, or regularized least-squares are used.
+        *   *Non-linear Iterative Methods:* Gauss-Newton, Levenberg-Marquardt, gradient descent, that iteratively update optical property estimates by minimizing the difference between measured and predicted data.
+    *   **Regularization:** Tikhonov (L2), Total Variation (TV), L1-norm (for sparsity) are essential due to the highly ill-posed and diffuse nature of DOT.
+*   **Key Features:**
+    *   Non-invasive, uses non-ionizing NIR light.
+    *   Can measure functional information (e.g., hemoglobin concentration changes related to brain activity or tumor angiogenesis).
+    *   Relatively low cost and potential for portable systems.
+    *   Highly scattering nature of light in tissue leads to a very ill-posed inverse problem and low spatial resolution compared to X-ray CT or MRI.
+    *   Different data types: Continuous Wave (CW), Frequency Domain (FD), Time Domain (TD), each providing different information content and complexity.
+*   **Regularization in DOT:**
+    *   **L1:** Applied in sparse reconstruction to model localized absorbers or scatterers, or to find sparse changes in optical properties (e.g., in functional brain imaging).
+    *   **L2 (Tikhonov):** Commonly used to stabilize reconstructions in the presence of noise and the inherent ill-posedness of the inverse problem, typically promoting smoother solutions.
+    *   **TV (Total Variation):** Enhances edge-preserving reconstruction of optical property maps, useful for delineating regions with different optical characteristics.
