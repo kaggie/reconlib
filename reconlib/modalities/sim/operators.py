@@ -2,81 +2,79 @@ import torch
 from reconlib.operators import Operator
 import numpy as np
 from reconlib.modalities.fluorescence_microscopy.operators import generate_gaussian_psf # Re-use for PSF
+from .utils import generate_sim_patterns # Import from local utils
 
 class SIMOperator(Operator):
     """
-    Placeholder Forward and Adjoint Operator for Structured Illumination Microscopy (SIM).
+    Refined Forward and Adjoint Operator for Structured Illumination Microscopy (SIM).
 
-    SIM works by illuminating the sample with patterned light (e.g., stripes),
-    acquiring multiple images with different pattern phases/orientations.
-    This effectively encodes high-frequency information into observable moiré fringes.
-    Reconstruction decodes this to achieve super-resolution.
-
-    A simplified forward model:
+    Models SIM acquisition:
     1. True high-res image X_hr.
-    2. For each illumination pattern P_i:
+    2. For each illumination pattern P_i (generated if not provided):
        - Modulated image: M_i = X_hr * P_i
        - Observed raw image: Y_i = PSF_det * M_i (convolution with detection PSF)
     The operator outputs a stack of Y_i.
-
-    The adjoint is complex. This placeholder will be very basic.
     """
     def __init__(self,
-                 hr_image_shape: tuple[int, int], # (Ny_hr, Nx_hr) - high-res ground truth
-                 num_patterns: int, # Total number of raw SIM images (e.g., 3 phases * 3 angles = 9)
-                 psf_detection: torch.Tensor, # Detection PSF (low-pass effect)
-                 patterns: torch.Tensor | None = None, # Pre-generated patterns (num_patterns, Ny_hr, Nx_hr)
+                 hr_image_shape: tuple[int, int],
+                 psf_detection: torch.Tensor,
+                 num_angles: int = 3, # Used if patterns are not provided
+                 num_phases: int = 3, # Used if patterns are not provided
+                 patterns: torch.Tensor | None = None,
+                 pattern_k_max_rel: float = 0.8, # Used for internal pattern generation
                  device: str | torch.device = 'cpu'):
         super().__init__()
         self.hr_image_shape = hr_image_shape
-        self.num_patterns = num_patterns
         self.psf_detection = psf_detection.to(torch.device(device))
         self.device = torch.device(device)
 
-        if self.psf_detection.ndim != 2:
-            raise ValueError("Detection PSF must be 2D for this basic SIM operator.")
+        if self.psf_detection.ndim != 2: # Assuming 2D SIM for now
+            raise ValueError("Detection PSF must be 2D for this SIM operator.")
 
-        # Padding for 'same' convolution with detection PSF
-        self.psf_padding = [(s - 1) // 2 for s in self.psf_detection.shape]
-        # PyTorch conv2d padding is (pad_H, pad_W)
-        # self.psf_padding.reverse() # Not needed if (H,W) order is kept
+        # Manual padding for 'same' convolution with detection PSF
+        self.psf_padding = [(s - 1) // 2 for s in self.psf_detection.shape] # (pad_H, pad_W)
 
         if patterns is not None:
-            if patterns.shape != (num_patterns, *hr_image_shape):
-                raise ValueError(f"Provided patterns shape {patterns.shape} is not ({num_patterns}, {hr_image_shape[0]}, {hr_image_shape[1]}).")
             self.patterns = patterns.to(self.device)
+            self.num_patterns = self.patterns.shape[0]
+            if self.patterns.shape[1:] != self.hr_image_shape:
+                raise ValueError(f"Provided patterns spatial shape {self.patterns.shape[1:]} "
+                                 f"does not match hr_image_shape {self.hr_image_shape}.")
         else:
-            print("Warning: No patterns provided to SIMOperator. Using dummy constant patterns.")
-            self.patterns = torch.ones((num_patterns, *hr_image_shape), device=self.device) / num_patterns
-            # In a real scenario, these would be e.g. sin(k*x + phase) for different k, phase
+            print("SIMOperator: Patterns not provided, generating internally.")
+            self.num_patterns = num_angles * num_phases
+            self.patterns = generate_sim_patterns(
+                hr_image_shape=self.hr_image_shape,
+                num_angles=num_angles,
+                num_phases=num_phases,
+                k_vector_max_rel=pattern_k_max_rel,
+                device=self.device
+            )
+            if self.patterns.shape[0] != self.num_patterns: # Should match by construction
+                 raise ValueError("Internal pattern generation failed to produce num_patterns.")
 
-        # Output shape: stack of raw SIM images
-        self.measurement_shape = (num_patterns, *hr_image_shape) # Each raw image has same shape as HR for simplicity here
 
-        print(f"SIMOperator (Placeholder) initialized.")
+        self.measurement_shape = (self.num_patterns, *self.hr_image_shape)
+
+        print(f"SIMOperator (Refined) initialized.")
         print(f"  HR Image Shape: {self.hr_image_shape}, Num Patterns: {self.num_patterns}")
-        print(f"  Detection PSF shape: {self.psf_detection.shape}")
+        print(f"  Detection PSF shape: {self.psf_detection.shape}, Padding: {self.psf_padding}")
 
     def op(self, hr_image: torch.Tensor) -> torch.Tensor:
-        """
-        Forward: High-resolution image to a stack of raw SIM images.
-        """
         if hr_image.shape != self.hr_image_shape:
             raise ValueError(f"Input hr_image shape {hr_image.shape} must match {self.hr_image_shape}.")
         hr_image = hr_image.to(self.device)
+        if hr_image.dtype != self.patterns.dtype: # Ensure dtype consistency for multiplication
+            hr_image = hr_image.to(self.patterns.dtype)
 
-        raw_sim_images = torch.zeros(self.measurement_shape, device=self.device)
 
-        # Unsqueeze for conv2d
-        psf_exp = self.psf_detection.unsqueeze(0).unsqueeze(0) # (1,1,kH,kW)
+        raw_sim_images = torch.zeros(self.measurement_shape, device=self.device, dtype=hr_image.dtype)
+        psf_exp = self.psf_detection.unsqueeze(0).unsqueeze(0).to(hr_image.dtype) # (1,1,kH,kW)
 
         for i in range(self.num_patterns):
-            pattern_i = self.patterns[i, ...] # (Ny_hr, Nx_hr)
-            modulated_image = hr_image * pattern_i # Element-wise multiplication
-
-            # Apply detection PSF (blurring)
-            # Input for conv2d: (batch, channels, H, W)
-            modulated_image_exp = modulated_image.unsqueeze(0).unsqueeze(0) # (1,1,H,W)
+            pattern_i = self.patterns[i, ...]
+            modulated_image = hr_image * pattern_i
+            modulated_image_exp = modulated_image.unsqueeze(0).unsqueeze(0)
 
             blurred_modulated_image = torch.nn.functional.conv2d(
                 modulated_image_exp, psf_exp, padding=self.psf_padding
@@ -86,80 +84,106 @@ class SIMOperator(Operator):
         return raw_sim_images
 
     def op_adj(self, raw_sim_images_stack: torch.Tensor) -> torch.Tensor:
-        """
-        Adjoint: Stack of raw SIM images to a high-resolution image estimate.
-        Placeholder: Correlate each raw image with its pattern and sum up, after adjoint PSF.
-        """
         if raw_sim_images_stack.shape != self.measurement_shape:
             raise ValueError(f"Input stack shape {raw_sim_images_stack.shape} must match {self.measurement_shape}.")
         raw_sim_images_stack = raw_sim_images_stack.to(self.device)
+        if raw_sim_images_stack.dtype != self.patterns.dtype:
+            raw_sim_images_stack = raw_sim_images_stack.to(self.patterns.dtype)
 
-        hr_image_estimate = torch.zeros(self.hr_image_shape, device=self.device)
 
-        # Flipped PSF for adjoint convolution
-        psf_flipped_exp = torch.flip(self.psf_detection, dims=[0,1]).unsqueeze(0).unsqueeze(0)
+        hr_image_estimate = torch.zeros(self.hr_image_shape, device=self.device, dtype=raw_sim_images_stack.dtype)
+        psf_flipped_exp = torch.flip(self.psf_detection, dims=[0,1]).unsqueeze(0).unsqueeze(0).to(raw_sim_images_stack.dtype)
 
         for i in range(self.num_patterns):
-            raw_image_i_exp = raw_sim_images_stack[i, ...].unsqueeze(0).unsqueeze(0) # (1,1,H,W)
+            raw_image_i_exp = raw_sim_images_stack[i, ...].unsqueeze(0).unsqueeze(0)
 
-            # Adjoint of PSF convolution
             adj_conv_raw_image = torch.nn.functional.conv2d(
                 raw_image_i_exp, psf_flipped_exp, padding=self.psf_padding
-            ).squeeze() # (H,W)
+            ).squeeze()
 
-            # Adjoint of pattern multiplication (element-wise with same pattern if real)
             pattern_i = self.patterns[i, ...]
-            hr_image_estimate += adj_conv_raw_image * pattern_i # Element-wise
+            hr_image_estimate += adj_conv_raw_image * pattern_i
 
-        return hr_image_estimate / self.num_patterns # Average contribution
+        # The division by num_patterns in the previous placeholder was a simple normalization.
+        # A true adjoint for sum_i A_i x (where A_i is pattern_i * conv_psf)
+        # would be sum_i A_i^T y_i. Each A_i^T involves pattern_i * conv_psf_adj.
+        # So the sum is correct. Normalization can be handled outside if needed.
+        return hr_image_estimate
 
 if __name__ == '__main__':
-    print("\nRunning basic SIMOperator (Placeholder) checks...")
+    print("\nRunning basic SIMOperator (Refined) checks...")
     dev = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    hr_shape = (64, 64)
-    n_pats = 9
-    psf_det_sim = generate_gaussian_psf(shape=(7,7), sigma=2.0, device=dev) # Wider PSF for noticeable blur
+    hr_shape = (32, 32) # Smaller for faster test
+    n_angles_test = 2
+    n_phases_test = 2
+    n_pats_test = n_angles_test * n_phases_test
 
-    # Example patterns (simple stripes for demo)
-    example_patterns = torch.zeros((n_pats, *hr_shape), device=dev)
-    x_coords = torch.linspace(-np.pi, np.pi, hr_shape[1], device=dev)
-    for i in range(n_pats):
-        angle = (i // 3) * (np.pi / 3) # 3 angles
-        phase = (i % 3) * (2 * np.pi / 3) # 3 phases
-        kx = torch.cos(angle) * 5 # Example spatial frequency
-        ky = torch.sin(angle) * 5
-        xx, yy = torch.meshgrid(torch.arange(hr_shape[0],device=dev), torch.arange(hr_shape[1],device=dev), indexing='ij')
-        example_patterns[i,...] = (torch.cos( (xx*ky + yy*kx) * (2*np.pi/hr_shape[0]) + phase) + 1)/2 # Positive patterns
+    psf_det_sim_test = generate_gaussian_psf(shape=(5,5), sigma=1.0, device=dev).to(torch.float32)
 
+    # Test case 1: Operator generates patterns internally
+    print("\n--- Test Case: Internal Pattern Generation ---")
     try:
-        sim_op = SIMOperator(hr_image_shape=hr_shape, num_patterns=n_pats,
-                             psf_detection=psf_det_sim, patterns=example_patterns, device=dev)
-        print("SIMOperator instantiated.")
+        sim_op_internal_pats = SIMOperator(
+            hr_image_shape=hr_shape,
+            psf_detection=psf_det_sim_test,
+            num_angles=n_angles_test,
+            num_phases=n_phases_test,
+            patterns=None, # Force internal generation
+            pattern_k_max_rel=0.7,
+            device=dev
+        )
+        print("SIMOperator (internal patterns) instantiated.")
 
-        phantom_hr = torch.zeros(hr_shape, device=dev)
-        phantom_hr[hr_shape[0]//4:hr_shape[0]*3//4, hr_shape[1]//4:hr_shape[1]*3//4] = 1.0
-        phantom_hr[10:20,10:20]=2.0
+        phantom_hr_test = torch.randn(hr_shape, device=dev, dtype=torch.float32)
+        raw_images_test = sim_op_internal_pats.op(phantom_hr_test)
+        assert raw_images_test.shape == (n_pats_test, *hr_shape)
 
+        adj_recon_test = sim_op_internal_pats.op_adj(raw_images_test)
+        assert adj_recon_test.shape == hr_shape
 
-        raw_images = sim_op.op(phantom_hr)
-        print(f"Forward op output shape: {raw_images.shape}")
-        assert raw_images.shape == (n_pats, *hr_shape)
+        x_dp_i = torch.randn_like(phantom_hr_test)
+        y_dp_rand_i = torch.randn_like(raw_images_test)
+        Ax_i = sim_op_internal_pats.op(x_dp_i)
+        Aty_i = sim_op_internal_pats.op_adj(y_dp_rand_i)
+        lhs_i = torch.dot(Ax_i.flatten(), y_dp_rand_i.flatten())
+        rhs_i = torch.dot(x_dp_i.flatten(), Aty_i.flatten())
+        print(f"SIM Internal Pats Dot Test: LHS={lhs_i.item():.6f}, RHS={rhs_i.item():.6f}")
+        assert np.isclose(lhs_i.item(), rhs_i.item(), rtol=1e-3, atol=1e-5), "Dot product test failed (internal patterns)."
+        print("SIMOperator (internal patterns) dot product test passed.")
 
-        adj_recon = sim_op.op_adj(raw_images)
-        print(f"Adjoint op output shape: {adj_recon.shape}")
-        assert adj_recon.shape == hr_shape
-
-        # Dot product test
-        x_dp = torch.randn_like(phantom_hr)
-        y_dp_rand = torch.randn_like(raw_images)
-        Ax = sim_op.op(x_dp)
-        Aty = sim_op.op_adj(y_dp_rand)
-        lhs = torch.dot(Ax.flatten(), y_dp_rand.flatten())
-        rhs = torch.dot(x_dp.flatten(), Aty.flatten())
-        print(f"SIM Dot product test: LHS={lhs.item():.6f}, RHS={rhs.item():.6f}")
-        assert np.isclose(lhs.item(), rhs.item(), rtol=1e-3), "Dot product test failed."
-
-        print("SIMOperator __main__ checks completed.")
     except Exception as e:
-        print(f"Error in SIMOperator __main__ checks: {e}")
+        print(f"Error in SIMOperator (internal patterns) checks: {e}")
+        import traceback; traceback.print_exc()
+
+    # Test case 2: External patterns provided
+    print("\n--- Test Case: External Pattern Generation ---")
+    external_patterns_test = generate_sim_patterns(
+        hr_shape, n_angles_test, n_phases_test, k_vector_max_rel=0.7, device=dev
+    ).to(torch.float32)
+    try:
+        sim_op_external_pats = SIMOperator(
+            hr_image_shape=hr_shape,
+            psf_detection=psf_det_sim_test,
+            patterns=external_patterns_test, # Provide patterns
+            device=dev
+        )
+        print("SIMOperator (external patterns) instantiated.")
+        # ... (rest of tests similar to above, using sim_op_external_pats) ...
+        phantom_hr_test_e = torch.randn(hr_shape, device=dev, dtype=torch.float32)
+        raw_images_test_e = sim_op_external_pats.op(phantom_hr_test_e)
+        adj_recon_test_e = sim_op_external_pats.op_adj(raw_images_test_e)
+
+        x_dp_e = torch.randn_like(phantom_hr_test_e)
+        y_dp_rand_e = torch.randn_like(raw_images_test_e)
+        Ax_e = sim_op_external_pats.op(x_dp_e)
+        Aty_e = sim_op_external_pats.op_adj(y_dp_rand_e)
+        lhs_e = torch.dot(Ax_e.flatten(), y_dp_rand_e.flatten())
+        rhs_e = torch.dot(x_dp_e.flatten(), Aty_e.flatten())
+        print(f"SIM External Pats Dot Test: LHS={lhs_e.item():.6f}, RHS={rhs_e.item():.6f}")
+        assert np.isclose(lhs_e.item(), rhs_e.item(), rtol=1e-3, atol=1e-5), "Dot product test failed (external patterns)."
+        print("SIMOperator (external patterns) dot product test passed.")
+
+        print("\nSIMOperator __main__ checks completed for both cases.")
+    except Exception as e:
+        print(f"Error in SIMOperator (external patterns) checks: {e}")
         import traceback; traceback.print_exc()

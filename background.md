@@ -206,3 +206,19 @@
     *   **L1:** Applied in sparse reconstruction to model localized absorbers or scatterers, or to find sparse changes in optical properties (e.g., in functional brain imaging).
     *   **L2 (Tikhonov):** Commonly used to stabilize reconstructions in the presence of noise and the inherent ill-posedness of the inverse problem, typically promoting smoother solutions.
     *   **TV (Total Variation):** Enhances edge-preserving reconstruction of optical property maps, useful for delineating regions with different optical characteristics.
+
+## Photon Counting CT (PCCT) - User Requested TODO
+
+*   **Description:** An advanced X-ray computed tomography technique that uses energy-resolving photon-counting detectors. These detectors count individual X-ray photons and measure their energy, allowing for material decomposition, noise reduction, and potentially lower radiation doses.
+*   **Key Features & Challenges:**
+    *   Energy discrimination capabilities (multiple energy bins).
+    *   Improved contrast-to-noise ratio (CNR).
+    *   Material decomposition (e.g., separating bone, soft tissue, contrast agents).
+    *   Potential for K-edge imaging.
+    *   Higher spatial resolution than conventional CT.
+    *   Challenges: Pulse pile-up, charge sharing, detector calibration, high data rates, spectral distortion, complex image reconstruction algorithms (statistical, model-based).
+*   **Regularization in PCCT:**
+    *   **L1/Sparsity:** Useful for material-specific images (e.g., if a contrast agent is sparse) or for regularizing sinograms in sparse-view CT.
+    *   **TV (Total Variation):** Widely used for preserving edges and reducing noise in reconstructed attenuation maps for each energy bin or in material-decomposed images.
+    *   **L2 (Tikhonov):** Can be used for general smoothing and stabilizing iterative reconstructions.
+    *   **Spectral Regularization:** Priors that enforce smoothness or correlations across energy bins or material basis images (e.g., spectral TV).

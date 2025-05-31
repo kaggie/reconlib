@@ -48,13 +48,26 @@
 
 ## Fluorescence Microscopy
 
-*   **Enhancement Idea 1 (Realistic PSF Generation):** Implement more sophisticated PSF models (e.g., Gibson-Lanni, Born & Wolf) that can account for optical parameters like numerical aperture (NA), wavelength, refractive index mismatch.
-*   **Enhancement Idea 2 (Specific Super-Resolution Operators/Reconstructors):**
-    *   `SparseLocalizationOperator`: For PALM/STORM, an operator that maps a sparse grid of emitter locations and intensities to a series of blurred image frames (simulating blinking). The adjoint would project back.
-    *   Reconstructors specifically for fitting PSFs or using L1-norm minimization for sparse localization.
-*   **Enhancement Idea 3 (Blind Deconvolution):** Implement algorithms that can estimate both the true image and the PSF when the PSF is unknown or partially known.
-*   **Enhancement Idea 4 (GPU-Accelerated Convolution):** Ensure convolution operations are efficiently implemented on GPU, as deconvolution can be computationally intensive. (PyTorch's convNd is already good).
-*   **Enhancement Idea 5 (Handling Different Noise Models):** Extend reconstructors to handle Poisson noise (common in low-light microscopy) or mixed Poisson-Gaussian noise, beyond simple L2 data fidelity.
+*   **Enhancement Idea 1 (Realistic PSF Generation):** Implement more
+sophisticated PSF models (e.g., Gibson-Lanni, Born & Wolf) that can account for
+optical parameters like numerical aperture (NA), wavelength, refractive index
+mismatch.
+*   **Enhancement Idea 2 (Specific Super-Resolution
+Operators/Reconstructors):**
+    *   `SparseLocalizationOperator`: For PALM/STORM, an operator that maps a
+        sparse grid of emitter locations and intensities to a series of blurred
+        image frames (simulating blinking). The adjoint would project back.
+    *   Reconstructors specifically for fitting PSFs or using L1-norm
+        minimization for sparse localization.
+*   **Enhancement Idea 3 (Blind Deconvolution):** Implement algorithms that can
+estimate both the true image and the PSF when the PSF is unknown or partially
+known.
+*   **Enhancement Idea 4 (GPU-Accelerated Convolution):** Ensure convolution
+operations are efficiently implemented on GPU, as deconvolution can be
+computationally intensive. (PyTorch's convNd is already good).
+*   **Enhancement Idea 5 (Handling Different Noise Models):** Extend
+reconstructors to handle Poisson noise (common in low-light microscopy) or mixed
+Poisson-Gaussian noise, beyond simple L2 data fidelity.
 
 # Future Modalities TODO (User Request)
 
@@ -156,7 +169,7 @@
 *   **Example Application:** TV regularization is often favored in medical EIT for reconstructing images of lung aeration or detecting organ boundaries, as it can better preserve edges than pure L2 regularization.
 
 ## Diffuse Optical Tomography (DOT)
-*   **Description:** Uses near-infrared light to image optical properties (e.g., absorption, scattering) in tissues, often for brain or breast imaging.
+*   **Description:** Uses near-infrared (NIR) light to image optical properties (primarily absorption `mu_a` and reduced scattering `mu_s'`) of biological tissues. Light is delivered to the tissue surface via source optodes, and detected at other locations by detector optodes after it has propagated through the tissue.
 *   **Key Papers:**
     *   Arridge, S. R. (1999). Optical tomography in medical imaging. Inverse problems, 15(2), R41. (Comprehensive review of DOT physics and maths)
     *   Boas, D. A., Brooks, D. H., Miller, E. L., DiMarzio, C. A., Kilmer, M., Gaudette, R. J., & Zhang, Q. (2001). Imaging the body with diffuse optical tomography. IEEE signal processing magazine, 18(6), 57-75.
@@ -190,3 +203,97 @@
 *   **Enhancement Idea 5 (Multi-wavelength DOT):** Extend to handle data from multiple wavelengths to allow for spectroscopic DOT (estimating concentrations of chromophores like oxy- and deoxy-hemoglobin).
 *   **Rationale for Regularization:** DOT is severely ill-posed due to strong light scattering. L2 regularization is essential for stability. L1/TV are valuable for reconstructing sparse or piece-wise constant changes in optical properties, improving spatial localization and reducing artifacts.
 *   **Example Application:** DOT reconstruction for functional brain imaging often uses TV or L1 regularization to better localize activated regions, which appear as changes in absorption due to neurovascular coupling.
+
+## Photon Counting CT (PCCT) - User Requested TODO
+
+*   **Description:** An advanced X-ray computed tomography technique that uses energy-resolving photon-counting detectors. These detectors count individual X-ray photons and measure their energy, allowing for material decomposition, noise reduction, and potentially lower radiation doses.
+*   **Key Features & Challenges:**
+    *   Energy discrimination capabilities (multiple energy bins).
+    *   Improved contrast-to-noise ratio (CNR).
+    *   Material decomposition (e.g., separating bone, soft tissue, contrast agents).
+    *   Potential for K-edge imaging.
+    *   Higher spatial resolution than conventional CT.
+    *   Challenges: Pulse pile-up, charge sharing, detector calibration, high data rates, spectral distortion, complex image reconstruction algorithms (statistical, model-based).
+*   **Regularization in PCCT:**
+    *   **L1/Sparsity:** Useful for material-specific images (e.g., if a contrast agent is sparse) or for regularizing sinograms in sparse-view CT.
+    *   **TV (Total Variation):** Widely used for preserving edges and reducing noise in reconstructed attenuation maps for each energy bin or in material-decomposed images.
+    *   **L2 (Tikhonov):** Can be used for general smoothing and stabilizing iterative reconstructions.
+    *   **Spectral Regularization:** Priors that enforce smoothness or correlations across energy bins or material basis images (e.g., spectral TV).
+*   **Enhancement Ideas for reconlib:**
+    *   **Basic PCCT Operator:**
+        *   Model Beer-Lambert law for multiple energy bins: `I_bin = I0_bin * exp(-sum_materials(mu_material_bin * L_material))`.
+        *   The operator would take material-decomposed images (e.g., basis material line integrals or density maps) and project them to get sinograms for each energy bin. Or, take attenuation maps per energy bin and project them.
+        *   A simpler start: assume already have attenuation sinograms per bin, and the "reconstruction" is about combining/processing them.
+    *   **Basic PCCT Reconstructor:**
+        *   Could start with bin-wise reconstruction (e.g., FBP or iterative per bin) followed by material decomposition.
+        *   Or, a simple model-based iterative reconstruction (MBIR) that directly reconstructs material basis images from multi-energy sinograms, possibly using `ProximalGradientReconstructor` with appropriate regularizers.
+    *   **Phantom Generation:** Utilities to create phantoms with material properties defined for different energy X-ray interactions (e.g., Hounsfield units or mass attenuation coefficients for different materials across energy spectra).
+    *   **Spectral Response Modeling:** (Advanced) Include detector spectral response, charge sharing, pile-up effects in the operator.
+### Basic Two-Material Decomposition Concept (Conceptual Outline)
+This outlines a simplified approach for decomposing an object into two known materials using measurements from two distinct energy bins from PCCT.
+
+*   **Assumptions:**
+    *   The object is composed of known fractions of two basis materials (e.g., material A and material B).
+    *   The mass attenuation coefficients (MACs) for material A and material B are known at the effective energies of the two selected PCCT energy bins (e.g., `mac_A_bin1`, `mac_A_bin2`, `mac_B_bin1`, `mac_B_bin2`). These are typically in cm^2/g.
+    *   We have already reconstructed or obtained the line integrals (e.g., `-log(I/I0)`) for the object for these two energy bins: `L_bin1` and `L_bin2` (these are sinograms).
+
+*   **Model per projection ray:**
+    For a single ray path `s`:
+    `L_bin1(s) = mac_A_bin1 * t_A(s) + mac_B_bin1 * t_B(s)`
+    `L_bin2(s) = mac_A_bin2 * t_A(s) + mac_B_bin2 * t_B(s)`
+    where `t_A(s)` and `t_B(s)` are the effective thicknesses (or projected densities, in g/cm^2) of material A and material B along that ray path `s`.
+
+*   **Solving for material thicknesses (per ray):**
+    This is a 2x2 linear system for each ray `s`:
+    `[[mac_A_bin1, mac_B_bin1], [mac_A_bin2, mac_B_bin2]] @ [[t_A(s)], [t_B(s)]] = [[L_bin1(s)], [L_bin2(s)]]`
+
+    This system can be solved for `t_A(s)` and `t_B(s)` by inverting the 2x2 MAC matrix (if it's invertible).
+    `[[t_A(s)], [t_B(s)]] = MAC_matrix_inv @ [[L_bin1(s)], [L_bin2(s)]]`
+
+*   **Image Domain Decomposition:**
+    1.  Perform the above calculation for every ray in the sinograms `L_bin1` and `L_bin2` to get sinograms of material thicknesses: `sinogram_t_A` and `sinogram_t_B`.
+    2.  Reconstruct images from `sinogram_t_A` and `sinogram_t_B` separately using a standard CT reconstruction algorithm (e.g., FBP or iterative methods like TV-regularized PGD). This yields images representing the spatial distribution of material A and material B (e.g., density maps).
+
+*   **Simplifications & Challenges for this basic model:**
+    *   Assumes perfect energy separation between bins and known, distinct MACs.
+    *   Ignores beam hardening effects within bins (i.e., assumes monochromatic behavior per bin).
+    *   Noise in `L_bin1`, `L_bin2` will propagate and can be amplified by the matrix inversion, especially if MACs are not well separated.
+    *   Requires accurate registration of the two bin sinograms/images.
+    *   Does not account for scatter or other non-ideal detector effects.
+
+*   **Implementation in `reconlib` (Future Idea):**
+    *   A `MaterialDecompositionOperator` could take `[sinogram_t_A, sinogram_t_B]` and forward project them using the MAC matrix to `[L_bin1, L_bin2]`.
+    *   A reconstructor could then solve the inverse problem, possibly iteratively with regularization on the material images.
+
+### Other Future PCCT Enhancements (Conceptual)
+
+Beyond basic attenuation imaging and the two-material decomposition outlined above, PCCT capabilities in `reconlib` could be expanded with:
+
+*   **Advanced Detector Response Models:**
+    *   **Pulse Pile-up:** At high photon fluxes, multiple photons arriving simultaneously or very close in time can be miscounted or their energies misassigned. Modeling this in the forward operator can improve accuracy.
+    *   **Charge Sharing:** Charge generated by a photon interaction can spread to adjacent detector pixels, leading to split events and spectral distortion.
+    *   **K-escape Fluorescence:** Characteristic X-rays (e.g., from detector material like Cadmium Telluride) can escape and be reabsorbed, distorting the measured spectrum.
+    *   **Spectral Broadening:** Intrinsic energy resolution limitations of the detector.
+    *   Implementing these would make the `PCCTProjectorOperator` significantly more complex but also more realistic.
+
+*   **Iterative Material Decomposition Algorithms:**
+    *   Instead of post-reconstruction decomposition, solve for material basis images directly from projection data.
+    *   Could involve formulating a joint optimization problem, possibly within the `ProximalGradientReconstructor` framework, with regularizers applied to the material images.
+    *   Example: `argmin_{basis_images} ||ForwardProject(basis_images_to_multi_energy_sinos) - measured_multi_energy_sinos||^2 + Reg(basis_images)`
+
+*   **Statistical Image Reconstruction (SIR) for PCCT:**
+    *   Model the Poisson statistics of photon counting directly in the reconstruction objective function.
+    *   This typically leads to weighted least squares (for log-transformed data) or maximum likelihood (e.g., Penalized Likelihood) formulations.
+    *   Algorithms like OSEM (Ordered Subsets Expectation Maximization) or iterative coordinate descent could be adapted.
+
+*   **Scatter Correction for PCCT:**
+    *   Develop or integrate methods to estimate and correct for X-ray scatter, which can be energy-dependent and affect quantitative accuracy.
+
+*   **Calibration Utilities:**
+    *   Tools to help simulate or process calibration phantom scans for deriving detector response functions or energy bin thresholds.
+
+*   **Multi-Material Decomposition (N>2):**
+    *   Extend decomposition to more than two materials, requiring more energy bins and more sophisticated algorithms (e.g., constrained optimization, dictionary-based methods).
+
+*   **K-Edge Imaging:**
+    *   Specific operators and reconstructors for imaging contrast agents by exploiting the sharp change in their attenuation at their K-edge energy. This requires fine energy resolution around the K-edge.
