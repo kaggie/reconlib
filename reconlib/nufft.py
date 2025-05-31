@@ -578,7 +578,8 @@ class NUFFT3D(NUFFT):
         if np.isclose(float(denominator_bessel_val_np), 0.0):
             kb_kernel_vals[mask] = 0.0 # Or some other handling
         else:
-            kb_kernel_vals[mask] = numerator / float(denominator_bessel_val_np)
+            # Ensure value assigned to complex tensor is complex
+            kb_kernel_vals[mask] = (numerator / float(denominator_bessel_val_np)).to(torch.complex64)
             
         return kb_kernel_vals
 
@@ -702,8 +703,8 @@ class NUFFT3D(NUFFT):
         # Ensure final scaling_factors has shape self.image_shape and is complex
         self.scaling_factors = self.scaling_factors.reshape(self.image_shape).to(torch.complex64)
 
-
-    @abc.abstractmethod
+    # This method is implemented, so it should not be an abstractmethod.
+    # @abc.abstractmethod # This was causing NUFFT3D to be uninstantiable
     def _lookup_1d_table(self, table: torch.Tensor, relative_offset_grid_units: torch.Tensor, L_d: int) -> torch.Tensor:
         """
         Performs 1D linear interpolation on a precomputed table.
