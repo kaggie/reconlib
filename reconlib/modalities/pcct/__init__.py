@@ -23,7 +23,8 @@ from .utils import (
     generate_pcct_phantom_material_maps,
     combine_material_maps_to_mu_ref,
     get_pcct_energy_scaling_factors,
-    estimate_scatter_sinogram_kernel_based # Added new function
+    estimate_scatter_sinogram_kernel_based,
+    simulate_flux_scan_for_pileup_calibration # Added new function
 )
 # plot_pcct_results is mainly for notebook use
 
@@ -35,5 +36,6 @@ __all__ = [
     'generate_pcct_phantom_material_maps',
     'combine_material_maps_to_mu_ref',
     'get_pcct_energy_scaling_factors',
-    'estimate_scatter_sinogram_kernel_based', # Added new function
+    'estimate_scatter_sinogram_kernel_based',
+    'simulate_flux_scan_for_pileup_calibration', # Added new function
 ]
