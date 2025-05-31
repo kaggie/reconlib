@@ -6,103 +6,90 @@ class HyperspectralImagingOperator(Operator):
     """
     Forward and Adjoint Operator for Hyperspectral Imaging (HSI).
 
-    Models the acquisition process in HSI, often in the context of
-    compressed sensing or spectral unmixing.
-
-    - For Compressed HSI (Snapshot Spectral Imaging):
-      A common model is y = Hx, where x is the flattened hyperspectral cube (X_vector),
-      H is the sensing matrix (representing encoding, dispersion, etc.),
-      and y is the set of measurements from a 2D detector.
-      The image_shape would be (Ny, Nx, N_bands).
-      The measurement_shape would be (N_detector_pixels_y, N_detector_pixels_x) or flattened.
-
-    - For Spectral Unmixing (less of an 'operator' in this sense, but related):
-      If x is the abundance maps and A contains endmember spectra, then M = Ax,
-      where M is the observed hyperspectral cube. This is a different problem structure.
-
-    This placeholder will focus on the compressed HSI model y = Hx.
-    The 'image' to reconstruct is the full hyperspectral cube.
+    Models the acquisition process in HSI, particularly for Compressed HSI (CS-HSI)
+    where measurements are obtained via a sensing matrix: y = Hx.
+    'x' is the flattened hyperspectral cube (X_vector).
+    'H' is the sensing matrix, which can be dense or sparse. This implementation
+    allows for a generic H.
+    'y' is the set of measurements.
     """
-    def __init__(self, image_shape: tuple[int, int, int], # (Ny, Nx, N_bands)
+    def __init__(self,
+                 image_shape: tuple[int, int, int], # (Ny, Nx, N_bands)
                  sensing_matrix: torch.Tensor, # (num_measurements, Ny*Nx*N_bands)
                  device: str | torch.device = 'cpu'):
         super().__init__()
         self.image_shape = image_shape  # (Ny, Nx, N_bands)
+        self.Ny, self.Nx, self.N_bands = self.image_shape
         self.device = torch.device(device)
 
-        self.sensing_matrix = sensing_matrix.to(self.device)
-        # num_image_elements = np.prod(image_shape)
-        # num_measurements = self.sensing_matrix.shape[0]
+        if not isinstance(sensing_matrix, torch.Tensor):
+            raise TypeError("sensing_matrix must be a PyTorch Tensor.")
 
-        if self.sensing_matrix.shape[1] != np.prod(self.image_shape):
+        self.sensing_matrix = sensing_matrix.to(self.device)
+
+        num_image_elements = np.prod(self.image_shape)
+        if self.sensing_matrix.shape[1] != num_image_elements:
             raise ValueError(
                 f"Sensing matrix columns ({self.sensing_matrix.shape[1]}) "
-                f"must match total number of hyperspectral image elements ({np.prod(self.image_shape)})."
+                f"must match total number of hyperspectral image elements ({num_image_elements})."
             )
         self.num_measurements = self.sensing_matrix.shape[0]
 
-        print(f"HyperspectralImagingOperator initialized for image cube shape {self.image_shape}, "
-              f"sensing matrix shape {self.sensing_matrix.shape}.")
+        print(f"HyperspectralImagingOperator initialized for image cube shape {self.image_shape}.")
+        print(f"  Sensing Matrix H: shape {self.sensing_matrix.shape}, type {self.sensing_matrix.dtype}, device {self.sensing_matrix.device}.")
+        if self.sensing_matrix.is_sparse:
+             # Calculate density for sparse COO tensors
+             density = self.sensing_matrix._nnz() / float(np.prod(self.sensing_matrix.shape))
+             print(f"  Sensing Matrix is Sparse (density: {density:.4f})")
+
 
     def op(self, hyperspectral_cube: torch.Tensor) -> torch.Tensor:
         """
-        Forward operation: Hyperspectral data cube to sensor measurements.
-
-        Args:
-            hyperspectral_cube (torch.Tensor): The full hyperspectral data cube.
-                                               Shape: self.image_shape (Ny, Nx, N_bands).
-
-        Returns:
-            torch.Tensor: Simulated sensor measurement data.
-                          Shape: (num_measurements,).
+        Forward operation: Hyperspectral data cube to sensor measurements. y = Hx
         """
         if hyperspectral_cube.shape != self.image_shape:
             raise ValueError(f"Input cube shape {hyperspectral_cube.shape} must match {self.image_shape}.")
-        if hyperspectral_cube.device != self.device:
-            hyperspectral_cube = hyperspectral_cube.to(self.device)
+        hyperspectral_cube = hyperspectral_cube.to(self.device)
 
-        image_vector = hyperspectral_cube.reshape(-1) # Flatten the cube (Ny*Nx*N_bands)
+        image_vector = hyperspectral_cube.reshape(-1) # Flatten the cube
 
-        # Ensure type consistency, though HSI data and matrix are usually real
+        # Type handling (HSI data usually real, H can be real or complex in some abstract CS cases)
         if self.sensing_matrix.is_complex() and not image_vector.is_complex():
             image_vector = image_vector.to(torch.complex64)
         elif not self.sensing_matrix.is_complex() and image_vector.is_complex():
-            # This case is unlikely for standard HSI sensing models
-            print("Warning: Complex image with real sensing matrix. Taking real part of image.")
+            print("Warning: Complex HSI cube with real sensing matrix. Taking real part of cube.")
             image_vector = image_vector.real
 
-        # Forward operation: y = H * x
+        # Ensure dtypes match for matmul if one is float and other is double etc.
+        # Cast image_vector to sensing_matrix's dtype for matmul
+        if image_vector.dtype != self.sensing_matrix.dtype:
+            image_vector = image_vector.to(self.sensing_matrix.dtype)
+
+
         measurement_data = torch.matmul(self.sensing_matrix, image_vector)
         return measurement_data
 
     def op_adj(self, measurement_data: torch.Tensor) -> torch.Tensor:
         """
-        Adjoint operation: Sensor measurements to hyperspectral data cube domain.
-        This is the transpose (or conjugate transpose if complex) of the sensing matrix.
-
-        Args:
-            measurement_data (torch.Tensor): Sensor measurement data.
-                                             Shape: (num_measurements,).
-
-        Returns:
-            torch.Tensor: Hyperspectral data cube reconstructed by adjoint operation.
-                          Shape: self.image_shape.
+        Adjoint operation: Sensor measurements to HSI cube domain. x_adj = H^T y or H^H y
         """
         if measurement_data.ndim != 1 or measurement_data.shape[0] != self.num_measurements:
-            raise ValueError(f"Input data has invalid shape {measurement_data.shape}. "
-                             f"Expected 1D tensor of length {self.num_measurements}.")
-        if measurement_data.device != self.device:
-            measurement_data = measurement_data.to(self.device)
+            raise ValueError(f"Input data has invalid shape {measurement_data.shape}. Expected ({self.num_measurements},).")
+        measurement_data = measurement_data.to(self.device)
 
-        # Adjoint operation: x_adj = H^T * y (or H^H * y if complex)
+        # Determine adjoint matrix
         if self.sensing_matrix.is_complex():
             sensing_matrix_adj = self.sensing_matrix.conj().T
-            if not measurement_data.is_complex(): # Ensure data is complex for matmul
+            if not measurement_data.is_complex(): # Ensure data matches matrix complexity
                  measurement_data = measurement_data.to(torch.complex64)
-        else:
+        else: # Sensing matrix is real
             sensing_matrix_adj = self.sensing_matrix.T
-            if measurement_data.is_complex(): # Ensure data is real if matrix is real
+            if measurement_data.is_complex(): # If data is complex but matrix real, result of H^T y should be real
                  measurement_data = measurement_data.real
+
+        # Ensure dtypes match for matmul
+        if measurement_data.dtype != sensing_matrix_adj.dtype:
+             measurement_data = measurement_data.to(sensing_matrix_adj.dtype)
 
 
         reconstructed_vector = torch.matmul(sensing_matrix_adj, measurement_data)
@@ -110,69 +97,105 @@ class HyperspectralImagingOperator(Operator):
 
         return reconstructed_cube
 
+def create_sparse_sensing_matrix(num_measurements: int, num_image_elements: int,
+                                 sparsity_factor: float = 0.1, device='cpu',
+                                 dtype=torch.float32) -> torch.Tensor:
+    """
+    Creates a sparse random sensing matrix H (torch.sparse_coo_tensor).
+    Each row (measurement) will have approximately sparsity_factor * num_image_elements non-zero entries.
+    This is a generic way to make H sparse, not specific to a CASSI architecture.
+    """
+    if not (0 < sparsity_factor <= 1):
+        raise ValueError("Sparsity factor must be between 0 and 1 (exclusive of 0).")
+
+    num_non_zero_per_row = int(np.ceil(num_image_elements * sparsity_factor))
+    if num_non_zero_per_row == 0: num_non_zero_per_row = 1
+
+    total_non_zero_elements = num_measurements * num_non_zero_per_row
+
+    # Ensure we don't request more non-zero elements than possible if num_image_elements is small
+    if num_non_zero_per_row > num_image_elements :
+        num_non_zero_per_row = num_image_elements
+        total_non_zero_elements = num_measurements * num_image_elements
+
+
+    rows = torch.arange(num_measurements, device=device).repeat_interleave(num_non_zero_per_row)
+
+    # For columns, ensure unique selections per row if replace=False, or allow repeats
+    # Using replace=True is simpler and often fine for random matrices.
+    # If num_non_zero_per_row is small relative to num_image_elements, duplicates are less likely.
+    cols = torch.randint(0, num_image_elements, (total_non_zero_elements,), device=device)
+
+    # For truly unique columns per row (more complex to generate efficiently for large sparse matrices):
+    # cols_list = []
+    # for _ in range(num_measurements):
+    #    cols_list.append(torch.randperm(num_image_elements, device=device)[:num_non_zero_per_row])
+    # cols = torch.cat(cols_list)
+
+    values = torch.randn(total_non_zero_elements, device=device, dtype=dtype)
+
+    indices = torch.stack([rows, cols], dim=0)
+
+    sparse_matrix = torch.sparse_coo_tensor(indices, values,
+                                            (num_measurements, num_image_elements),
+                                            device=device)
+    return sparse_matrix.coalesce() # Sums duplicate indices if any, and sorts them
+
+
 if __name__ == '__main__':
-    print("Running basic HyperspectralImagingOperator checks...")
-    device_hsi = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print("\nRunning basic HyperspectralImagingOperator (Sparse H) checks...")
+    device_hsi_op = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    # Image cube: Ny, Nx, N_bands
-    img_shape_hsi = (32, 32, 10) # 10 spectral bands
-    num_elements_hsi = np.prod(img_shape_hsi)
+    img_s_hsi = (16, 16, 8) # Ny, Nx, N_bands
+    num_elements_hsi = np.prod(img_s_hsi)
+    num_measurements_hsi = num_elements_hsi // 3
 
-    # Number of measurements (e.g., pixels on a 2D detector in a CASSI-like system)
-    # For compressed sensing, num_measurements < num_elements_hsi
-    num_measurements_hsi = num_elements_hsi // 3 # Compression factor of 3
+    h_matrix_sparse = create_sparse_sensing_matrix(
+        num_measurements_hsi, num_elements_hsi,
+        sparsity_factor=0.05,
+        device=device_hsi_op,
+        dtype=torch.float32
+    )
 
-    # Sensing matrix H (usually real for HSI)
-    sensing_matrix_hsi = torch.randn(num_measurements_hsi, num_elements_hsi, dtype=torch.float32, device=device_hsi)
+    # Test with a dense matrix as well
+    # h_matrix_dense = torch.randn(num_measurements_hsi, num_elements_hsi, dtype=torch.float32, device=device_hsi_op)
 
-    try:
-        hsi_op_test = HyperspectralImagingOperator(
-            image_shape=img_shape_hsi,
-            sensing_matrix=sensing_matrix_hsi,
-            device=device_hsi
-        )
-        print("HyperspectralImagingOperator instantiated.")
+    for h_matrix_type, h_matrix in [("Sparse", h_matrix_sparse)]: #, ("Dense", h_matrix_dense)
+        print(f"--- Testing with {h_matrix_type} Sensing Matrix ---")
+        try:
+            hsi_op = HyperspectralImagingOperator(
+                image_shape=img_s_hsi,
+                sensing_matrix=h_matrix,
+                device=device_hsi_op
+            )
+            print(f"HyperspectralImagingOperator ({h_matrix_type} H) instantiated.")
 
-        # Create a simple phantom hyperspectral cube
-        phantom_hsi_cube = torch.zeros(img_shape_hsi, device=device_hsi)
-        # Add a 'square' feature that has a specific spectrum
-        square_region = (slice(img_shape_hsi[0]//4, img_shape_hsi[0]*3//4),
-                         slice(img_shape_hsi[1]//4, img_shape_hsi[1]*3//4))
-        spectrum1 = torch.sin(torch.linspace(0, np.pi*2, img_shape_hsi[2], device=device_hsi)) * 0.5 + 0.5
-        phantom_hsi_cube[square_region[0], square_region[1], :] = spectrum1.unsqueeze(0).unsqueeze(0)
-        # Add another feature
-        circle_center_y, circle_center_x = img_shape_hsi[0]*2//3, img_shape_hsi[1]*2//3
-        radius = img_shape_hsi[0]//5
-        yy,xx = torch.meshgrid(torch.arange(img_shape_hsi[0], device=device_hsi), torch.arange(img_shape_hsi[1], device=device_hsi), indexing='ij')
-        mask = (xx - circle_center_x)**2 + (yy - circle_center_y)**2 < radius**2
-        spectrum2 = torch.cos(torch.linspace(0, np.pi*2, img_shape_hsi[2], device=device_hsi)) * 0.5 + 0.5
-        phantom_hsi_cube[mask,:] = spectrum2.unsqueeze(0)
+            phantom_hsi = torch.randn(img_s_hsi, device=device_hsi_op, dtype=torch.float32)
 
+            simulated_measurements = hsi_op.op(phantom_hsi)
+            print(f"Forward op output shape: {simulated_measurements.shape}")
+            assert simulated_measurements.shape == (num_measurements_hsi,)
 
-        simulated_measurements_hsi = hsi_op_test.op(phantom_hsi_cube)
-        print(f"Forward op output shape (measurements): {simulated_measurements_hsi.shape}")
-        assert simulated_measurements_hsi.shape == (num_measurements_hsi,)
+            reconstructed_adj = hsi_op.op_adj(simulated_measurements)
+            print(f"Adjoint op output shape: {reconstructed_adj.shape}")
+            assert reconstructed_adj.shape == img_s_hsi
 
-        reconstructed_cube_hsi = hsi_op_test.op_adj(simulated_measurements_hsi)
-        print(f"Adjoint op output shape (reconstructed cube): {reconstructed_cube_hsi.shape}")
-        assert reconstructed_cube_hsi.shape == img_shape_hsi
+            # Dot product test
+            x_dp = torch.randn_like(phantom_hsi) # Real input
+            y_dp_rand = torch.randn_like(simulated_measurements) # Real measurements (since H is real)
 
-        # Basic dot product test
-        x_dp_hsi = torch.randn_like(phantom_hsi_cube)
-        y_dp_rand_hsi = torch.randn_like(simulated_measurements_hsi)
+            Ax = hsi_op.op(x_dp)
+            Aty = hsi_op.op_adj(y_dp_rand)
 
-        Ax_hsi = hsi_op_test.op(x_dp_hsi)
-        Aty_hsi = hsi_op_test.op_adj(y_dp_rand_hsi)
+            lhs = torch.dot(Ax.flatten(), y_dp_rand.flatten())
+            rhs = torch.dot(x_dp.flatten(), Aty.flatten())
 
-        # Assuming real data and matrix for HSI
-        lhs_hsi = torch.dot(Ax_hsi.flatten(), y_dp_rand_hsi.flatten())
-        rhs_hsi = torch.dot(x_dp_hsi.flatten(), Aty_hsi.flatten())
+            print(f"HSI ({h_matrix_type} H) Dot product test: LHS={lhs.item():.6f}, RHS={rhs.item():.6f}")
+            assert np.isclose(lhs.item(), rhs.item(), rtol=1e-3, atol=1e-5), f"Dot product test failed for {h_matrix_type} H."
 
-        print(f"HSI Dot product test: LHS={lhs_hsi.item():.4f}, RHS={rhs_hsi.item():.4f}")
-        assert np.isclose(lhs_hsi.item(), rhs_hsi.item(), rtol=1e-3), "Dot product test failed for HSI operator."
+            print(f"HyperspectralImagingOperator ({h_matrix_type} H) __main__ checks completed.")
 
-        print("HyperspectralImagingOperator __main__ checks completed.")
-    except Exception as e:
-        print(f"Error in HyperspectralImagingOperator __main__ checks: {e}")
-        import traceback
-        traceback.print_exc()
+        except Exception as e:
+            print(f"Error in HyperspectralImagingOperator ({h_matrix_type} H) __main__ checks: {e}")
+            import traceback
+            traceback.print_exc()

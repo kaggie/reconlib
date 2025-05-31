@@ -6,54 +6,60 @@ class TerahertzOperator(Operator):
     """
     Forward and Adjoint Operator for Terahertz (THz) Imaging.
 
-    Models THz wave interaction with a sample. This can vary greatly depending
-    on the THz imaging mode (e.g., transmission, reflection, pulsed, continuous wave).
-    A common mode is THz Computed Tomography (CT), which might use a Radon-like transform,
-    or THz pulsed imaging which might involve deconvolution.
+    Models THz wave interaction with a sample, specifically simulating a
+    Fourier sampling scenario. This could represent simplified cases of
+    THz holography or systems where k-space data is acquired.
 
-    This placeholder will assume a generic imaging scenario where the forward
-    operator applies some system matrix (e.g., related to Fourier sampling or a point spread function)
-    and the adjoint is its conjugate transpose.
+    The forward operator performs a 2D FFT of the input image (material property map)
+    and then samples this k-space at specified locations.
+    The adjoint operator performs the conjugate operation: gridding the k-space
+    samples and performing an inverse 2D FFT.
     """
-    def __init__(self, image_shape: tuple[int, int], system_matrix: torch.Tensor | None = None, device: str | torch.device = 'cpu'):
+    def __init__(self,
+                 image_shape: tuple[int, int], # (Ny, Nx)
+                 k_space_locations: torch.Tensor, # (num_measurements, 2) specifying (kx, ky) coordinates
+                 device: str | torch.device = 'cpu'):
         super().__init__()
-        self.image_shape = image_shape  # (Ny, Nx) or (Nz, Ny, Nx)
+        self.image_shape = image_shape # (Ny, Nx)
+        self.Ny, self.Nx = self.image_shape
         self.device = torch.device(device)
 
-        if system_matrix is not None:
-            self.system_matrix = system_matrix.to(self.device)
-            # Expected shape for system_matrix: (num_measurements, num_image_pixels)
-            # where num_image_pixels = np.prod(image_shape)
-            if self.system_matrix.shape[1] != np.prod(self.image_shape):
-                raise ValueError(
-                    f"System matrix columns ({self.system_matrix.shape[1]}) "
-                    f"must match total number of image pixels ({np.prod(self.image_shape)})."
-                )
-            self.num_measurements = self.system_matrix.shape[0]
-        else:
-            # Placeholder: if no system matrix, create a dummy one (e.g., identity or random)
-            # This would correspond to a very simple direct mapping for measurements
-            print("Warning: No system_matrix provided to TerahertzOperator. Using a placeholder (random).")
-            self.num_measurements = np.prod(self.image_shape) // 2 # Example: half the number of pixels
-            self.system_matrix = torch.randn(
-                self.num_measurements, np.prod(self.image_shape),
-                dtype=torch.complex64 if np.random.rand() > 0.5 else torch.float32, # Randomly complex or real
-                device=self.device
-            ) * 0.1
+        if not isinstance(k_space_locations, torch.Tensor):
+            k_space_locations = torch.tensor(k_space_locations, dtype=torch.float32)
+        self.k_space_locations = k_space_locations.to(self.device) # (num_measurements, 2)
 
-        print(f"TerahertzOperator initialized for image shape {self.image_shape}, "
-              f"system matrix shape {self.system_matrix.shape}.")
+        if self.k_space_locations.ndim != 2 or self.k_space_locations.shape[1] != 2:
+            raise ValueError("k_space_locations must be a 2D tensor of shape (num_measurements, 2).")
+
+        self.num_measurements = self.k_space_locations.shape[0]
+
+        # Validate k-space coordinates: should be in range [-N/2, N/2-1] for corresponding dimension
+        # kx corresponds to Nx (width), ky to Ny (height)
+        # u (kx) range: [-Nx/2, Nx/2 -1], v (ky) range: [-Ny/2, Ny/2 -1]
+        u_min, u_max = -self.Nx // 2, (self.Nx - 1) // 2
+        v_min, v_max = -self.Ny // 2, (self.Ny - 1) // 2
+
+        if not (torch.all(self.k_space_locations[:, 0] >= u_min) and \
+                torch.all(self.k_space_locations[:, 0] <= u_max)):
+            print(f"Warning: kx coordinates may be outside typical FFT range [{u_min}, {u_max}] for image width {self.Nx}.")
+        if not (torch.all(self.k_space_locations[:, 1] >= v_min) and \
+                torch.all(self.k_space_locations[:, 1] <= v_max)):
+            print(f"Warning: ky coordinates may be outside typical FFT range [{v_min}, {v_max}] for image height {self.Ny}.")
+
+        print(f"TerahertzOperator (Fourier Sampling) initialized for image shape {self.image_shape}.")
+        print(f"  {self.num_measurements} k-space sampling locations provided.")
+
 
     def op(self, image_estimate: torch.Tensor) -> torch.Tensor:
         """
-        Forward operation: Image estimate to THz measurement data.
+        Forward operation: Image estimate to k-space measurement data.
+        Performs 2D FFT on image_estimate and samples at self.k_space_locations.
 
         Args:
             image_estimate (torch.Tensor): The material property map (e.g., refractive index, absorption).
-                                           Shape: self.image_shape.
-
+                                           Shape: self.image_shape (Ny, Nx). Assumed real.
         Returns:
-            torch.Tensor: Simulated THz measurement data.
+            torch.Tensor: Simulated k-space measurement data (complex-valued).
                           Shape: (num_measurements,).
         """
         if image_estimate.shape != self.image_shape:
@@ -61,141 +67,160 @@ class TerahertzOperator(Operator):
         if image_estimate.device != self.device:
             image_estimate = image_estimate.to(self.device)
 
-        image_vector = image_estimate.reshape(-1) # Flatten image
+        # Image is typically real, FFT output is complex
+        if image_estimate.is_complex():
+            # This model assumes a real input image leading to Hermitian k-space
+            print("Warning: Input image_estimate is complex. Taking real part for FFT-based THz model.")
+            image_estimate = image_estimate.real
 
-        # Ensure type consistency for matrix multiplication
-        if self.system_matrix.is_complex() and not image_vector.is_complex():
-            image_vector = image_vector.to(torch.complex64)
-        elif not self.system_matrix.is_complex() and image_vector.is_complex():
-            # This case might need careful handling depending on the physics
-            # For simplicity, we'll cast system_matrix if image is complex
-            print("Warning: Complex image with real system matrix. Casting system matrix to complex for matmul.")
-            self.system_matrix = self.system_matrix.to(torch.complex64)
+        # 1. Perform 2D FFT of the image
+        k_space_full = torch.fft.fft2(image_estimate, norm='ortho') # Output is complex
 
+        # 2. Shift zero-frequency component to the center for easier indexing with k_space_locations
+        k_space_shifted = torch.fft.fftshift(k_space_full) # (Ny, Nx)
 
-        # Forward operation: y = A * x
-        # A is system_matrix, x is image_vector
-        measurement_data = torch.matmul(self.system_matrix, image_vector)
+        # 3. Sample from k_space_shifted at k_space_locations
+        # Map kx, ky from [-N/2, N/2-1] to array indices [0, N-1]
+        # u_coords = kx, v_coords = ky
+        # u_indices = kx + Nx/2
+        # v_indices = ky + Ny/2
+        u_indices = torch.round(self.k_space_locations[:, 0] + self.Nx / 2.0).long()
+        v_indices = torch.round(self.k_space_locations[:, 1] + self.Ny / 2.0).long()
+
+        # Clamp indices to be within valid range [0, N-1]
+        u_indices = torch.clamp(u_indices, 0, self.Nx - 1)
+        v_indices = torch.clamp(v_indices, 0, self.Ny - 1)
+
+        measurement_data = k_space_shifted[v_indices, u_indices] # Complex valued
+
         return measurement_data
 
     def op_adj(self, measurement_data: torch.Tensor) -> torch.Tensor:
         """
-        Adjoint operation: THz measurement data to image domain.
-        This is typically the conjugate transpose of the system matrix.
+        Adjoint operation: k-space measurement data to image domain.
+        Grids the k-space samples and performs inverse 2D FFT.
 
         Args:
-            measurement_data (torch.Tensor): THz measurement data.
+            measurement_data (torch.Tensor): THz k-space measurement data (complex-valued).
                                              Shape: (num_measurements,).
-
         Returns:
             torch.Tensor: Image reconstructed by adjoint operation.
-                          Shape: self.image_shape.
+                          Shape: self.image_shape. Output is real (should be if k-space data was Hermitian).
         """
+        if not measurement_data.is_complex():
+            # This could happen if op somehow produced real data or if input is wrong
+            print("Warning: op_adj received real measurement_data. K-space data should be complex.")
+            measurement_data = measurement_data.to(torch.complex64) # Ensure complex
+
         if measurement_data.ndim != 1 or measurement_data.shape[0] != self.num_measurements:
-            raise ValueError(f"Input measurement_data has invalid shape {measurement_data.shape}. "
-                             f"Expected 1D tensor of length {self.num_measurements}.")
-        if measurement_data.device != self.device:
-            measurement_data = measurement_data.to(self.device)
+            raise ValueError(f"Input data has invalid shape {measurement_data.shape}. Expected ({self.num_measurements},).")
+        measurement_data = measurement_data.to(self.device)
 
-        # Adjoint operation: x_adj = A^H * y
-        # A^H is the conjugate transpose of system_matrix
+        # 1. Create an empty k-space grid (for fftshifted data)
+        k_space_gridded_shifted = torch.zeros(self.image_shape, dtype=torch.complex64, device=self.device)
 
-        # Ensure type consistency
-        if self.system_matrix.is_complex() and not measurement_data.is_complex():
-            measurement_data = measurement_data.to(torch.complex64)
-        elif not self.system_matrix.is_complex() and measurement_data.is_complex() and self.system_matrix.dtype != measurement_data.dtype:
-             # If system matrix is real and data is complex, ensure system_matrix is also complex for matmul
-            self.system_matrix = self.system_matrix.to(torch.complex64)
+        # 2. Map kx, ky to array indices and place/grid measurements
+        u_indices = torch.round(self.k_space_locations[:, 0] + self.Nx / 2.0).long()
+        v_indices = torch.round(self.k_space_locations[:, 1] + self.Ny / 2.0).long()
 
+        u_indices = torch.clamp(u_indices, 0, self.Nx - 1)
+        v_indices = torch.clamp(v_indices, 0, self.Ny - 1)
 
-        # system_matrix_adj = self.system_matrix.H # .H is conjugate transpose
-        if self.system_matrix.is_complex():
-            system_matrix_adj = self.system_matrix.conj().T
-        else:
-            system_matrix_adj = self.system_matrix.T # Just transpose for real matrix
+        # Place measurements into the k-space grid.
+        # Using index_put_ with accumulate=True for proper adjoint if multiple k-space locations map to the same grid cell (due to rounding).
+        k_space_gridded_shifted.index_put_((v_indices, u_indices), measurement_data, accumulate=True)
 
-        reconstructed_vector = torch.matmul(system_matrix_adj, measurement_data)
-        reconstructed_image = reconstructed_vector.reshape(self.image_shape)
+        # 3. Inverse shift zero-frequency from center to corner
+        k_space_gridded_ifftshifted = torch.fft.ifftshift(k_space_gridded_shifted)
 
-        # If original image was likely real, take real part of adjoint result
-        # This depends on how system_matrix was defined.
-        # For this placeholder, if system_matrix was real, output should be real.
-        if not self.system_matrix.is_complex() and reconstructed_image.is_complex():
-             reconstructed_image = reconstructed_image.real
+        # 4. Perform Inverse 2D FFT to get the image
+        # Output should be real if the original image was real and k-space sampling was Hermitian (or handled correctly)
+        reconstructed_image = torch.fft.ifft2(k_space_gridded_ifftshifted, norm='ortho')
 
+        # Since the input image to op() is assumed real, the output of op_adj() should also be real.
+        # The k-space data generated from a real image is Hermitian.
+        # If op_adj() is correct, ifft2 of such gridded data should result in a primarily real image.
+        return reconstructed_image.real
 
-        return reconstructed_image
 
 if __name__ == '__main__':
-    print("Running basic TerahertzOperator checks...")
-    device_thz = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print("\nRunning basic TerahertzOperator (Fourier Sampling) checks...")
+    device_thz_op = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    img_shape_thz = (32, 32) # Ny, Nx
-    num_pixels_thz = np.prod(img_shape_thz)
-    num_measurements_thz = num_pixels_thz // 2 # Example
+    img_s_thz = (32, 32) # Ny, Nx
 
-    # Create a dummy system matrix (e.g., random Gaussian)
-    # Can be real or complex
-    is_complex_system = np.random.rand() > 0.5
-    dtype_system = torch.complex64 if is_complex_system else torch.float32
-
-    system_matrix_thz = torch.randn(num_measurements_thz, num_pixels_thz, dtype=dtype_system, device=device_thz)
+    # Define some k-space sampling locations (e.g., random sparse pattern)
+    num_measurements_thz = img_s_thz[0] * img_s_thz[1] // 4 # 1/4 sampling
+    kx_coords = torch.randint(-img_s_thz[1]//2, img_s_thz[1]//2, (num_measurements_thz,), device=device_thz_op).float()
+    ky_coords = torch.randint(-img_s_thz[0]//2, img_s_thz[0]//2, (num_measurements_thz,), device=device_thz_op).float()
+    k_locs = torch.stack([kx_coords, ky_coords], dim=1)
 
     try:
-        thz_op_test = TerahertzOperator(
-            image_shape=img_shape_thz,
-            system_matrix=system_matrix_thz,
-            device=device_thz
+        thz_op = TerahertzOperator(
+            image_shape=img_s_thz,
+            k_space_locations=k_locs,
+            device=device_thz_op
         )
-        print("TerahertzOperator instantiated.")
+        print("TerahertzOperator (Fourier Sampling) instantiated.")
 
-        # Create a simple phantom image
-        phantom_thz_image_real = torch.zeros(img_shape_thz, device=device_thz)
-        phantom_thz_image_real[img_shape_thz[0]//4:img_shape_thz[0]//4*3, img_shape_thz[1]//4:img_shape_thz[1]//4*3] = 1.0
-
-        # Decide if phantom should be complex based on system matrix for simplicity in test
-        phantom_thz_image = phantom_thz_image_real.to(dtype_system) if is_complex_system else phantom_thz_image_real
+        # Create a simple real phantom image
+        phantom_thz_image = torch.zeros(img_s_thz, device=device_thz_op)
+        phantom_thz_image[img_s_thz[0]//4:img_s_thz[0]*3//4, img_s_thz[1]//4:img_s_thz[1]*3//4] = 1.0
+        phantom_thz_image[img_s_thz[0]//3:img_s_thz[0]*2//3, img_s_thz[1]//3:img_s_thz[1]*2//3] = 2.0
 
 
-        simulated_measurements_thz = thz_op_test.op(phantom_thz_image)
-        print(f"Forward op output shape (measurements): {simulated_measurements_thz.shape}")
-        assert simulated_measurements_thz.shape == (num_measurements_thz,)
+        simulated_k_data = thz_op.op(phantom_thz_image)
+        print(f"Forward op output shape (k-space data): {simulated_k_data.shape}")
+        assert simulated_k_data.shape == (num_measurements_thz,)
+        assert simulated_k_data.is_complex()
 
-        reconstructed_image_thz = thz_op_test.op_adj(simulated_measurements_thz)
-        print(f"Adjoint op output shape (reconstructed image): {reconstructed_image_thz.shape}")
-        assert reconstructed_image_thz.shape == img_shape_thz
+        reconstructed_img_adj = thz_op.op_adj(simulated_k_data)
+        print(f"Adjoint op output shape (reconstructed image): {reconstructed_img_adj.shape}")
+        assert reconstructed_img_adj.shape == img_s_thz
+        assert not reconstructed_img_adj.is_complex() # Should be real
 
         # Basic dot product test
-        # Create x_dp that matches the dtype of the system_matrix or image for consistency
-        x_dp_thz_real = torch.randn(img_shape_thz, device=device_thz)
-        x_dp_thz = x_dp_thz_real.to(dtype_system) if is_complex_system else x_dp_thz_real
+        # x_dp should be real, y_dp_rand (k-space) should be complex
+        x_dp_thz = torch.randn_like(phantom_thz_image)
+        y_dp_rand_thz = torch.randn(num_measurements_thz, dtype=torch.complex64, device=device_thz_op)
 
-        # Create y_dp_rand that matches the dtype of the measurements
-        y_dp_rand_thz = torch.randn(num_measurements_thz, dtype=simulated_measurements_thz.dtype, device=device_thz)
+        Ax_thz = thz_op.op(x_dp_thz) # Ax is complex
+        Aty_thz = thz_op.op_adj(y_dp_rand_thz) # Aty is real
 
-        Ax_thz = thz_op_test.op(x_dp_thz)
-        Aty_thz = thz_op_test.op_adj(y_dp_rand_thz)
+        # LHS: <Ax, y> (complex dot product)
+        # Ax is complex, y_dp_rand_thz is complex
+        lhs_thz = torch.vdot(Ax_thz.flatten(), y_dp_rand_thz.flatten())
 
-        # Dot product: <Ax, y> vs <x, A^H y>
-        if Ax_thz.is_complex() or y_dp_rand_thz.is_complex():
-            lhs_thz = torch.vdot(Ax_thz.flatten(), y_dp_rand_thz.flatten())
-        else:
-            lhs_thz = torch.dot(Ax_thz.flatten(), y_dp_rand_thz.flatten())
+        # RHS: <x, A^H y> (real dot product, as x_dp_thz and Aty_thz are real)
+        # x_dp_thz is real, Aty_thz is real
+        rhs_thz = torch.dot(x_dp_thz.flatten(), Aty_thz.flatten())
 
-        if x_dp_thz.is_complex() or Aty_thz.is_complex():
-            rhs_thz = torch.vdot(x_dp_thz.flatten(), Aty_thz.flatten())
-        else:
-            rhs_thz = torch.dot(x_dp_thz.flatten(), Aty_thz.flatten())
-
-        print(f"THz Dot product test: LHS={lhs_thz.item():.4f}, RHS={rhs_thz.item():.4f}")
-        # This test should pass if op and op_adj are correctly implemented as A and A^H
-        assert np.isclose(lhs_thz.real.item(), rhs_thz.real.item(), rtol=1e-3), "Real parts of dot product differ"
-        if is_complex_system: # Only check imaginary part if system is complex
-            assert np.isclose(lhs_thz.imag.item(), rhs_thz.imag.item(), rtol=1e-3), "Imaginary parts of dot product differ"
+        # For <Ax,y> = <x, A^H y> where x is real, y is complex:
+        # LHS is sum( (Ax)_i * conj(y_i) )
+        # RHS is sum( x_i * conj((A^H y)_i) )
+        # Since (A^H y) is real for our operator, conj((A^H y)_i) = (A^H y)_i.
+        # So RHS becomes sum(x_i * (A^H y)_i), which is a real value.
+        # Thus, the imaginary part of LHS should be zero.
+        print(f"THz Fourier Op Dot product test: LHS={lhs_thz.item():.6f} (complex), RHS={rhs_thz.item():.6f} (real)")
+        assert np.isclose(lhs_thz.real.item(), rhs_thz.item(), rtol=1e-3), "Real parts of dot product differ."
+        assert np.isclose(lhs_thz.imag.item(), 0.0, atol=1e-4), "Imaginary part of LHS should be near zero."
 
 
-        print("TerahertzOperator __main__ checks completed.")
+        print("TerahertzOperator (Fourier Sampling) __main__ checks completed.")
+
+        # import matplotlib.pyplot as plt
+        # fig, axes = plt.subplots(1,3, figsize=(12,4))
+        # axes[0].imshow(phantom_thz_image.cpu().numpy()); axes[0].set_title("Phantom")
+        # #axes[1].plot(np.abs(simulated_k_data.cpu().numpy())); axes[1].set_title("K-space Data Mag")
+        # k_grid_vis = torch.zeros(img_s_thz, dtype=torch.complex64, device=device_thz_op)
+        # u_indices_vis = torch.round(k_locs[:, 0] + img_s_thz[1] / 2.0).long().clamp(0, img_s_thz[1] - 1)
+        # v_indices_vis = torch.round(k_locs[:, 1] + img_s_thz[0] / 2.0).long().clamp(0, img_s_thz[0] - 1)
+        # k_grid_vis[v_indices_vis, u_indices_vis] = simulated_k_data
+        # axes[1].imshow(torch.log(torch.abs(k_grid_vis)+1e-9).cpu().numpy()); axes[1].set_title("Gridded K-space (log abs)")
+        # axes[2].imshow(reconstructed_img_adj.cpu().numpy()); axes[2].set_title("Adjoint Recon (iFFT)")
+        # plt.show()
+
     except Exception as e:
-        print(f"Error in TerahertzOperator __main__ checks: {e}")
+        print(f"Error in TerahertzOperator (Fourier Sampling) __main__ checks: {e}")
         import traceback
         traceback.print_exc()

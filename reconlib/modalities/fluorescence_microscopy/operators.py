@@ -30,17 +30,29 @@ class FluorescenceMicroscopyOperator(Operator):
         # Normalize PSF (optional, but common for it to sum/integrate to 1)
         # self.psf = self.psf / torch.sum(self.psf)
 
-        # Determine padding for 'same' convolution
-        self.padding = []
-        for dim_size in self.psf.shape:
-            self.padding.extend([(dim_size - 1) // 2, dim_size // 2]) # Pad for each dim (before, after)
-        # PyTorch convnd padding is (pad_dimN_before, pad_dimN_after, pad_dimN-1_before, ...)
-        # So we need to reverse the per-dimension padding list.
-        self.padding.reverse()
+        # Determine padding for 'same' convolution.
+        # For convNd, padding is specified for each dimension starting from the last.
+        # For a kernel k_dimN, k_dimN-1, ..., k_dim0
+        # padding should be (pad_dim0_pair, pad_dim1_pair, ..., pad_dimN_pair)
+        # where pad_dimX_pair can be a single int (symmetric) or a tuple (before, after)
+        # For 'same' output size, total padding for a dimension 'd' is psf.shape[d] - 1.
+        # This is split into (psf.shape[d]-1)//2 before and psf.shape[d]//2 after.
 
+        # PyTorch's F.convNd padding argument is a tuple for (dimN, dimN-1, ... dim0)
+        # e.g., for 3D conv (D, H, W), padding is (pad_D, pad_H, pad_W)
+        # where each pad_X is an int for symmetric padding.
+
+        self.manual_padding = []
+        # Iterate through PSF dimensions in reverse order (spatial dims first, then depth if 3D)
+        for i in range(psf.ndim - 1, -1, -1):
+            pad_total = self.psf.shape[i] - 1
+            pad_before = pad_total // 2
+            # pad_after = pad_total - pad_before # Not needed if using symmetric int padding
+            self.manual_padding.append(pad_before)
+        self.manual_padding = tuple(self.manual_padding) # e.g. (pad_W, pad_H, pad_D) or (pad_W, pad_H)
 
         print(f"FluorescenceMicroscopyOperator initialized for image shape {self.image_shape} "
-              f"with PSF shape {self.psf.shape}. 3D: {self.is_3d}. Padding: {self.padding}")
+              f"with PSF shape {self.psf.shape}. 3D: {self.is_3d}. Manual Padding: {self.manual_padding}")
 
     def op(self, true_fluorescence_map: torch.Tensor) -> torch.Tensor:
         """
@@ -67,12 +79,9 @@ class FluorescenceMicroscopyOperator(Operator):
         psf_expanded = self.psf.unsqueeze(0).unsqueeze(0)          # (1, 1, [kD], kH, kW)
 
         if self.is_3d:
-            blurred_image = torch.nn.functional.conv3d(x_expanded, psf_expanded, padding='same') # Requires PyTorch 1.10+ for string padding
-            # blurred_image = torch.nn.functional.conv3d(x_expanded, psf_expanded, padding=self.padding) # Manual padding
+            blurred_image = torch.nn.functional.conv3d(x_expanded, psf_expanded, padding=self.manual_padding)
         else: # 2D
-            blurred_image = torch.nn.functional.conv2d(x_expanded, psf_expanded, padding='same')
-            # blurred_image = torch.nn.functional.conv2d(x_expanded, psf_expanded, padding=self.padding)
-
+            blurred_image = torch.nn.functional.conv2d(x_expanded, psf_expanded, padding=self.manual_padding)
 
         return blurred_image.squeeze()
 
@@ -95,25 +104,27 @@ class FluorescenceMicroscopyOperator(Operator):
         if observed_image.device != self.device:
             observed_image = observed_image.to(self.device)
 
-        y_expanded = observed_image.unsqueeze(0).unsqueeze(0)
+        y_expanded = observed_image.unsqueeze(0).unsqueeze(0) # (1, 1, [D], H, W)
 
         # Flipped PSF for adjoint convolution
-        # For a symmetric PSF, flipped_psf = psf.
         # torch.flip is easy for this.
         dims_to_flip = list(range(self.psf.ndim)) # Flip all spatial/depth dimensions of PSF
-        psf_flipped = torch.flip(self.psf, dims=dims_to_flip).unsqueeze(0).unsqueeze(0)
+        psf_flipped = torch.flip(self.psf, dims=dims_to_flip).unsqueeze(0).unsqueeze(0) # (1,1,[kD],kH,kW)
 
         if self.is_3d:
-            adj_conv_image = torch.nn.functional.conv3d(y_expanded, psf_flipped, padding='same')
-            # adj_conv_image = torch.nn.functional.conv3d(y_expanded, psf_flipped, padding=self.padding)
+            adj_conv_image = torch.nn.functional.conv3d(y_expanded, psf_flipped, padding=self.manual_padding)
         else: # 2D
-            adj_conv_image = torch.nn.functional.conv2d(y_expanded, psf_flipped, padding='same')
-            # adj_conv_image = torch.nn.functional.conv2d(y_expanded, psf_flipped, padding=self.padding)
+            adj_conv_image = torch.nn.functional.conv2d(y_expanded, psf_flipped, padding=self.manual_padding)
 
         return adj_conv_image.squeeze()
 
 # Helper to generate a simple PSF (e.g., Gaussian)
 def generate_gaussian_psf(shape: tuple, sigma: float | tuple[float,...], device='cpu') -> torch.Tensor:
+    """
+    Generates a Gaussian Point Spread Function (PSF).
+    Sigma ideally relates to physical parameters like wavelength and NA,
+    but here it's used directly to define the Gaussian width in pixel units.
+    """
     is_3d_psf = len(shape) == 3
     if isinstance(sigma, (float, int)):
         sigma = [float(sigma)] * len(shape)

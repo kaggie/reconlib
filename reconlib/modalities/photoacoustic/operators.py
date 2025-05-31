@@ -1,5 +1,6 @@
 import torch
 from reconlib.operators import Operator
+import numpy as np
 
 class PhotoacousticOperator(Operator):
     """
@@ -7,145 +8,221 @@ class PhotoacousticOperator(Operator):
 
     Models the generation and propagation of acoustic waves following light absorption.
     The forward operator simulates the acoustic signals received by transducers
-    based on an initial pressure distribution (the image to be reconstructed).
-    The adjoint operator is a time-reversal or back-projection like operation.
+    based on an initial pressure distribution (the image to be reconstructed),
+    using a simplified time-of-flight model.
+    The adjoint operator performs a corresponding back-projection.
     """
-    def __init__(self, image_shape: tuple[int, int], sensor_positions: torch.Tensor, sound_speed: float = 1500.0, device: str | torch.device = 'cpu'):
+    def __init__(self,
+                 image_shape: tuple[int, int],  # (Ny, Nx)
+                 sensor_positions: torch.Tensor, # Shape (num_sensors, 2) for 2D
+                 sound_speed: float = 1500.0,    # m/s
+                 time_samples: int = 256,        # Number of time samples for sensor data
+                 pixel_size: float = 0.0001,     # meters (e.g., 0.1 mm)
+                 device: str | torch.device = 'cpu'):
         super().__init__()
-        self.image_shape = image_shape  # (Ny, Nx) or (Nz, Ny, Nx)
-        self.sensor_positions = sensor_positions # Shape (num_sensors, num_dimensions_coords) e.g., (num_sensors, 2) for 2D
+        self.image_shape = image_shape
+        self.Ny, self.Nx = self.image_shape
+        self.sensor_positions = sensor_positions.to(torch.device(device)) # (num_sensors, 2)
+        self.num_sensors = self.sensor_positions.shape[0]
         self.sound_speed = sound_speed
+        self.time_samples = time_samples
+        self.pixel_size = pixel_size # Physical size of a pixel
         self.device = torch.device(device)
 
-        # TODO: Add any necessary precomputations, e.g., distance matrices, k-Wave grid setup
+        # Create image pixel coordinates
+        img_y_coords = torch.arange(self.Ny, device=self.device) * self.pixel_size
+        img_x_coords = torch.arange(self.Nx, device=self.device) * self.pixel_size
+        img_grid_y, img_grid_x = torch.meshgrid(img_y_coords, img_x_coords, indexing='ij')
+        self.pixel_coords = torch.stack((img_grid_y.flatten(), img_grid_x.flatten()), dim=1) # (Ny*Nx, 2)
 
-        print(f"PhotoacousticOperator initialized for image shape {self.image_shape} and {self.sensor_positions.shape[0]} sensors.")
+        # Calculate distance matrix: (num_pixels, num_sensors)
+        # self.pixel_coords: (N_pixels, 2) -> (N_pixels, 1, 2)
+        # self.sensor_positions: (N_sensors, 2) -> (1, N_sensors, 2)
+        dist_sq = torch.sum(
+            (self.pixel_coords.unsqueeze(1) - self.sensor_positions.unsqueeze(0))**2,
+            dim=2
+        )
+        self.distances = torch.sqrt(dist_sq) # (N_pixels, N_sensors)
+
+        # Calculate time-of-flight matrix: (N_pixels, N_sensors)
+        self.tof_matrix = self.distances / self.sound_speed
+
+        # Determine max time for time vector based on max distance
+        max_dist = torch.max(self.distances)
+        max_time_needed = max_dist / self.sound_speed
+        self.time_vector = torch.linspace(0, max_time_needed * 1.1, self.time_samples, device=self.device) # (time_samples,)
+        self.dt = self.time_vector[1] - self.time_vector[0] if self.time_samples > 1 else max_time_needed
+
+
+        print(f"PhotoacousticOperator (Time-of-Flight) initialized.")
+        print(f"  Image: {self.Ny}x{self.Nx} pixels, Pixel size: {self.pixel_size*1000:.2f} mm")
+        print(f"  Sensors: {self.num_sensors}, Sound speed: {self.sound_speed} m/s")
+        print(f"  Time samples: {self.time_samples}, dt: {self.dt*1e6:.2f} us, Max time: {self.time_vector[-1]*1e3:.2f} ms")
+
 
     def op(self, initial_pressure_map: torch.Tensor) -> torch.Tensor:
         """
         Forward operation: Initial pressure map to sensor data (time series).
-
+        y_s(t) = sum_r P0(r) * delta(t - |r - r_s|/c)
+        (Simplified: sum contributions from pixels arriving at sensor 's' at time 't')
         Args:
             initial_pressure_map (torch.Tensor): The initial pressure distribution at t=0.
-                                                 Shape: self.image_shape.
-
+                                                 Shape: self.image_shape (Ny, Nx).
         Returns:
             torch.Tensor: Simulated time-series data at sensor locations.
                           Shape: (num_sensors, num_time_samples).
         """
         if initial_pressure_map.shape != self.image_shape:
-            raise ValueError(f"Input initial_pressure_map shape {initial_pressure_map.shape} must match {self.image_shape}.")
-        if initial_pressure_map.device != self.device:
-            initial_pressure_map = initial_pressure_map.to(self.device)
+            raise ValueError(f"Input map shape {initial_pressure_map.shape} must match {self.image_shape}.")
+        initial_pressure_vector = initial_pressure_map.to(self.device).flatten() # (N_pixels,)
 
-        print("PhotoacousticOperator.op: Placeholder - Forward simulation not implemented.")
-        # Placeholder: Replace with actual acoustic forward model (e.g., k-Wave, analytical solution)
-        # This would involve:
-        # 1. Defining a computational grid.
-        # 2. Solving the wave equation with initial_pressure_map as the source.
-        # 3. Recording pressure at sensor_positions over time.
-        num_sensors = self.sensor_positions.shape[0]
-        num_time_samples = 100 # Example, should be determined by imaging depth and sound speed
+        sensor_data = torch.zeros((self.num_sensors, self.time_samples), device=self.device)
 
-        # Simulate some data based on the sum of the initial pressure, scaled by distance (very rough)
-        simulated_data = torch.zeros(num_sensors, num_time_samples, device=self.device)
-        for i in range(num_sensors):
-            # A very naive placeholder: sum of pressure scaled by a pseudo-distance effect
-            pseudo_distance_effect = (i + 1) / num_sensors
-            simulated_data[i, :] = torch.sum(initial_pressure_map) * 0.01 * pseudo_distance_effect * torch.sin(torch.linspace(0, 10, num_time_samples, device=self.device))
+        # For each sensor
+        for s_idx in range(self.num_sensors):
+            # tof_s for this sensor: (N_pixels,)
+            tof_s = self.tof_matrix[:, s_idx]
 
-        return simulated_data
+            # For each pixel, find which time bin its signal falls into for this sensor
+            # time_bin_indices = torch.floor(tof_s / self.dt).long() # Simple binning
+
+            # More robust: find nearest time sample
+            # tof_s.unsqueeze(1) -> (N_pixels, 1)
+            # self.time_vector.unsqueeze(0) -> (1, time_samples)
+            # Find index of time_vector closest to each tof_s value
+            time_diffs = torch.abs(tof_s.unsqueeze(1) - self.time_vector.unsqueeze(0))
+            time_bin_indices = torch.argmin(time_diffs, dim=1) # (N_pixels,)
+
+            # Accumulate pressure signals into the correct time bins
+            # initial_pressure_vector is (N_pixels,)
+            # Need to handle cases where time_bin_indices are out of bounds for sensor_data[s_idx,:]
+            valid_bins_mask = (time_bin_indices >= 0) & (time_bin_indices < self.time_samples)
+
+            # Use index_add_ for safe accumulation if multiple pixels map to same time bin (unlikely with float TOF)
+            # sensor_data[s_idx, :].index_add_(0, time_bin_indices[valid_bins_mask], initial_pressure_vector[valid_bins_mask])
+            # A simpler loop for clarity, though index_add is better for performance/correctness with exact binning
+            for p_idx in range(self.pixel_coords.shape[0]):
+                if valid_bins_mask[p_idx]:
+                    bin_idx = time_bin_indices[p_idx]
+                    sensor_data[s_idx, bin_idx] += initial_pressure_vector[p_idx]
+
+        # Optional: convolve with a short pulse to make signals less spiky if dt is small
+        # For now, this is a very basic "sum at arrival time" model.
+        # A small amount of blurring can make it more robust to time discretization.
+        # Example: if self.time_samples > 10:
+        #    blur_kernel = torch.tensor([0.5, 1.0, 0.5], device=self.device).view(1,1,-1) / 2.0
+        #    sensor_data = torch.nn.functional.conv1d(sensor_data.unsqueeze(1), blur_kernel, padding='same').squeeze(1)
+
+
+        return sensor_data
 
     def op_adj(self, sensor_time_data: torch.Tensor) -> torch.Tensor:
         """
         Adjoint operation: Sensor time data to reconstructed initial pressure map.
-        This is often a form of back-projection or time-reversal.
+        This is a simple back-projection: P_adj(r) = sum_s y_s(t = |r - r_s|/c)
 
         Args:
             sensor_time_data (torch.Tensor): Time-series data from sensors.
                                              Shape: (num_sensors, num_time_samples).
-
         Returns:
             torch.Tensor: Reconstructed initial pressure map.
                           Shape: self.image_shape.
         """
-        if sensor_time_data.ndim != 2 or sensor_time_data.shape[0] != self.sensor_positions.shape[0]:
-            raise ValueError(f"Input sensor_time_data has invalid shape {sensor_time_data.shape}. Expected ({self.sensor_positions.shape[0]}, num_time_samples).")
-        if sensor_time_data.device != self.device:
-            sensor_time_data = sensor_time_data.to(self.device)
+        if sensor_time_data.shape != (self.num_sensors, self.time_samples):
+            raise ValueError(f"Input data shape {sensor_time_data.shape} incorrect.")
+        sensor_time_data = sensor_time_data.to(self.device)
 
-        print("PhotoacousticOperator.op_adj: Placeholder - Adjoint operation (back-projection) not implemented.")
-        # Placeholder: Replace with actual adjoint/back-projection algorithm
-        # This would involve:
-        # 1. "Broadcasting" the time-reversed sensor data back into the medium.
-        # 2. Summing contributions at each pixel/voxel.
+        reconstructed_map_vector = torch.zeros(self.pixel_coords.shape[0], device=self.device)
 
-        # A very naive placeholder: sum of sensor data attributed to each pixel
-        reconstructed_map = torch.zeros(self.image_shape, dtype=torch.float32, device=self.device)
-        for r in range(self.image_shape[0]):
-            for c in range(self.image_shape[1]):
-                # Another very naive placeholder
-                reconstructed_map[r,c] = torch.sum(sensor_time_data) * 0.001 * ((r+c+1) / (self.image_shape[0] + self.image_shape[1]))
+        # For each pixel
+        for p_idx in range(self.pixel_coords.shape[0]):
+            # tof_p for this pixel: (N_sensors,)
+            tof_p = self.tof_matrix[p_idx, :]
 
+            # Find nearest time sample index in sensor_time_data for each sensor's TOF
+            time_diffs = torch.abs(tof_p.unsqueeze(1) - self.time_vector.unsqueeze(0))
+            time_bin_indices = torch.argmin(time_diffs, dim=1) # (N_sensors,)
 
-        return reconstructed_map
+            # Accumulate the sensor reading from that time bin for all sensors
+            # reconstructed_map_vector[p_idx] = torch.sum(sensor_time_data[torch.arange(self.num_sensors), time_bin_indices])
+            # Loop for clarity:
+            val = 0.0
+            for s_idx in range(self.num_sensors):
+                bin_idx = time_bin_indices[s_idx]
+                if 0 <= bin_idx < self.time_samples: # Check bounds
+                    val += sensor_time_data[s_idx, bin_idx]
+            reconstructed_map_vector[p_idx] = val
+
+        return reconstructed_map_vector.reshape(self.image_shape)
 
 if __name__ == '__main__':
-    print("Running basic PhotoacousticOperator checks...")
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print("\nRunning basic PhotoacousticOperator (Time-of-Flight) checks...")
+    device_pat_op = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    img_shape_pat = (64, 64) # Ny, Nx
-    num_sensors_pat = 32
-    # Example sensor positions (e.g., circular array)
-    angles = torch.linspace(0, 2 * torch.pi, num_sensors_pat, device=device)
-    radius = 50
-    sensor_pos_pat = torch.stack([radius * torch.cos(angles), radius * torch.sin(angles)], dim=1)
+    img_s = (16, 16) # Small image for faster test Ny, Nx
+    n_sensors = 8
+    # Circular sensor geometry
+    center_x, center_y = (img_s[1]-1)*0.0001/2, (img_s[0]-1)*0.0001/2 # Image center
+    radius = max(img_s) * 0.0001 * 0.7 # Radius slightly larger than half image diagonal
+    angles_sens = torch.linspace(0, 2 * np.pi, n_sensors, endpoint=False, device=device_pat_op)
+    sensor_pos = torch.stack([
+        center_x + radius * torch.cos(angles_sens),
+        center_y + radius * torch.sin(angles_sens)
+    ], dim=1)
+
+    sound_s = 1500.0
+    time_samps = 64
+    pix_s = 0.0001 # 0.1 mm
 
     try:
-        pat_op_test = PhotoacousticOperator(
-            image_shape=img_shape_pat,
-            sensor_positions=sensor_pos_pat,
-            sound_speed=1500.0,
-            device=device
+        pat_op = PhotoacousticOperator(
+            image_shape=img_s,
+            sensor_positions=sensor_pos,
+            sound_speed=sound_s,
+            time_samples=time_samps,
+            pixel_size=pix_s,
+            device=device_pat_op
         )
-        print("PhotoacousticOperator instantiated.")
+        print("PhotoacousticOperator (Time-of-Flight) instantiated.")
 
-        # Create a simple phantom initial pressure map
-        phantom_pressure = torch.zeros(img_shape_pat, device=device)
-        phantom_pressure[img_shape_pat[0]//4:img_shape_pat[0]//4*3, img_shape_pat[1]//4:img_shape_pat[1]//4*3] = 1.0
-        phantom_pressure[img_shape_pat[0]//3:img_shape_pat[0]//3*2, img_shape_pat[1]//3:img_shape_pat[1]//3*2] = 2.0
+        phantom_pressure = torch.zeros(img_s, device=device_pat_op)
+        phantom_pressure[img_s[0]//4:img_s[0]*3//4, img_s[1]//4:img_s[1]*3//4] = 1.0 # Square source
+        # phantom_pressure[img_s[0]//2, img_s[1]//2] = 1.0 # Point source
 
+        sensor_data_sim = pat_op.op(phantom_pressure)
+        print(f"Forward op output shape: {sensor_data_sim.shape}")
+        assert sensor_data_sim.shape == (n_sensors, time_samps)
 
-        sensor_data_sim_pat = pat_op_test.op(phantom_pressure)
-        print(f"Forward op output shape (sensor data): {sensor_data_sim_pat.shape}")
-        assert sensor_data_sim_pat.shape[0] == num_sensors_pat
+        recon_pressure_map = pat_op.op_adj(sensor_data_sim)
+        print(f"Adjoint op output shape: {recon_pressure_map.shape}")
+        assert recon_pressure_map.shape == img_s
 
-        recon_pressure_map_pat = pat_op_test.op_adj(sensor_data_sim_pat)
-        print(f"Adjoint op output shape (reconstructed map): {recon_pressure_map_pat.shape}")
-        assert recon_pressure_map_pat.shape == img_shape_pat
+        # Basic dot product test
+        x_dp = torch.randn_like(phantom_pressure)
+        y_dp_rand = torch.randn_like(sensor_data_sim)
 
-        # Basic dot product test (will likely fail with current placeholders, but good structure)
-        x_dp_pat = torch.randn_like(phantom_pressure)
-        y_dp_rand_pat = torch.randn_like(sensor_data_sim_pat)
+        Ax = pat_op.op(x_dp)
+        Aty = pat_op.op_adj(y_dp_rand)
 
-        Ax_pat = pat_op_test.op(x_dp_pat)
-        Aty_pat = pat_op_test.op_adj(y_dp_rand_pat)
+        lhs = torch.dot(Ax.flatten(), y_dp_rand.flatten())
+        rhs = torch.dot(x_dp.flatten(), Aty.flatten())
 
-        # Ensure complex dot product if data can be complex, otherwise real
-        if Ax_pat.is_complex() or y_dp_rand_pat.is_complex():
-            lhs_pat = torch.vdot(Ax_pat.flatten(), y_dp_rand_pat.flatten())
-        else:
-            lhs_pat = torch.dot(Ax_pat.flatten(), y_dp_rand_pat.flatten())
+        print(f"PAT Dot product test: LHS={lhs.item():.6f}, RHS={rhs.item():.6f}")
+        # This test is sensitive to the discretization of time and space.
+        # For this simple model, it should pass reasonably well.
+        assert np.isclose(lhs.item(), rhs.item(), rtol=1e-3), "Dot product test failed for PAT TOF operator."
 
-        if x_dp_pat.is_complex() or Aty_pat.is_complex():
-            rhs_pat = torch.vdot(x_dp_pat.flatten(), Aty_pat.flatten())
-        else:
-            rhs_pat = torch.dot(x_dp_pat.flatten(), Aty_pat.flatten())
+        print("PhotoacousticOperator (Time-of-Flight) __main__ checks completed.")
 
-        print(f"PAT Dot product test: LHS={lhs_pat.item():.4f}, RHS={rhs_pat.item():.4f}")
-        # Note: This test is expected to fail with naive placeholders.
-        # A real implementation would require careful discretization and model accuracy.
+        # Optional: visualize if matplotlib is available
+        # import matplotlib.pyplot as plt
+        # fig, axes = plt.subplots(1,3, figsize=(12,4))
+        # axes[0].imshow(phantom_pressure.cpu().numpy()); axes[0].set_title("Phantom")
+        # axes[1].imshow(sensor_data_sim.cpu().numpy(), aspect='auto'); axes[1].set_title("Sensor Data")
+        # axes[2].imshow(recon_pressure_map.cpu().numpy()); axes[2].set_title("Adjoint Recon")
+        # plt.show()
 
-        print("PhotoacousticOperator __main__ checks completed (placeholders used).")
     except Exception as e:
-        print(f"Error in PhotoacousticOperator __main__ checks: {e}")
+        print(f"Error in PhotoacousticOperator (Time-of-Flight) __main__ checks: {e}")
+        import traceback
+        traceback.print_exc()
