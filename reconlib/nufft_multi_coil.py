@@ -62,16 +62,20 @@ class MultiCoilNUFFTOperator(Operator):
             A tensor of multi-coil k-space data.
             Shape: (num_coils, num_kpoints).
         """
-        if multi_coil_image_data.ndim < 2+len(self.image_shape): # e.g. ndim < 3 for 2D, ndim < 4 for 3D
-             # If input is (H,W) and image_shape is (H,W), assume it's single coil data for this op.
-             # This is a deviation from strict multi-coil if num_coils=1 was intended to be (1,H,W).
-             # For now, require explicit coil dimension.
-            if multi_coil_image_data.shape == self.image_shape: # Allow single coil image if it matches image_shape
-                 multi_coil_image_data = multi_coil_image_data.unsqueeze(0) # Add dummy coil dim
+        # Expected shape: (num_coils, *image_shape)
+        expected_ndim = len(self.image_shape) + 1
+        if multi_coil_image_data.ndim != expected_ndim:
+            # If it's a single image matching image_shape, add a coil dimension
+            if multi_coil_image_data.ndim == len(self.image_shape) and multi_coil_image_data.shape == self.image_shape:
+                multi_coil_image_data = multi_coil_image_data.unsqueeze(0) # Add dummy coil dim
             else:
-                raise ValueError(f"Input multi_coil_image_data must have shape (num_coils, *image_shape). "
-                                 f"Got {multi_coil_image_data.shape}, expected coil dim + {self.image_shape}")
+                raise ValueError(
+                    f"Input multi_coil_image_data has incorrect ndim ({multi_coil_image_data.ndim}). "
+                    f"Expected {expected_ndim} (for shape (num_coils, *image_shape)) "
+                    f"or {len(self.image_shape)} (for shape (*image_shape) to be unsqueezed)."
+                )
 
+        # After potential unsqueeze, check spatial dimensions
         if multi_coil_image_data.shape[1:] != self.image_shape:
             raise ValueError(f"Image dimensions of input data {multi_coil_image_data.shape[1:]} "
                              f"do not match operator's image_shape {self.image_shape}.")
