@@ -33,6 +33,9 @@ class SeismicForwardOperator(Operator):
                  source_pos_m: tuple[float, float], # (src_x, src_z)
                  receiver_pos_m: torch.Tensor,    # (num_receivers, 2) for (rec_x, rec_z)
                  pixel_spacing_m: float | tuple[float,float] = 1.0,
+        source_wavelet: torch.Tensor = None,
+        wavelet_time_offset_s: float = 0.0,
+        apply_geometrical_spreading: bool = True,
                  device: str | torch.device = 'cpu'):
         super().__init__()
         self.reflectivity_map_shape = reflectivity_map_shape # (Nz, Nx)
@@ -73,6 +76,22 @@ class SeismicForwardOperator(Operator):
         # self.pixel_grid will be (Nz, Nx, 2) where each entry is (pixel_x_coord, pixel_z_coord)
         self.pixel_grid_m = torch.stack((self.pixel_grid_x_m, self.pixel_grid_z_m), dim=-1)
 
+        # Store wavelet and spreading parameters
+        if source_wavelet is not None:
+            if not isinstance(source_wavelet, torch.Tensor):
+                source_wavelet = torch.tensor(source_wavelet, dtype=torch.float32)
+            if source_wavelet.ndim != 1:
+                raise ValueError("source_wavelet must be a 1D tensor.")
+            self.source_wavelet = source_wavelet.to(device=self.device, dtype=torch.float32)
+            self.wavelet_center_idx = int(round(wavelet_time_offset_s / self.dt_s))
+            self.reversed_wavelet = torch.flip(self.source_wavelet, dims=[0])
+        else:
+            self.source_wavelet = None
+            self.wavelet_center_idx = 0
+            self.reversed_wavelet = None
+
+        self.apply_geometrical_spreading = apply_geometrical_spreading
+
 
     def op(self, x_reflectivity_map: torch.Tensor) -> torch.Tensor:
         """
@@ -94,14 +113,14 @@ class SeismicForwardOperator(Operator):
         y_seismic_traces = torch.zeros((self.num_receivers, self.num_time_samples),
                                        dtype=torch.float32, device=self.device)
 
+        # Distances from source to all pixels: (Nz, Nx)
+        dist_source_to_pixels = torch.sqrt(
+            (self.pixel_grid_m[..., 0] - self.source_pos_m[0])**2 + \
+            (self.pixel_grid_m[..., 1] - self.source_pos_m[1])**2
+        )
+
         for i_rec in range(self.num_receivers):
             rec_pos = self.receiver_pos_m[i_rec, :] # (rec_x, rec_z)
-
-            # Distances from source to all pixels: (Nz, Nx)
-            dist_source_to_pixels = torch.sqrt(
-                (self.pixel_grid_m[..., 0] - self.source_pos_m[0])**2 + \
-                (self.pixel_grid_m[..., 1] - self.source_pos_m[1])**2
-            )
 
             # Distances from all pixels to current receiver: (Nz, Nx)
             dist_pixels_to_receiver = torch.sqrt(
@@ -111,26 +130,37 @@ class SeismicForwardOperator(Operator):
 
             # Total time of flight: source -> pixel -> receiver
             total_time_of_flight_s = (dist_source_to_pixels + dist_pixels_to_receiver) / self.wave_speed_mps # (Nz, Nx)
-
-            # Convert TOF to time sample indices
             time_sample_indices = torch.round(total_time_of_flight_s / self.dt_s).long() # (Nz, Nx)
 
-            # Flatten for easier processing
-            flat_reflectivity = x_reflectivity_map.flatten() # (Nz*Nx)
-            flat_time_indices = time_sample_indices.flatten() # (Nz*Nx)
+            for px_z in range(self.Nz):
+                for px_x in range(self.Nx):
+                    refl_val = x_reflectivity_map[px_z, px_x]
+                    if refl_val == 0:
+                        continue
 
-            for j_px_flat in range(flat_reflectivity.shape[0]):
-                refl_val = flat_reflectivity[j_px_flat]
-                if refl_val == 0: # No reflection, skip
-                    continue
+                    time_idx_event_center = time_sample_indices[px_z, px_x]
+                    current_amplitude_contribution = refl_val
 
-                time_idx = flat_time_indices[j_px_flat]
+                    if self.apply_geometrical_spreading:
+                        dist_sp = dist_source_to_pixels[px_z, px_x]
+                        dist_pr = dist_pixels_to_receiver[px_z, px_x]
+                        total_dist = dist_sp + dist_pr
+                        # Avoid division by zero if total_dist is very small
+                        amplitude_scaling = 1.0 / (total_dist + 1e-9)
+                        current_amplitude_contribution *= amplitude_scaling
 
-                if 0 <= time_idx < self.num_time_samples:
-                    # Simplistic model: add reflectivity to the trace at TOF.
-                    # A more complex model would convolve with a source wavelet.
-                    # Attenuation could also be added: 1 / (dist_src_px * dist_px_rec) approx
-                    y_seismic_traces[i_rec, time_idx] += refl_val
+                    if current_amplitude_contribution == 0: # Can happen if refl_val or scaling is zero
+                        continue
+
+                    if self.source_wavelet is not None:
+                        t_start_in_trace = time_idx_event_center - self.wavelet_center_idx
+                        for k_w in range(len(self.source_wavelet)):
+                            t_trace = t_start_in_trace + k_w
+                            if 0 <= t_trace < self.num_time_samples:
+                                y_seismic_traces[i_rec, t_trace] += current_amplitude_contribution * self.source_wavelet[k_w]
+                    else: # No wavelet, just deposit scaled reflectivity
+                        if 0 <= time_idx_event_center < self.num_time_samples:
+                            y_seismic_traces[i_rec, time_idx_event_center] += current_amplitude_contribution
 
         return y_seismic_traces
 
@@ -155,85 +185,139 @@ class SeismicForwardOperator(Operator):
             for j_px_x in range(self.Nx):
                 pixel_pos_m = self.pixel_grid_m[i_px_z, j_px_x, :] # (px_x, px_z)
 
-                # Dist from source to this pixel
                 dist_source_to_pixel = torch.sqrt(
                     (pixel_pos_m[0] - self.source_pos_m[0])**2 + \
                     (pixel_pos_m[1] - self.source_pos_m[1])**2
                 )
 
-                accumulated_val_for_pixel = 0.0
+                accumulated_val_for_this_pixel = 0.0
                 for k_rec in range(self.num_receivers):
                     rec_pos = self.receiver_pos_m[k_rec, :]
-
-                    # Dist from this pixel to this receiver
                     dist_pixel_to_receiver = torch.sqrt(
                         (pixel_pos_m[0] - rec_pos[0])**2 + \
                         (pixel_pos_m[1] - rec_pos[1])**2
                     )
 
-                    total_time_of_flight_s = (dist_source_to_pixel + dist_pixel_to_receiver) / self.wave_speed_mps
-                    time_sample_idx = torch.round(total_time_of_flight_s / self.dt_s).long()
+                    time_idx_event_center = torch.round(
+                        (dist_source_to_pixel + dist_pixel_to_receiver) / self.wave_speed_mps / self.dt_s
+                    ).long()
 
-                    if 0 <= time_sample_idx < self.num_time_samples:
-                        # Add the trace value at this TOF to the pixel
-                        accumulated_val_for_pixel += y_seismic_traces[k_rec, time_sample_idx]
+                    value_from_trace_interaction = 0.0
+                    if self.reversed_wavelet is not None: # Adjoint of convolution is correlation
+                        t_start_in_trace = time_idx_event_center - self.wavelet_center_idx
+                        for k_w in range(len(self.reversed_wavelet)):
+                            t_trace = t_start_in_trace + k_w
+                            if 0 <= t_trace < self.num_time_samples:
+                                value_from_trace_interaction += y_seismic_traces[k_rec, t_trace] * self.reversed_wavelet[k_w]
+                    else: # No wavelet
+                        if 0 <= time_idx_event_center < self.num_time_samples:
+                            value_from_trace_interaction = y_seismic_traces[k_rec, time_idx_event_center]
 
-                x_reflectivity_adj[i_px_z, j_px_x] = accumulated_val_for_pixel
+                    final_contrib_this_ray = value_from_trace_interaction
+                    if self.apply_geometrical_spreading:
+                        total_dist = dist_source_to_pixel + dist_pixel_to_receiver
+                        amplitude_scaling = 1.0 / (total_dist + 1e-9)
+                        final_contrib_this_ray *= amplitude_scaling
+
+                    accumulated_val_for_this_pixel += final_contrib_this_ray
+
+                x_reflectivity_adj[i_px_z, j_px_x] = accumulated_val_for_this_pixel
 
         return x_reflectivity_adj
 
 if __name__ == '__main__':
     print("Running basic SeismicForwardOperator checks...")
-    device = torch.device('cpu')
-    map_shape_test = (32, 48) # Nz, Nx - Keep small for tests
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
 
-    src_pos = (map_shape_test[1] * 0.01 / 2, 0.0) # Source at center surface, pixel_spacing=0.01
-    num_recs = 10
-    rec_x = np.linspace(0, map_shape_test[1] * 0.01, num_recs)
-    rec_z = np.zeros(num_recs)
-    rec_pos_test = torch.tensor(np.stack([rec_x, rec_z], axis=-1), dtype=torch.float32, device=device)
+    map_shape_test = (16, 24) # Nz, Nx - Keep small for tests for speed
+    pixel_spacing_val = 1.0 # meters for dz and dx
 
-    try:
-        seismic_op_test = SeismicForwardOperator(
-            reflectivity_map_shape=map_shape_test,
-            wave_speed_mps=2000.0,
-            time_sampling_dt_s=0.001, # 1 ms
-            num_time_samples=500,    # 0.5 seconds of recording
-            source_pos_m=src_pos,
-            receiver_pos_m=rec_pos_test,
-            pixel_spacing_m=0.01, # 10m pixels
-            device=device
-        )
-        print("SeismicForwardOperator instantiated.")
+    src_pos_test = (map_shape_test[1] * pixel_spacing_val / 2.0, 0.0) # Source at center surface
+    num_recs_test = 10
+    rec_x_test = torch.linspace(0, (map_shape_test[1]-1) * pixel_spacing_val, num_recs_test, device=device)
+    rec_z_test = torch.zeros(num_recs_test, device=device)
+    rec_pos_test_tensor = torch.stack([rec_x_test, rec_z_test], dim=-1)
 
-        phantom_map = torch.zeros(map_shape_test, dtype=torch.float32, device=device)
-        phantom_map[map_shape_test[0]//2, map_shape_test[1]//2] = 1.0 # Point scatterer
-        phantom_map[map_shape_test[0]*3//4, :] = 0.5 # A layer
+    time_sampling_dt_s_val = 0.001 # 1 ms
+    num_time_samples_val = 250    # 0.25 seconds of recording
 
-        traces_sim = seismic_op_test.op(phantom_map)
-        print(f"Forward op output shape (traces): {traces_sim.shape}")
-        assert traces_sim.shape == (num_recs, seismic_op_test.num_time_samples)
+    # Define Ricker wavelet function
+    def ricker_wavelet(peak_freq, dt, num_samples, device='cpu'):
+        """Generates a Ricker wavelet."""
+        t = np.arange(-num_samples // 2, num_samples // 2) * dt
+        # Corrected Ricker formula: (1 - 2 * (pi*f*t)^2) * exp(-(pi*f*t)^2)
+        factor = (np.pi * peak_freq * t)**2
+        wavelet = (1 - 2 * factor) * np.exp(-factor)
+        return torch.tensor(wavelet, dtype=torch.float32, device=device)
 
-        recon_map_adj = seismic_op_test.op_adj(traces_sim)
-        print(f"Adjoint op output shape (map): {recon_map_adj.shape}")
-        assert recon_map_adj.shape == map_shape_test
+    wavelet_len = 63 # Odd number for a symmetric wavelet with a clear center
+    test_wavelet_tensor = ricker_wavelet(peak_freq=25.0, dt=time_sampling_dt_s_val, num_samples=wavelet_len, device=device)
+    # Offset should be such that wavelet_center_idx points to the peak of the wavelet
+    # If num_samples is odd, peak is at (num_samples-1)/2.
+    # Time offset = index * dt
+    test_wavelet_offset_s_val = ((wavelet_len -1) // 2) * time_sampling_dt_s_val
 
-        # Basic dot product test (can be slow due to nested loops)
-        # For real operators, torch.vdot expects complex, but our ops are real-valued here.
-        # Using (a*b).sum() for real dot product.
-        x_dp_seis = torch.randn_like(phantom_map)
-        y_dp_rand_seis = torch.randn_like(traces_sim)
 
-        Ax_seis = seismic_op_test.op(x_dp_seis)
-        Aty_seis = seismic_op_test.op_adj(y_dp_rand_seis)
+    phantom_map_test = torch.zeros(map_shape_test, dtype=torch.float32, device=device)
+    phantom_map_test[map_shape_test[0]//3, map_shape_test[1]//3] = 1.0
+    phantom_map_test[map_shape_test[0]*2//3, map_shape_test[1]*2//3] = -0.5
 
-        lhs_seis = (Ax_seis * y_dp_rand_seis).sum() # Real dot product
-        rhs_seis = (x_dp_seis * Aty_seis).sum()   # Real dot product
 
-        print(f"Seismic Dot product test: LHS={lhs_seis.item():.4e}, RHS={rhs_seis.item():.4e}")
-        if not np.isclose(lhs_seis.item(), rhs_seis.item(), rtol=1e-3, atol=1e-4): # Increased tolerance
-           print(f"Warning: Seismic Dot product components differ. LHS: {lhs_seis}, RHS: {rhs_seis}")
+    test_configs = [
+        {"name": "Wavelet_SpreadingTrue", "wavelet": test_wavelet_tensor, "offset": test_wavelet_offset_s_val, "spreading": True},
+        {"name": "NoWavelet_SpreadingTrue", "wavelet": None, "offset": 0.0, "spreading": True},
+        {"name": "Wavelet_SpreadingFalse", "wavelet": test_wavelet_tensor, "offset": test_wavelet_offset_s_val, "spreading": False},
+        {"name": "NoWavelet_SpreadingFalse", "wavelet": None, "offset": 0.0, "spreading": False}, # Original behavior
+    ]
 
-        print("SeismicForwardOperator __main__ checks completed.")
-    except Exception as e:
-        print(f"Error in SeismicForwardOperator __main__ checks: {e}")
+    for config in test_configs:
+        print(f"\n--- Testing Configuration: {config['name']} ---")
+        try:
+            seismic_op_test = SeismicForwardOperator(
+                reflectivity_map_shape=map_shape_test,
+                wave_speed_mps=1500.0,
+                time_sampling_dt_s=time_sampling_dt_s_val,
+                num_time_samples=num_time_samples_val,
+                source_pos_m=src_pos_test,
+                receiver_pos_m=rec_pos_test_tensor,
+                pixel_spacing_m=pixel_spacing_val,
+                source_wavelet=config["wavelet"],
+                wavelet_time_offset_s=config["offset"],
+                apply_geometrical_spreading=config["spreading"],
+                device=device
+            )
+            print(f"SeismicForwardOperator ({config['name']}) instantiated.")
+
+            traces_sim = seismic_op_test.op(phantom_map_test)
+            print(f"Forward op output shape (traces): {traces_sim.shape}")
+            assert traces_sim.shape == (num_recs_test, num_time_samples_val)
+
+            recon_map_adj = seismic_op_test.op_adj(traces_sim)
+            print(f"Adjoint op output shape (map): {recon_map_adj.shape}")
+            assert recon_map_adj.shape == map_shape_test
+
+            x_dp_seis = torch.randn_like(phantom_map_test)
+            y_dp_rand_seis = torch.randn_like(traces_sim)
+
+            Ax_seis = seismic_op_test.op(x_dp_seis)
+            Aty_seis = seismic_op_test.op_adj(y_dp_rand_seis)
+
+            lhs_seis = (Ax_seis * y_dp_rand_seis).sum()
+            rhs_seis = (x_dp_seis * Aty_seis).sum()
+
+            print(f"Dot product test ({config['name']}): LHS={lhs_seis.item():.4e}, RHS={rhs_seis.item():.4e}")
+            # Adjust tolerance: spreading and wavelet can affect precision
+            rtol_val = 1e-2 if config["spreading"] or config["wavelet"] is not None else 1e-3
+            atol_val = 1e-3 if config["spreading"] or config["wavelet"] is not None else 1e-4
+            if not np.isclose(lhs_seis.item(), rhs_seis.item(), rtol=rtol_val, atol=atol_val):
+               print(f"Warning: Dot product FAILED for {config['name']}. Diff: {abs(lhs_seis.item() - rhs_seis.item())}")
+            else:
+               print(f"Dot product PASSED for {config['name']}.")
+
+        except Exception as e:
+            print(f"Error in SeismicForwardOperator ({config['name']}) checks: {e}")
+            import traceback
+            traceback.print_exc()
+
+    print("\nAll SeismicForwardOperator __main__ checks completed.")

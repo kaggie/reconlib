@@ -10,11 +10,11 @@ forward and adjoint operators, and reconstruction algorithms.
 from .operators import UltrasoundForwardOperator
 from .reconstructors import das_reconstruction, inverse_reconstruction_pg
 from .utils import compute_and_apply_voronoi_weights_to_echo_data
-from .regularizers import UltrasoundTVCustomRegularizer
+from .regularizers import UltrasoundTVRegularizer # Corrected class name
 
 __all__ = [
     'UltrasoundForwardOperator',
-    'UltrasoundTVCustomRegularizer',
+    'UltrasoundTVRegularizer', # Corrected class name
     'compute_and_apply_voronoi_weights_to_echo_data',
     'das_reconstruction',
     'inverse_reconstruction_pg',
