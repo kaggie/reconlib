@@ -107,6 +107,15 @@ plot_bounds = torch.stack([plot_bounds_min, plot_bounds_max])
 plt.show()
 ```
 
+## Applications in Medical Image Reconstruction
+
+The tools in this Voronoi/Delaunay toolkit serve as foundational components for advanced image reconstruction techniques. Implementations of 2D Voronoi-based iterative image reconstruction algorithms have been developed for:
+
+*   **Computed Tomography (CT):** Utilizing a SART-like algorithm. See `reconlib.modalities.ct.voronoi_reconstructor.VoronoiCTReconstructor2D`.
+*   **Single Photon Emission Computed Tomography (SPECT):** Utilizing an OSEM-like algorithm. See `reconlib.modalities.spect.voronoi_reconstructor.VoronoiSPECTReconstructor2D`.
+
+These reconstructors leverage the Voronoi tessellation to define image elements (cells) where physical properties (attenuation for CT, activity for SPECT) are assumed to be uniform. The geometric properties of these cells are then used to build system matrices for iterative updates.
+
 ## Documentation
 
 Detailed documentation for each module and its functions can be found in the **[wiki](./wiki/README.md)**.
