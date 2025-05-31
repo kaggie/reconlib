@@ -7,7 +7,7 @@ unwrapping algorithm, inspired by PUROR principles.
 import torch
 import heapq
 import numpy as np # For np.prod if needed, and type hints
-from typing import Optional, Tuple, List, Set, PriorityQueue as PQueue # PriorityQueue not directly used, heapq is
+from typing import Optional, Tuple, List, Set # PriorityQueue not directly used, heapq is
 
 # Helper: Get Neighbors (similar to ROMEO's, can be shared or duplicated/adapted)
 def _get_neighbors_puror(
@@ -164,12 +164,12 @@ def _compute_residual_puror(
     return residual_wrapped
 
 # Stub functions for deferred parts
-def _merge_voronoi_cells_puror(unwrapped_phase: torch.Tensor, /* other args */) -> torch.Tensor:
+def _merge_voronoi_cells_puror(unwrapped_phase: torch.Tensor, *args, **kwargs) -> torch.Tensor:
     print("Warning: _merge_voronoi_cells_puror is a stub and does nothing.")
     # raise NotImplementedError("_merge_voronoi_cells_puror is not implemented.")
     return unwrapped_phase
 
-def _optimize_paths_puror(unwrapped_phase: torch.Tensor, /* other args */) -> torch.Tensor:
+def _optimize_paths_puror(unwrapped_phase: torch.Tensor, *args, **kwargs) -> torch.Tensor:
     print("Warning: _optimize_paths_puror is a stub and does nothing.")
     # raise NotImplementedError("_optimize_paths_puror is not implemented.")
     return unwrapped_phase
