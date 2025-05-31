@@ -11,11 +11,13 @@ except ImportError:
 from .pipeline import ReconstructionPipeline, convergence_monitor, metrics_calculator
 from .preprocessing import normalize_counts, randoms_correction
 from .simulation import PhantomGenerator, simulate_projection_data
+from .voronoi_reconstructor import VoronoiPETReconstructor2D # New import
 
 __all__ = [
     'ReconstructionPipeline', 'convergence_monitor', 'metrics_calculator',
     'normalize_counts', 'randoms_correction',
     'PhantomGenerator', 'simulate_projection_data',
+    'VoronoiPETReconstructor2D', # Added to __all__
     # Add any class/function names from data.py here if they become available
     # e.g., 'PETRawData', 'PETSinogramData',
 ]

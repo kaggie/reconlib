@@ -59,9 +59,11 @@ def monotone_chain_2d(points: torch.Tensor, tol: float = EPSILON):
                    torch.empty((0, 2), device=points.device, dtype=torch.long)
 
     # Sort points lexicographically (by x, then by y)
-    # torch.lexsort sorts based on the last key, then the second to last, etc.
-    # So, to sort by x then y, pass (points[:, 1], points[:, 0])
-    sorted_indices = torch.lexsort((points[:, 1], points[:, 0]))
+    # np.lexsort sorts based on the last key, then the second to last, etc.
+    # So, to sort by x then y, pass (points_np[:, 1], points_np[:, 0])
+    points_np = points.cpu().numpy() # Convert to NumPy for lexsort
+    sorted_indices_np = np.lexsort((points_np[:, 1], points_np[:, 0]))
+    sorted_indices = torch.from_numpy(sorted_indices_np).to(points.device) # Convert back to tensor and original device
     
     upper_hull = [] 
     lower_hull = [] 
