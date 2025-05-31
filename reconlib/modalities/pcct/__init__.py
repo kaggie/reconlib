@@ -14,6 +14,11 @@ and advanced algorithms.
 
 from .operators import PCCTProjectorOperator
 from .material_decomposition import MaterialDecompositionForwardOperator, IterativeMaterialDecompositionReconstructor
+from .projection_domain_decomposition import (
+    calculate_material_thickness_sinograms,
+    reconstruct_thickness_maps_from_sinograms,
+    LinearRadonOperatorPlaceholder # Added here
+)
 # Assuming simple_radon_transform and simple_back_projection are internal to operators.py for now
 
 from .reconstructors import tv_reconstruction_pcct_mu_ref # Based on previous subtask report for reconstructors
@@ -37,5 +42,8 @@ __all__ = [
     'combine_material_maps_to_mu_ref',
     'get_pcct_energy_scaling_factors',
     'estimate_scatter_sinogram_kernel_based',
-    'simulate_flux_scan_for_pileup_calibration', # Added new function
+    'simulate_flux_scan_for_pileup_calibration',
+    'calculate_material_thickness_sinograms',
+    'reconstruct_thickness_maps_from_sinograms',
+    'LinearRadonOperatorPlaceholder', # Added here
 ]
