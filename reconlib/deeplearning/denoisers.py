@@ -192,5 +192,3 @@ if __name__ == '__main__':
 
     print("\nSimpleWaveletDenoiser test passed: Output structure and shapes are consistent.")
     print("All parameters should be on device:", next(denoiser_module.parameters()).device)
-
-```
