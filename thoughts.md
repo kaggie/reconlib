@@ -204,7 +204,7 @@ Poisson-Gaussian noise, beyond simple L2 data fidelity.
 *   **Rationale for Regularization:** DOT is severely ill-posed due to strong light scattering. L2 regularization is essential for stability. L1/TV are valuable for reconstructing sparse or piece-wise constant changes in optical properties, improving spatial localization and reducing artifacts.
 *   **Example Application:** DOT reconstruction for functional brain imaging often uses TV or L1 regularization to better localize activated regions, which appear as changes in absorption due to neurovascular coupling.
 
-## Photon Counting CT (PCCT) - User Requested TODO
+## Photon Counting CT (PCCT)
 
 *   **Description:** An advanced X-ray computed tomography technique that uses energy-resolving photon-counting detectors. These detectors count individual X-ray photons and measure their energy, allowing for material decomposition, noise reduction, and potentially lower radiation doses.
 *   **Key Features & Challenges:**
@@ -229,6 +229,7 @@ Poisson-Gaussian noise, beyond simple L2 data fidelity.
         *   Or, a simple model-based iterative reconstruction (MBIR) that directly reconstructs material basis images from multi-energy sinograms, possibly using `ProximalGradientReconstructor` with appropriate regularizers.
     *   **Phantom Generation:** Utilities to create phantoms with material properties defined for different energy X-ray interactions (e.g., Hounsfield units or mass attenuation coefficients for different materials across energy spectra).
     *   **Spectral Response Modeling:** (Advanced) Include detector spectral response, charge sharing, pile-up effects in the operator.
+
 ### Basic Two-Material Decomposition Concept (Conceptual Outline)
 This outlines a simplified approach for decomposing an object into two known materials using measurements from two distinct energy bins from PCCT.
 
