@@ -55,3 +55,41 @@
 *   **Enhancement Idea 3 (Blind Deconvolution):** Implement algorithms that can estimate both the true image and the PSF when the PSF is unknown or partially known.
 *   **Enhancement Idea 4 (GPU-Accelerated Convolution):** Ensure convolution operations are efficiently implemented on GPU, as deconvolution can be computationally intensive. (PyTorch's convNd is already good).
 *   **Enhancement Idea 5 (Handling Different Noise Models):** Extend reconstructors to handle Poisson noise (common in low-light microscopy) or mixed Poisson-Gaussian noise, beyond simple L2 data fidelity.
+
+# Future Modalities TODO (User Request)
+
+## Structured Illumination Microscopy (SIM)
+*   **Description:** A super-resolution microscopy technique using patterned illumination to enhance resolution beyond the diffraction limit.
+*   **Regularization:**
+    *   L1: Used in super-resolution SIM (SR-SIM) to exploit sparsity in high-frequency components during reconstruction.
+    *   L2: Applied in Fourier domain reconstruction (e.g., generalized Wiener filtering) to stabilize solutions against noise.
+    *   TV: Employed in regularization-based iterative optimization to preserve edges and reduce noise in SR-SIM.
+*   **Rationale:** SIM’s reconstruction involves solving inverse problems with structured illumination patterns, where L1/TV and L2 improve resolution and robustness.
+*   **Example:** SR-SIM uses regularization-based iterative optimization for robust reconstruction under Gaussian or Poisson noise.
+
+## X-ray Diffraction Imaging
+*   **Description:** Uses X-ray diffraction patterns to image crystalline structures, often in materials science or structural biology.
+*   **Regularization:**
+    *   L1: Applied in phase retrieval problems (e.g., ptychography) to exploit sparsity in electron density or wavelet domains.
+    *   L2: Used in iterative phase retrieval (e.g., Gerchberg-Saxton algorithms) to stabilize solutions.
+    *   TV: Enhances edge preservation in reconstructed diffraction images.
+*   **Rationale:** Phase retrieval in diffraction imaging is an ill-posed inverse problem, where L1/TV promotes sparsity, and L2 reduces noise.
+*   **Example:** Fourier ptychography in X-ray diffraction uses L1 regularization for phase recovery.
+
+## Electrical Impedance Tomography (EIT)
+*   **Description:** Reconstructs internal conductivity distributions from surface electrical measurements, used in medical and industrial imaging.
+*   **Regularization:**
+    *   L1: Promotes sparse conductivity changes, useful in dynamic EIT or sparse imaging scenarios.
+    *   L2: Common in Tikhonov regularization to smooth conductivity maps and stabilize the ill-posed inverse problem.
+    *   TV: Widely used to preserve sharp boundaries in conductivity distributions.
+*   **Rationale:** EIT’s nonlinear inverse problem benefits from L1/TV for sparsity and edge preservation and L2 for smoothness.
+*   **Example:** TV regularization is used in EIT to reconstruct sharp conductivity contrasts in medical imaging.
+
+## Diffuse Optical Tomography (DOT)
+*   **Description:** Uses near-infrared light to image optical properties (e.g., absorption, scattering) in tissues, often for brain or breast imaging.
+*   **Regularization:**
+    *   L1: Applied in sparse reconstruction to model localized absorbers or scatterers.
+    *   L2: Used to stabilize reconstructions in the presence of noise and ill-posedness.
+    *   TV: Enhances edge-preserving reconstruction of optical property maps.
+*   **Rationale:** DOT’s ill-posed inverse problem benefits from L1/TV for sparse features and L2 for noise reduction.
+*   **Example:** DOT reconstruction often uses TV to resolve sharp boundaries in tissue optical properties.
