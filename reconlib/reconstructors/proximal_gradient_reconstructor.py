@@ -18,7 +18,9 @@ class ProximalGradientReconstructor(nn.Module):
                  step_size: float = 0.1, 
                  initial_estimate_fn: Optional[Callable[[torch.Tensor, Optional[torch.Tensor], Callable], torch.Tensor]] = None,
                  verbose: bool = False, 
-                 log_fn: Optional[Callable[[int, torch.Tensor, float, float], None]] = None):
+                 log_fn: Optional[Callable[[int, torch.Tensor, float, float], None]] = None,
+                 data_fidelity_gradient_mode: str = 'l2', # New parameter
+                 poisson_epsilon: float = 1e-9):           # New parameter
         """
         Args:
             iterations: Number of iterations to perform.
@@ -29,6 +31,9 @@ class ProximalGradientReconstructor(nn.Module):
             verbose: If True, print iteration progress.
             log_fn: An optional function to log iteration metrics.
                     Signature: `fn(iter_num, current_image, change_norm, grad_norm)`.
+            data_fidelity_gradient_mode: Mode for calculating data fidelity gradient.
+                                         Options: 'l2', 'poisson_likelihood'.
+            poisson_epsilon: Epsilon value for stabilizing Poisson likelihood gradient.
         """
         super().__init__()
         self.iterations = iterations
@@ -36,12 +41,14 @@ class ProximalGradientReconstructor(nn.Module):
         self.initial_estimate_fn = initial_estimate_fn
         self.verbose = verbose
         self.log_fn = log_fn
+        self.data_fidelity_gradient_mode = data_fidelity_gradient_mode
+        self.poisson_epsilon = poisson_epsilon
 
     def reconstruct(self, 
                     kspace_data: torch.Tensor, 
                     forward_op_fn: Callable[[torch.Tensor, Optional[torch.Tensor]], torch.Tensor], 
                     adjoint_op_fn: Callable[[torch.Tensor, Optional[torch.Tensor]], torch.Tensor], 
-                    regularizer_prox_fn: Callable[[torch.Tensor, float], torch.Tensor],
+                    regularizer_prox_fn: Optional[Callable[[torch.Tensor, float], torch.Tensor]], # Made Optional
                     sensitivity_maps: Optional[torch.Tensor] = None, 
                     x_init: Optional[torch.Tensor] = None,
                     image_shape_for_zero_init: Optional[Tuple[int, ...]] = None) -> torch.Tensor:
@@ -105,14 +112,26 @@ class ProximalGradientReconstructor(nn.Module):
                  x_current = x_current.to(torch.complex64)
 
         for iter_num in range(self.iterations):
-            k_pred = forward_op_fn(x_current, sensitivity_maps) 
-            k_resid = k_pred - kspace_data
-            grad_data_term = adjoint_op_fn(k_resid, sensitivity_maps)
+            estimated_mean_data = forward_op_fn(x_current, sensitivity_maps)
             
-            x_gradient_updated = x_current - self.step_size * grad_data_term
+            if self.data_fidelity_gradient_mode == 'l2':
+                k_resid = estimated_mean_data - kspace_data
+                grad_data_fidelity = adjoint_op_fn(k_resid, sensitivity_maps)
+            elif self.data_fidelity_gradient_mode == 'poisson_likelihood':
+                # grad_likelihood_component: (1 - y/Ax)
+                # Note: kspace_data here is the measured data 'y'
+                grad_likelihood_component = (1.0 - kspace_data / (estimated_mean_data + self.poisson_epsilon))
+                grad_data_fidelity = adjoint_op_fn(grad_likelihood_component, sensitivity_maps)
+            else:
+                raise ValueError(f"Unknown data_fidelity_gradient_mode: {self.data_fidelity_gradient_mode}")
+
+            x_gradient_updated = x_current - self.step_size * grad_data_fidelity
             
             # Regularization Step: Pass self.step_size as steplength to the prox operator
-            x_next = regularizer_prox_fn(x_gradient_updated, self.step_size)
+            if regularizer_prox_fn is not None:
+                x_next = regularizer_prox_fn(x_gradient_updated, self.step_size)
+            else:
+                x_next = x_gradient_updated.clone() # If no regularizer, proceed with gradient updated image
             
             if self.verbose or self.log_fn:
                 with torch.no_grad():
@@ -121,7 +140,7 @@ class ProximalGradientReconstructor(nn.Module):
                         change = torch.norm(x_next - x_current)
                     else:
                         change = torch.norm(x_next - x_current) / (current_norm + 1e-9)
-                    grad_norm_val = torch.norm(grad_data_term)
+                    grad_norm_val = torch.norm(grad_data_fidelity) # Use grad_data_fidelity here
 
                     if self.verbose:
                         print(f"Iter {iter_num + 1}/{self.iterations}, Step Size: {self.step_size:.2e}, "

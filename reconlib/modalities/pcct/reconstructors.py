@@ -1,9 +1,26 @@
 import torch
 from reconlib.reconstructors.proximal_gradient_reconstructor import ProximalGradientReconstructor
-from reconlib.modalities.ultrasound.regularizers import UltrasoundTVCustomRegularizer # Generic TV
+# from reconlib.modalities.ultrasound.regularizers import UltrasoundTVCustomRegularizer # Generic TV # TEMP COMMENT OUT
+from typing import Optional # Added for type hinting
 # from .operators import PCCTProjectorOperator # For type hinting
 import numpy as np # Added for np.pi in new reconstructor's fallback imports
 from reconlib.operators import Operator # Added for LinearRadonOperator in new reconstructor
+
+# --- TEMP PLACEHOLDER for UltrasoundTVCustomRegularizer ---
+# Moved to module level for wider accessibility within this file
+class TempUltrasoundTVCustomRegularizerPlaceholder:
+    def __init__(self, lambda_reg, prox_iterations, is_3d, device):
+        self.lambda_reg = lambda_reg
+        self.prox_iterations = prox_iterations
+        self.is_3d = is_3d
+        self.device = device
+        # print("WARNING: Using TEMP Placeholder for UltrasoundTVCustomRegularizer.") # Less verbose
+
+    def proximal_operator(self, image_estimate: torch.Tensor, step_size: float) -> torch.Tensor:
+        # Does nothing, just returns the image
+        # print(f"WARNING: TEMP UltrasoundTVCustomRegularizer.proximal_operator called, returning input image for {image_estimate.shape}.")
+        return image_estimate.clone()
+# --- END TEMP PLACEHOLDER ---
 
 def tv_reconstruction_pcct_mu_ref(
     y_photon_counts_stack: torch.Tensor, # (num_bins, num_angles, num_detector_pixels)
@@ -13,7 +30,8 @@ def tv_reconstruction_pcct_mu_ref(
     step_size: float = 0.001, # May need careful tuning due to exp/log and Radon
     tv_prox_iterations: int = 10,
     initial_mu_ref_estimate: torch.Tensor | None = None,
-    verbose: bool = False
+    verbose: bool = False,
+    data_fidelity_mode: str = 'l2' # New parameter
 ) -> torch.Tensor:
     """
     Placeholder TV-regularized reconstruction for PCCT to recover a reference
@@ -30,7 +48,8 @@ def tv_reconstruction_pcct_mu_ref(
     # The image to reconstruct (mu_reference_map) is typically 2D or 3D.
     # For this operator, it's 2D.
     is_3d_map = len(pcct_operator.image_shape) == 3
-    tv_regularizer = UltrasoundTVCustomRegularizer(
+
+    tv_regularizer = TempUltrasoundTVCustomRegularizerPlaceholder(
         lambda_reg=lambda_tv,
         prox_iterations=tv_prox_iterations,
         is_3d=is_3d_map,
@@ -46,9 +65,10 @@ def tv_reconstruction_pcct_mu_ref(
         step_size=step_size,
         initial_estimate_fn=None,
         verbose=verbose,
-        log_fn=lambda iter_n, img, change, grad_norm: \
-               print(f"PCCT TV Recon Iter {iter_n+1}/{iterations}: Change={change:.2e}, GradNorm={grad_norm:.2e}") \
-               if verbose and (iter_n % 10 == 0 or iter_n == iterations -1) else None
+        log_fn=lambda iter_num, current_image, change, grad_norm: \
+               print(f"PCCT TV Recon Iter {iter_num+1}/{iterations}: Change={change:.2e}, GradNorm={grad_norm:.2e}") \
+               if verbose and (iter_num % 10 == 0 or iter_num == iterations -1) else None,
+        data_fidelity_gradient_mode=data_fidelity_mode # Pass new mode
     )
 
     x_init_arg = initial_mu_ref_estimate
@@ -81,38 +101,86 @@ if __name__ == '__main__':
     img_s_recon = (16,16)
     n_a_recon = 10
     n_d_recon = 18
-    e_bins_recon = [(20,50), (50,80), (80,120)]
+    e_bins_recon = [(20,50), (50,80), (80,120)] # Using 3 bins for more structured data
     n_b_recon = len(e_bins_recon)
-    I0_recon = torch.tensor([1e4, 1e5, 1e4], device=dev_recon)
+    I0_recon = torch.tensor([1e5, 1e5, 1e5], device=dev_recon, dtype=torch.float32) # Higher I0
     e_scales_recon = torch.tensor([1.0, 0.8, 0.6], device=dev_recon)
 
+    mu_phantom_recon_test = torch.zeros(img_s_recon, device=dev_recon, dtype=torch.float32)
+    mu_phantom_recon_test[img_s_recon[0]//4:img_s_recon[0]*3//4, img_s_recon[1]//4:img_s_recon[1]*3//4] = 0.02
+
+
     try:
-        from .operators import PCCTProjectorOperator # Relative import
-        pcct_op_inst = PCCTProjectorOperator(
+        from reconlib.modalities.pcct.operators import PCCTProjectorOperator # Absolute import
+
+        # Operator for the reconstructor (should not add noise itself for SIR testing from noisy data)
+        pcct_op_for_recon = PCCTProjectorOperator(
             image_shape=img_s_recon,
             num_angles=n_a_recon,
             num_detector_pixels=n_d_recon,
             energy_bins_keV=e_bins_recon,
             source_photons_per_bin=I0_recon,
             energy_scaling_factors=e_scales_recon,
+            add_poisson_noise=False, # Reconstruction operator should be deterministic
             device=dev_recon
         )
 
-        # Dummy measured photon counts (stack of sinograms)
-        dummy_photon_counts = torch.rand((n_b_recon, n_a_recon, n_d_recon), device=dev_recon) * (I0_recon.view(n_b_recon,1,1)*0.1)
-
-
-        recon_mu = tv_reconstruction_pcct_mu_ref(
-            y_photon_counts_stack=dummy_photon_counts,
-            pcct_operator=pcct_op_inst,
-            lambda_tv=1e-4, # May need significant tuning
-            iterations=3,   # Low for quick check
-            step_size=1e-5, # Very small due to potential large gradients from exp/log & Radon
-            verbose=True
+        # Operator for generating true mean data (also no noise)
+        pcct_op_for_data_gen_mean = PCCTProjectorOperator(
+            image_shape=img_s_recon,
+            num_angles=n_a_recon,
+            num_detector_pixels=n_d_recon,
+            energy_bins_keV=e_bins_recon,
+            source_photons_per_bin=I0_recon,
+            energy_scaling_factors=e_scales_recon,
+            add_poisson_noise=False,
+            device=dev_recon
         )
-        print(f"PCCT reconstruction output shape: {recon_mu.shape}")
-        assert recon_mu.shape == img_s_recon
-        print("tv_reconstruction_pcct_mu_ref basic check PASSED.")
+
+        print("\n--- Testing tv_reconstruction_pcct_mu_ref with L2 fidelity ---")
+        # Generate true mean counts and then add Poisson noise for realistic scenario
+        y_true_mean_counts_l2 = pcct_op_for_data_gen_mean.op(mu_phantom_recon_test)
+        y_photon_counts_stack_l2 = torch.poisson(torch.clamp(y_true_mean_counts_l2, min=0.0))
+
+        recon_mu_l2 = tv_reconstruction_pcct_mu_ref(
+            y_photon_counts_stack=y_photon_counts_stack_l2,
+            pcct_operator=pcct_op_for_recon, # Use the deterministic operator for recon
+            lambda_tv=1e-4,
+            iterations=5,
+            step_size=1e-5,
+            verbose=True,
+            data_fidelity_mode='l2'
+        )
+        print(f"PCCT L2 reconstruction output shape: {recon_mu_l2.shape}")
+        assert recon_mu_l2.shape == img_s_recon
+        norm_l2_vs_phantom = torch.norm(recon_mu_l2 - mu_phantom_recon_test).item()
+        print(f"  Norm of (L2 Recon - True Phantom): {norm_l2_vs_phantom:.4f}")
+        print("tv_reconstruction_pcct_mu_ref L2 fidelity check PASSED.")
+
+        print("\n--- Testing tv_reconstruction_pcct_mu_ref with Poisson Likelihood (SIR) ---")
+        # Data generation (can reuse y_true_mean_counts_l2 and y_photon_counts_stack_l2 or regenerate)
+        y_true_mean_counts_sir = y_true_mean_counts_l2
+        y_photon_counts_stack_sir = y_photon_counts_stack_l2
+
+        recon_mu_sir = tv_reconstruction_pcct_mu_ref(
+            y_photon_counts_stack=y_photon_counts_stack_sir,
+            pcct_operator=pcct_op_for_recon, # Use the deterministic operator for recon
+            lambda_tv=1e-4,
+            iterations=5,
+            step_size=1e-5, # Step size might need to be much smaller for Poisson due to gradient scale
+            verbose=True,
+            data_fidelity_mode='poisson_likelihood'
+        )
+        print(f"PCCT SIR reconstruction output shape: {recon_mu_sir.shape}")
+        assert recon_mu_sir.shape == img_s_recon
+        norm_sir_vs_phantom = torch.norm(recon_mu_sir - mu_phantom_recon_test).item()
+        print(f"  Norm of (SIR Recon - True Phantom): {norm_sir_vs_phantom:.4f}")
+        print("tv_reconstruction_pcct_mu_ref Poisson Likelihood (SIR) check PASSED.")
+
+        # Optional: Compare L2 and SIR norms
+        print(f"\nComparison: L2 Recon Error = {norm_l2_vs_phantom:.4f}, SIR Recon Error = {norm_sir_vs_phantom:.4f}")
+
+
     except Exception as e:
         print(f"Error in tv_reconstruction_pcct_mu_ref check: {e}")
         import traceback; traceback.print_exc()
@@ -128,9 +196,9 @@ if __name__ == '__main__':
 # For this step, we'll assume they can be accessed or redefined if necessary.
 # Let's try importing them from the operator module as they are already there.
 try:
-    from .operators import simple_radon_transform, simple_back_projection
+    from reconlib.modalities.pcct.operators import simple_radon_transform, simple_back_projection # Absolute import
 except ImportError: # Fallback if running script directly or structure changes
-    print("Warning: Could not import simple_radon_transform/simple_back_projection from .operators for PCCT reconstructor.")
+    print("Warning: Could not import simple_radon_transform/simple_back_projection from reconlib.modalities.pcct.operators for PCCT reconstructor.")
     # Define simplified versions here if import fails (should match those in PCCTProjectorOperator)
     def simple_radon_transform(image: torch.Tensor, num_angles: int,
                                num_detector_pixels: int | None = None,
@@ -138,7 +206,8 @@ except ImportError: # Fallback if running script directly or structure changes
         Ny, Nx = image.shape
         if num_detector_pixels is None: num_detector_pixels = max(Ny, Nx)
         image = image.to(device)
-        angles = torch.linspace(0, np.pi, num_angles, endpoint=False, device=device)
+        # angles = torch.linspace(0, np.pi, num_angles, endpoint=False, device=device) # endpoint deprecated
+        angles = torch.arange(num_angles, device=device, dtype=torch.float32) * (np.pi / num_angles)
         sinogram = torch.zeros((num_angles, num_detector_pixels), device=device, dtype=image.dtype)
         x_coords = torch.linspace(-Nx // 2, Nx // 2 -1 , Nx, device=device)
         y_coords = torch.linspace(-Ny // 2, Ny // 2 -1 , Ny, device=device)
@@ -157,7 +226,8 @@ except ImportError: # Fallback if running script directly or structure changes
         Ny, Nx = image_shape
         sinogram = sinogram.to(device)
         reconstructed_image = torch.zeros(image_shape, device=device, dtype=sinogram.dtype)
-        angles = torch.linspace(0, np.pi, num_angles, endpoint=False, device=device)
+        # angles = torch.linspace(0, np.pi, num_angles, endpoint=False, device=device) # endpoint deprecated
+        angles = torch.arange(num_angles, device=device, dtype=torch.float32) * (np.pi / num_angles)
         x_coords = torch.linspace(-Nx // 2, Nx // 2 -1 , Nx, device=device)
         y_coords = torch.linspace(-Ny // 2, Ny // 2 -1 , Ny, device=device)
         grid_y, grid_x = torch.meshgrid(y_coords, x_coords, indexing='ij')
@@ -180,12 +250,14 @@ class LinearRadonOperator(Operator):
         self.device = device
         self.output_shape = (num_angles, num_detector_pixels)
 
-    def op(self, image: torch.Tensor) -> torch.Tensor:
+    def op(self, image: torch.Tensor, sensitivity_maps: Optional[torch.Tensor] = None) -> torch.Tensor:
+        # sensitivity_maps accepted for PGD compatibility, not used by this simple Radon op.
         if image.shape != self.image_shape:
             raise ValueError("Input image shape mismatch for LinearRadonOperator.")
         return simple_radon_transform(image, self.num_angles, self.num_detector_pixels, self.device)
 
-    def op_adj(self, sinogram: torch.Tensor) -> torch.Tensor:
+    def op_adj(self, sinogram: torch.Tensor, sensitivity_maps: Optional[torch.Tensor] = None) -> torch.Tensor:
+        # sensitivity_maps accepted for PGD compatibility, not used by this simple Radon op.
         if sinogram.shape != self.output_shape:
             raise ValueError("Input sinogram shape mismatch for LinearRadonOperator.")
         return simple_back_projection(sinogram, self.image_shape, self.device)
@@ -231,7 +303,9 @@ def iterative_reconstruction_pcct_bin(
     )
 
     is_3d_map = len(image_shape) == 3 # Should be False for this 2D reconstructor
-    tv_regularizer = UltrasoundTVCustomRegularizer(
+
+    # TempUltrasoundTVCustomRegularizerPlaceholder is now at module level
+    tv_regularizer = TempUltrasoundTVCustomRegularizerPlaceholder(
         lambda_reg=lambda_tv,
         prox_iterations=tv_prox_iterations,
         is_3d=is_3d_map,
@@ -243,9 +317,9 @@ def iterative_reconstruction_pcct_bin(
         step_size=pgd_step_size,
         initial_estimate_fn=None,
         verbose=verbose,
-        log_fn=lambda iter_n, img, change, grad_norm: \
-               print(f"PCCT Bin Iter Recon Iter {iter_n+1}/{pgd_iterations}: Change={change:.2e}, GradNorm={grad_norm:.2e}") \
-               if verbose and (iter_n % 10 == 0 or iter_n == pgd_iterations -1) else None
+        log_fn=lambda iter_num, current_image, change, grad_norm: \
+               print(f"PCCT Bin Iter Recon Iter {iter_num+1}/{pgd_iterations}: Change={change:.2e}, GradNorm={grad_norm:.2e}") \
+               if verbose and (iter_num % 10 == 0 or iter_num == pgd_iterations -1) else None
     )
 
     x_init_arg = initial_mu_eff_estimate

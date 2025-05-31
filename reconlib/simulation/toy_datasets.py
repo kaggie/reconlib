@@ -262,5 +262,3 @@ if __name__ == '__main__':
            "Undersampled k-space seems fully sampled or too dense." # Heuristic check
 
     print("\nAll toy dataset generation tests completed.")
-
-```

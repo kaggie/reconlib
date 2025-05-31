@@ -13,18 +13,27 @@ and advanced algorithms.
 """
 
 from .operators import PCCTProjectorOperator
+from .material_decomposition import MaterialDecompositionForwardOperator, IterativeMaterialDecompositionReconstructor
 # Assuming simple_radon_transform and simple_back_projection are internal to operators.py for now
 
 from .reconstructors import tv_reconstruction_pcct_mu_ref # Based on previous subtask report for reconstructors
 # If there are other main reconstructors, they should be listed here.
 
-from .utils import generate_pcct_phantom_material_maps, combine_material_maps_to_mu_ref, get_pcct_energy_scaling_factors
+from .utils import (
+    generate_pcct_phantom_material_maps,
+    combine_material_maps_to_mu_ref,
+    get_pcct_energy_scaling_factors,
+    estimate_scatter_sinogram_kernel_based # Added new function
+)
 # plot_pcct_results is mainly for notebook use
 
 __all__ = [
     'PCCTProjectorOperator',
+    'MaterialDecompositionForwardOperator',
+    'IterativeMaterialDecompositionReconstructor',
     'tv_reconstruction_pcct_mu_ref',
     'generate_pcct_phantom_material_maps',
     'combine_material_maps_to_mu_ref',
     'get_pcct_energy_scaling_factors',
+    'estimate_scatter_sinogram_kernel_based', # Added new function
 ]
