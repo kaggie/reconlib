@@ -175,14 +175,122 @@ class VoronoiPETReconstructor3D:
 
     @staticmethod
     def _is_point_in_face_3d(point_3d: torch.Tensor, face_vertices_coords: torch.Tensor,
-                             face_normal: torch.Tensor, epsilon: float) -> bool: # pragma: no cover
-        if face_vertices_coords.shape[0] < 3: return False
-        return True
+                             face_normal: torch.Tensor, epsilon: float) -> bool:
+        # 1. Check for basic conditions
+        if face_vertices_coords.shape[0] < 3:
+            return False
+
+        # 2. Co-planarity check
+        # Vector from a face vertex to the point
+        vec_to_point = point_3d - face_vertices_coords[0]
+        # Dot product with the face normal
+        dot_product = torch.dot(vec_to_point, face_normal)
+        if not (torch.abs(dot_product) < epsilon):
+            return False # Point is not co-planar
+
+        # 3. Projection to 2D
+        # Determine the axis of maximal projection
+        abs_normal = torch.abs(face_normal)
+        if abs_normal[2] > abs_normal[0] and abs_normal[2] > abs_normal[1]: # Max component is Z, project to XY
+            dim1, dim2 = 0, 1
+        elif abs_normal[1] > abs_normal[0]: # Max component is Y (or Z was not max), project to XZ
+            dim1, dim2 = 0, 2
+        else: # Max component is X (or Y, Z were not max), project to YZ
+            dim1, dim2 = 1, 2
+
+        point_2d = torch.tensor([point_3d[dim1], point_3d[dim2]], dtype=point_3d.dtype, device=point_3d.device)
+        face_vertices_2d = face_vertices_coords[:, [dim1, dim2]]
+
+        # 4. Point-in-polygon test (Winding Number Algorithm in 2D)
+        wn = 0
+        num_vertices = face_vertices_2d.shape[0]
+
+        for i in range(num_vertices):
+            v_i = face_vertices_2d[i]
+            v_i_plus_1 = face_vertices_2d[(i + 1) % num_vertices]
+
+            # is_left function: (x2 - x1) * (yp - y1) - (xp - x1) * (y2 - y1)
+            # Here: p0 = v_i, p1 = v_i_plus_1, p2 = point_2d
+            is_left_val = (v_i_plus_1[0] - v_i[0]) * (point_2d[1] - v_i[1]) - \
+                          (point_2d[0] - v_i[0]) * (v_i_plus_1[1] - v_i[1])
+
+            if v_i[1] <= point_2d[1] + epsilon:  # Upward crossing
+                if v_i_plus_1[1] > point_2d[1] + epsilon and is_left_val > -epsilon: # point is left or on edge
+                    wn += 1
+            else:  # Downward crossing
+                if v_i_plus_1[1] <= point_2d[1] + epsilon and is_left_val < epsilon: # point is right or on edge
+                    wn -= 1
+
+        return wn != 0
 
     @staticmethod
     def _is_point_inside_polyhedron_3d(point: torch.Tensor, faces_indices: List[List[int]],
-                                       unique_voronoi_vertices: torch.Tensor, epsilon: float) -> bool: # pragma: no cover
-        return False
+                                       unique_voronoi_vertices: torch.Tensor, epsilon: float) -> bool:
+        # 1. Handle basic cases
+        # A polyhedron needs at least 4 faces (e.g., a tetrahedron).
+        # unique_voronoi_vertices must have at least 4 points for a 3D polyhedron.
+        if not faces_indices or len(faces_indices) < 4:
+            return False # Not enough faces to form a closed polyhedron
+        if unique_voronoi_vertices.shape[0] < 4:
+            return False # Not enough unique vertices
+
+        # 2. Iterate through each face
+        for face_vertex_idx_list in faces_indices:
+            # Ensure each face has at least 3 vertices
+            if len(face_vertex_idx_list) < 3:
+                # This case should ideally not happen for well-formed polyhedra.
+                # Depending on strictness, one might raise an error or return False.
+                # For robustness in this context, let's assume it implies an issue with the polyhedron definition.
+                return False # Degenerate face definition
+
+            # 3. For each valid face:
+            # Get the coordinates of its vertices
+            try:
+                face_v_coords = unique_voronoi_vertices[torch.tensor(face_vertex_idx_list,
+                                                                   device=unique_voronoi_vertices.device,
+                                                                   dtype=torch.long)]
+            except IndexError: # pragma: no cover
+                # Should not happen if indices are validated upstream
+                return False
+
+            v0 = face_v_coords[0]
+            v1 = face_v_coords[1]
+            v2 = face_v_coords[2]
+
+            # Calculate the face normal
+            # Assuming counter-clockwise vertex order when viewed from outside for outward normal
+            normal = torch.cross(v1 - v0, v2 - v0)
+            normal_len = torch.linalg.norm(normal)
+
+            if normal_len < epsilon: # Degenerate face (collinear vertices)
+                # If the point lies exactly on this degenerate plane, its classification is ambiguous.
+                # For a robust "inside" check, a point near a degenerate face might be problematic.
+                # Depending on context, this might be an error or require special handling.
+                # Here, we consider it as not strictly inside if such a face is encountered.
+                # Alternatively, if point is co-planar with this degenerate face, it could be on boundary.
+                # Let's check if point is co-planar with v0, v1, v2.
+                # If normal is zero, any point is "co-planar" by dot product, this isn't helpful.
+                # A point cannot be "outside" a zero-volume region defined by a degenerate face.
+                # It's safer to continue; if other faces enclose it, it's fine.
+                # However, if this is the *only* kind of face, it's not a polyhedron.
+                # The initial check for len(faces_indices) < 4 handles cases where there are too few faces.
+                # If a face is degenerate but the polyhedron is otherwise valid, the point must still be
+                # on the correct side of *all other* valid faces.
+                continue # Skip this degenerate face and rely on other faces
+
+            normal = normal / normal_len
+
+            # Test the point against the plane of this face
+            # vector_to_point = point - v0
+            signed_distance = torch.dot(normal, point - v0)
+
+            # If signed_distance > epsilon, the point is on the "outside" of this face plane.
+            # This assumes normals are consistently pointing outwards.
+            if signed_distance > epsilon:
+                return False # Point is outside the polyhedron
+
+        # 4. If the point is on the inner side of or on all face planes
+        return True
 
     def _compute_lor_cell_intersection_3d(
         self, lor_p1: torch.Tensor, lor_p2: torch.Tensor,
