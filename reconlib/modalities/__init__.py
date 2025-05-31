@@ -3,8 +3,21 @@ reconlib.modalities
 ===================
 
 This package contains modules for different imaging modalities within reconlib.
-Each submodule (e.g., ultrasound, oct, em, xray_phase_contrast, seismic, astronomical)
+Each submodule (e.g., pcct, pet, ct, ultrasound, oct, em, xray_phase_contrast, seismic, astronomical)
 provides specialized tools for that particular modality.
 """
-# This __init__.py can remain relatively empty, serving primarily to mark
-# 'modalities' as a package. Specific modality submodules are imported directly.
+
+from . import pcct
+from . import pet
+from . import ct
+from . import spect # Uncommented and added
+# Example:
+# from . import ultrasound
+
+__all__ = [
+    'pcct',
+    'pet',
+    'ct',
+    'spect', # Added
+    # 'ultrasound',
+]

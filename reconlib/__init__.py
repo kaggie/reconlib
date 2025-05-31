@@ -34,10 +34,12 @@ from .io import DICOMIO # Added DICOMIO
 # New PET/CT specific modules
 from .geometry import ScannerGeometry, SystemMatrix
 from .projectors import ForwardProjector, BackwardProjector
-from .physics import AttenuationCorrection, ScatterCorrection, DetectorResponseModel
-from .pet_ct_preprocessing import normalize_counts, randoms_correction, normalize_projection_data
-from .pet_ct_pipeline import ReconstructionPipeline, convergence_monitor, metrics_calculator
-from .pet_ct_simulation import PhantomGenerator, simulate_projection_data
+from .physics import AttenuationCorrection, ScatterCorrection, DetectorResponseModel # This should be correct as physics/__init__.py exports them
+# The following direct imports are removed as these functionalities are now in reconlib.modalities.pet.*
+# from .pet_ct_preprocessing import normalize_counts, randoms_correction, normalize_projection_data
+# from .pet_ct_pipeline import ReconstructionPipeline, convergence_monitor, metrics_calculator
+# from .pet_ct_simulation import PhantomGenerator, simulate_projection_data
+# Users should now import from reconlib.modalities.pet or reconlib.modalities.ct
 
 
 from .coil_combination import (
@@ -128,12 +130,13 @@ __all__ = [
     "plot_projection_data",       # Added
     "visualize_reconstruction",   # Added
 
-    # PET/CT specific additions
-    'ScannerGeometry', 'SystemMatrix',
-    'ForwardProjector', 'BackwardProjector',
-    'AttenuationCorrection', 'ScatterCorrection', 'DetectorResponseModel',
-    'normalize_counts', 'randoms_correction', 'normalize_projection_data',
-    'ReconstructionPipeline', 'convergence_monitor', 'metrics_calculator',
-    'PhantomGenerator', 'simulate_projection_data',
+    # PET/CT specific additions that remain at top level or in core modules
+    'ScannerGeometry', 'SystemMatrix', # from .geometry
+    'ForwardProjector', 'BackwardProjector', # from .projectors
+    'AttenuationCorrection', 'ScatterCorrection', 'DetectorResponseModel', # from .physics
+    # Removed from here, should be imported from reconlib.modalities.pet or .ct:
+    # 'normalize_counts', 'randoms_correction', 'normalize_projection_data',
+    # 'ReconstructionPipeline', 'convergence_monitor', 'metrics_calculator',
+    # 'PhantomGenerator', 'simulate_projection_data',
 ]
 
